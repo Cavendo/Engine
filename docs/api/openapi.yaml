@@ -1,0 +1,3947 @@
+openapi: 3.0.3
+info:
+  title: Cavendo Engine API
+  description: |
+    REST API for Cavendo Engine - an AI agent task management platform.
+
+    ## Authentication
+
+    The API supports three authentication methods:
+
+    ### Session Authentication (Cookie-based)
+    Used by the web UI. Login via `/api/auth/login` to receive a session cookie.
+
+    ### Agent Key Authentication (X-Agent-Key header)
+    Used by AI agents. Generate keys via the admin UI or `/api/agents/{id}/keys`.
+    Keys start with `cav_ak_` prefix.
+
+    ### User Key Authentication (X-Agent-Key header)
+    Personal API keys for users (e.g., for MCP integration). Generate via `/api/users/me/keys`.
+    Keys start with `cav_uk_` prefix.
+
+    ## Key Concepts
+
+    - **Agents**: AI agents that execute tasks (Claude, GPT, custom implementations)
+    - **Tasks**: Work items assigned to agents
+    - **Deliverables**: Work output submitted by agents for review
+    - **Projects**: Organize tasks and knowledge
+    - **Knowledge**: Project-scoped reference documents for agents
+    - **Webhooks**: Event notifications for agents
+
+  version: 0.1.0
+  contact:
+    name: Cavendo Engine
+    url: https://github.com/Cavendo/Engine
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:3001
+    description: Local development
+  - url: https://your-server.com
+    description: Production
+
+tags:
+  - name: Authentication
+    description: User authentication and session management
+  - name: Agents
+    description: Agent management and self-service endpoints
+  - name: Tasks
+    description: Task creation, assignment, and management
+  - name: Deliverables
+    description: Work output submission and review
+  - name: Projects
+    description: Project organization
+  - name: Knowledge
+    description: Knowledge base management
+  - name: Webhooks
+    description: Webhook configuration and delivery
+  - name: Activity
+    description: Agent activity logging and statistics
+  - name: Users
+    description: User management and personal API keys
+
+components:
+  securitySchemes:
+    sessionAuth:
+      type: apiKey
+      in: cookie
+      name: session
+      description: Session cookie obtained from login endpoint
+    agentKey:
+      type: apiKey
+      in: header
+      name: X-Agent-Key
+      description: Agent API key (cav_ak_...) or User API key (cav_uk_...)
+
+  schemas:
+    # Common schemas
+    Error:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: false
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              example: NOT_FOUND
+            message:
+              type: string
+              example: Resource not found
+
+    ValidationError:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: false
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              example: VALIDATION_ERROR
+            message:
+              type: string
+            errors:
+              type: object
+              additionalProperties:
+                type: string
+
+    SuccessResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: object
+
+    # User schemas
+    User:
+      type: object
+      properties:
+        id:
+          type: integer
+          example: 1
+        email:
+          type: string
+          format: email
+          example: admin@example.com
+        name:
+          type: string
+          example: Admin User
+        role:
+          type: string
+          enum: [admin, reviewer, viewer]
+          example: admin
+        status:
+          type: string
+          enum: [active, inactive]
+          example: active
+        last_login_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    LoginRequest:
+      type: object
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          format: email
+          example: admin@example.com
+        password:
+          type: string
+          format: password
+          minLength: 1
+
+    LoginResponse:
+      type: object
+      properties:
+        user:
+          $ref: '#/components/schemas/User'
+        expiresAt:
+          type: string
+          format: date-time
+        csrfToken:
+          type: string
+
+    ChangePasswordRequest:
+      type: object
+      required:
+        - currentPassword
+        - newPassword
+      properties:
+        currentPassword:
+          type: string
+          format: password
+        newPassword:
+          type: string
+          format: password
+          minLength: 8
+
+    # Agent schemas
+    Agent:
+      type: object
+      properties:
+        id:
+          type: integer
+          example: 1
+        name:
+          type: string
+          example: Research Agent
+        type:
+          type: string
+          enum: [autonomous, semi-autonomous, supervised]
+          example: semi-autonomous
+        description:
+          type: string
+          nullable: true
+        capabilities:
+          type: array
+          items:
+            type: string
+          example: [research, writing, analysis]
+        status:
+          type: string
+          enum: [active, inactive, suspended]
+          example: active
+        webhook_url:
+          type: string
+          format: uri
+          nullable: true
+        webhook_events:
+          type: array
+          items:
+            type: string
+        max_concurrent_tasks:
+          type: integer
+          minimum: 1
+          maximum: 100
+          example: 3
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    AgentWithKeys:
+      allOf:
+        - $ref: '#/components/schemas/Agent'
+        - type: object
+          properties:
+            keys:
+              type: array
+              items:
+                $ref: '#/components/schemas/AgentKey'
+
+    AgentKey:
+      type: object
+      properties:
+        id:
+          type: integer
+        key_prefix:
+          type: string
+          example: cav_ak_a
+        name:
+          type: string
+          nullable: true
+        scopes:
+          type: array
+          items:
+            type: string
+            enum: [read, write, webhook:create, '*']
+        last_used_at:
+          type: string
+          format: date-time
+          nullable: true
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+        revoked_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+
+    CreateAgentRequest:
+      type: object
+      required:
+        - name
+        - type
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        type:
+          type: string
+          enum: [autonomous, semi-autonomous, supervised]
+        description:
+          type: string
+          maxLength: 1000
+          nullable: true
+        capabilities:
+          type: array
+          items:
+            type: string
+            maxLength: 50
+          maxItems: 20
+          default: []
+        maxConcurrentTasks:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 1
+
+    UpdateAgentRequest:
+      type: object
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        type:
+          type: string
+          enum: [autonomous, semi-autonomous, supervised]
+        description:
+          type: string
+          maxLength: 1000
+          nullable: true
+        capabilities:
+          type: array
+          items:
+            type: string
+            maxLength: 50
+          maxItems: 20
+        status:
+          type: string
+          enum: [active, inactive, suspended]
+        webhookUrl:
+          type: string
+          format: uri
+          nullable: true
+        webhookEvents:
+          type: array
+          items:
+            type: string
+        maxConcurrentTasks:
+          type: integer
+          minimum: 1
+          maximum: 100
+
+    GenerateKeyRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          maxLength: 100
+          nullable: true
+        scopes:
+          type: array
+          items:
+            type: string
+            enum: [read, write, webhook:create, '*']
+          default: [read, write]
+        expiresAt:
+          type: string
+          format: date-time
+          nullable: true
+
+    GenerateKeyResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+        key:
+          type: string
+          description: Full API key - only returned once at creation time
+          example: cav_ak_abc123xyz789...
+        prefix:
+          type: string
+          example: cav_ak_a
+        name:
+          type: string
+          nullable: true
+        scopes:
+          type: array
+          items:
+            type: string
+        expiresAt:
+          type: string
+          format: date-time
+          nullable: true
+        message:
+          type: string
+          example: Store this key securely - it cannot be retrieved again
+
+    UpdateExecutionRequest:
+      type: object
+      minProperties: 1
+      properties:
+        provider:
+          type: string
+          enum: [anthropic, openai]
+          nullable: true
+        providerApiKey:
+          type: string
+          nullable: true
+          description: API key for the provider (encrypted at rest)
+        providerModel:
+          type: string
+          nullable: true
+          example: claude-sonnet-4-20250514
+        systemPrompt:
+          type: string
+          nullable: true
+        executionMode:
+          type: string
+          enum: [manual, auto, polling]
+          default: manual
+        maxTokens:
+          type: integer
+          default: 4096
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
+          default: 0.7
+
+    # Task schemas
+    Task:
+      type: object
+      properties:
+        id:
+          type: integer
+          example: 1
+        project_id:
+          type: integer
+          nullable: true
+        assigned_agent_id:
+          type: integer
+          nullable: true
+        title:
+          type: string
+          example: Research competitor pricing
+        description:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [pending, assigned, in_progress, review, completed, cancelled]
+          example: assigned
+        priority:
+          type: integer
+          minimum: 1
+          maximum: 4
+          description: "1=critical, 2=high, 3=medium, 4=low"
+          example: 2
+        context:
+          type: object
+          additionalProperties: true
+          description: Additional context data for the task
+        due_date:
+          type: string
+          format: date-time
+          nullable: true
+        assigned_at:
+          type: string
+          format: date-time
+          nullable: true
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        project_name:
+          type: string
+          description: Populated when querying with joins
+        agent_name:
+          type: string
+          description: Populated when querying with joins
+
+    TaskWithDeliverables:
+      allOf:
+        - $ref: '#/components/schemas/Task'
+        - type: object
+          properties:
+            deliverables:
+              type: array
+              items:
+                type: object
+                properties:
+                  id:
+                    type: integer
+                  title:
+                    type: string
+                  status:
+                    type: string
+                  version:
+                    type: integer
+                  created_at:
+                    type: string
+                    format: date-time
+
+    TaskContext:
+      type: object
+      properties:
+        task:
+          $ref: '#/components/schemas/Task'
+        project:
+          type: object
+          nullable: true
+          properties:
+            id:
+              type: integer
+            name:
+              type: string
+        knowledge:
+          type: array
+          items:
+            $ref: '#/components/schemas/Knowledge'
+        deliverables:
+          type: array
+          items:
+            $ref: '#/components/schemas/Deliverable'
+        relatedTasks:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: integer
+              title:
+                type: string
+              status:
+                type: string
+              priority:
+                type: integer
+
+    CreateTaskRequest:
+      type: object
+      required:
+        - title
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 500
+        description:
+          type: string
+          maxLength: 10000
+          nullable: true
+        projectId:
+          type: integer
+          nullable: true
+        assignedAgentId:
+          type: integer
+          nullable: true
+        priority:
+          type: integer
+          minimum: 1
+          maximum: 4
+          default: 2
+        context:
+          type: object
+          additionalProperties: true
+          default: {}
+        dueDate:
+          type: string
+          format: date-time
+          nullable: true
+
+    UpdateTaskRequest:
+      type: object
+      minProperties: 1
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 500
+        description:
+          type: string
+          maxLength: 10000
+          nullable: true
+        projectId:
+          type: integer
+          nullable: true
+        assignedAgentId:
+          type: integer
+          nullable: true
+        status:
+          type: string
+          enum: [pending, assigned, in_progress, review, completed, cancelled]
+        priority:
+          type: integer
+          minimum: 1
+          maximum: 4
+        context:
+          type: object
+          additionalProperties: true
+        dueDate:
+          type: string
+          format: date-time
+          nullable: true
+
+    UpdateTaskStatusRequest:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum: [in_progress, review]
+          description: Agents can only set status to in_progress or review
+        progress:
+          description: Optional progress data to store in task context
+
+    NextTaskResponse:
+      type: object
+      properties:
+        task:
+          $ref: '#/components/schemas/Task'
+          nullable: true
+        reason:
+          type: string
+          enum: [concurrent_limit_reached, no_tasks]
+          description: Present when task is null
+        message:
+          type: string
+
+    # Deliverable schemas
+    Deliverable:
+      type: object
+      properties:
+        id:
+          type: integer
+        task_id:
+          type: integer
+          nullable: true
+        project_id:
+          type: integer
+          nullable: true
+        agent_id:
+          type: integer
+          nullable: true
+        title:
+          type: string
+        summary:
+          type: string
+          nullable: true
+        content:
+          type: string
+          nullable: true
+        content_type:
+          type: string
+          enum: [markdown, html, json, text, code]
+        files:
+          type: array
+          items:
+            $ref: '#/components/schemas/FileAttachment'
+        actions:
+          type: array
+          items:
+            $ref: '#/components/schemas/ActionItem'
+        status:
+          type: string
+          enum: [pending, approved, revision_requested, rejected]
+        version:
+          type: integer
+        parent_id:
+          type: integer
+          nullable: true
+        reviewed_by:
+          type: string
+          nullable: true
+        reviewed_at:
+          type: string
+          format: date-time
+          nullable: true
+        feedback:
+          type: string
+          nullable: true
+        metadata:
+          type: object
+          additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        task_title:
+          type: string
+          description: Populated when querying with joins
+        agent_name:
+          type: string
+          description: Populated when querying with joins
+        project_name:
+          type: string
+          description: Populated when querying with joins
+
+    DeliverableWithVersions:
+      allOf:
+        - $ref: '#/components/schemas/Deliverable'
+        - type: object
+          properties:
+            versions:
+              type: array
+              items:
+                type: object
+                properties:
+                  id:
+                    type: integer
+                  version:
+                    type: integer
+                  status:
+                    type: string
+                  created_at:
+                    type: string
+                    format: date-time
+                  reviewed_at:
+                    type: string
+                    format: date-time
+                    nullable: true
+
+    FileAttachment:
+      type: object
+      properties:
+        filename:
+          type: string
+        path:
+          type: string
+        mimeType:
+          type: string
+        size:
+          type: integer
+
+    ActionItem:
+      type: object
+      properties:
+        action_text:
+          type: string
+        estimated_time_minutes:
+          type: integer
+          default: 25
+        notes:
+          type: string
+        completed:
+          type: boolean
+
+    SubmitDeliverableRequest:
+      type: object
+      required:
+        - title
+      properties:
+        taskId:
+          type: integer
+          description: Link to task (optional for standalone deliverables)
+        projectId:
+          oneOf:
+            - type: integer
+            - type: string
+          description: Project ID or name (used if no taskId)
+        title:
+          type: string
+          minLength: 1
+          maxLength: 500
+        summary:
+          type: string
+          maxLength: 50000
+          description: Text summary shown in Overview tab
+        content:
+          type: string
+          maxLength: 1000000
+          description: Main content (optional if files provided)
+        contentType:
+          type: string
+          enum: [markdown, html, json, text, code]
+          default: markdown
+        files:
+          type: array
+          items:
+            type: object
+            required:
+              - filename
+              - content
+            properties:
+              filename:
+                type: string
+              content:
+                type: string
+                description: File content (prefix with "base64:" for binary)
+              mimeType:
+                type: string
+        actions:
+          type: array
+          items:
+            type: object
+            required:
+              - action_text
+            properties:
+              action_text:
+                type: string
+              estimated_time_minutes:
+                type: integer
+                default: 25
+              notes:
+                type: string
+        metadata:
+          type: object
+          additionalProperties: true
+          default: {}
+
+    SubmitRevisionRequest:
+      type: object
+      required:
+        - content
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 500
+        content:
+          type: string
+          minLength: 1
+          maxLength: 1000000
+        contentType:
+          type: string
+          enum: [markdown, html, json, text, code]
+        metadata:
+          type: object
+          additionalProperties: true
+        files:
+          type: array
+          items:
+            type: object
+            required:
+              - filename
+              - content
+            properties:
+              filename:
+                type: string
+              content:
+                type: string
+              mimeType:
+                type: string
+
+    ReviewDeliverableRequest:
+      type: object
+      required:
+        - decision
+      properties:
+        decision:
+          type: string
+          enum: [approved, revision_requested, rejected]
+        feedback:
+          type: string
+          maxLength: 10000
+          description: Required when decision is revision_requested
+
+    DeliverableFeedback:
+      type: object
+      properties:
+        id:
+          type: integer
+        status:
+          type: string
+        feedback:
+          type: string
+          nullable: true
+        reviewedBy:
+          type: string
+          nullable: true
+        reviewedAt:
+          type: string
+          format: date-time
+          nullable: true
+
+    # Project schemas
+    Project:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        description:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [active, archived, completed]
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        taskCounts:
+          type: object
+          properties:
+            total:
+              type: integer
+            completed:
+              type: integer
+            in_progress:
+              type: integer
+            pending:
+              type: integer
+
+    ProjectWithTasks:
+      allOf:
+        - $ref: '#/components/schemas/Project'
+        - type: object
+          properties:
+            tasks:
+              type: array
+              items:
+                type: object
+                properties:
+                  id:
+                    type: integer
+                  title:
+                    type: string
+                  status:
+                    type: string
+                  priority:
+                    type: integer
+                  assigned_agent_id:
+                    type: integer
+                    nullable: true
+            knowledgeCount:
+              type: integer
+
+    CreateProjectRequest:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        description:
+          type: string
+          maxLength: 2000
+          nullable: true
+
+    UpdateProjectRequest:
+      type: object
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+        description:
+          type: string
+          maxLength: 2000
+          nullable: true
+        status:
+          type: string
+          enum: [active, archived, completed]
+
+    # Knowledge schemas
+    Knowledge:
+      type: object
+      properties:
+        id:
+          type: integer
+        project_id:
+          type: integer
+          nullable: true
+        title:
+          type: string
+        content:
+          type: string
+        content_type:
+          type: string
+          enum: [markdown, html, json, text]
+        category:
+          type: string
+          nullable: true
+        tags:
+          type: array
+          items:
+            type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        project_name:
+          type: string
+          description: Populated when querying with joins
+
+    KnowledgeSearchResult:
+      allOf:
+        - $ref: '#/components/schemas/Knowledge'
+        - type: object
+          properties:
+            snippet:
+              type: string
+              description: First 200 characters of content
+
+    CreateKnowledgeRequest:
+      type: object
+      required:
+        - title
+        - content
+      properties:
+        projectId:
+          type: integer
+          nullable: true
+        title:
+          type: string
+          minLength: 1
+          maxLength: 500
+        content:
+          type: string
+          minLength: 1
+          maxLength: 500000
+        contentType:
+          type: string
+          enum: [markdown, html, json, text]
+          default: markdown
+        category:
+          type: string
+          maxLength: 100
+          nullable: true
+        tags:
+          type: array
+          items:
+            type: string
+            maxLength: 50
+          maxItems: 20
+          default: []
+
+    UpdateKnowledgeRequest:
+      type: object
+      minProperties: 1
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 500
+        content:
+          type: string
+          minLength: 1
+          maxLength: 500000
+        contentType:
+          type: string
+          enum: [markdown, html, json, text]
+        category:
+          type: string
+          maxLength: 100
+          nullable: true
+        tags:
+          type: array
+          items:
+            type: string
+            maxLength: 50
+          maxItems: 20
+
+    # Webhook schemas
+    Webhook:
+      type: object
+      properties:
+        id:
+          type: integer
+        agent_id:
+          type: integer
+        url:
+          type: string
+          format: uri
+        events:
+          type: array
+          items:
+            type: string
+            enum:
+              - task.assigned
+              - task.updated
+              - deliverable.approved
+              - deliverable.revision_requested
+              - deliverable.rejected
+              - sprint.started
+              - project.knowledge_updated
+              - briefing.generated
+        status:
+          type: string
+          enum: [active, inactive]
+        hasSecret:
+          type: boolean
+          description: Indicates if a secret is configured (secret itself is not exposed)
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        last_triggered_at:
+          type: string
+          format: date-time
+          nullable: true
+        agent_name:
+          type: string
+          description: Populated when querying with joins
+
+    WebhookWithDeliveries:
+      allOf:
+        - $ref: '#/components/schemas/Webhook'
+        - type: object
+          properties:
+            deliveries:
+              type: array
+              items:
+                $ref: '#/components/schemas/WebhookDelivery'
+
+    WebhookDelivery:
+      type: object
+      properties:
+        id:
+          type: integer
+        event_type:
+          type: string
+        status:
+          type: string
+          enum: [pending, delivered, failed]
+        attempts:
+          type: integer
+        response_status:
+          type: integer
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        last_attempt_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    CreateWebhookRequest:
+      type: object
+      required:
+        - agentId
+        - url
+        - events
+      properties:
+        agentId:
+          type: integer
+        url:
+          type: string
+          format: uri
+        events:
+          type: array
+          minItems: 1
+          items:
+            type: string
+            enum:
+              - task.assigned
+              - task.updated
+              - deliverable.approved
+              - deliverable.revision_requested
+              - deliverable.rejected
+              - sprint.started
+              - project.knowledge_updated
+              - briefing.generated
+
+    CreateWebhookResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+        agentId:
+          type: integer
+        url:
+          type: string
+        events:
+          type: array
+          items:
+            type: string
+        secret:
+          type: string
+          description: Webhook secret - only returned once at creation time
+        status:
+          type: string
+        message:
+          type: string
+
+    UpdateWebhookRequest:
+      type: object
+      minProperties: 1
+      properties:
+        url:
+          type: string
+          format: uri
+        events:
+          type: array
+          minItems: 1
+          items:
+            type: string
+        status:
+          type: string
+          enum: [active, inactive]
+
+    # Activity schemas
+    AgentActivity:
+      type: object
+      properties:
+        id:
+          type: integer
+        agent_id:
+          type: integer
+        action:
+          type: string
+          example: deliverable.submitted
+        resource_type:
+          type: string
+          nullable: true
+          example: deliverable
+        resource_id:
+          type: integer
+          nullable: true
+        details:
+          type: object
+          additionalProperties: true
+        ip_address:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        agent_name:
+          type: string
+          description: Populated when querying with joins
+
+    ActivityStats:
+      type: object
+      properties:
+        period:
+          type: string
+          enum: ['24h', '7d', '30d']
+        totalActions:
+          type: integer
+        actionsByType:
+          type: array
+          items:
+            type: object
+            properties:
+              action:
+                type: string
+              count:
+                type: integer
+        actionsByAgent:
+          type: array
+          items:
+            type: object
+            properties:
+              agent_id:
+                type: integer
+              agent_name:
+                type: string
+              count:
+                type: integer
+        actionsOverTime:
+          type: array
+          items:
+            type: object
+            properties:
+              date:
+                type: string
+                format: date
+              count:
+                type: integer
+
+    # User Key schemas
+    UserKey:
+      type: object
+      properties:
+        id:
+          type: integer
+        prefix:
+          type: string
+          example: cav_uk_abc12345
+        name:
+          type: string
+          nullable: true
+        lastUsedAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+
+    CreateUserKeyRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          description: Optional name for the key
+
+    CreateUserKeyResponse:
+      type: object
+      properties:
+        id:
+          type: integer
+        apiKey:
+          type: string
+          description: Full API key - only returned once at creation time
+          example: cav_uk_abc123xyz789...
+        prefix:
+          type: string
+        name:
+          type: string
+          nullable: true
+        warning:
+          type: string
+          example: Store this key securely - it cannot be retrieved again
+
+  responses:
+    Unauthorized:
+      description: Authentication required
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            success: false
+            error:
+              code: UNAUTHORIZED
+              message: Session required
+
+    Forbidden:
+      description: Insufficient permissions
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            success: false
+            error:
+              code: FORBIDDEN
+              message: Insufficient permissions
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            success: false
+            error:
+              code: NOT_FOUND
+              message: Resource not found
+
+    ValidationError:
+      description: Validation error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ValidationError'
+
+    ServerError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            success: false
+            error:
+              code: SERVER_ERROR
+              message: An unexpected error occurred
+
+paths:
+  # Authentication endpoints
+  /api/auth/login:
+    post:
+      tags: [Authentication]
+      summary: Login with email and password
+      description: Authenticates a user and creates a session. Returns a session cookie and CSRF token.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Login successful
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+                example: session=abc123; HttpOnly; Secure; SameSite=Lax
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/LoginResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Account inactive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/auth/logout:
+    post:
+      tags: [Authentication]
+      summary: Logout current session
+      description: Invalidates the current session and clears the session cookie.
+      security:
+        - sessionAuth: []
+      responses:
+        '200':
+          description: Logout successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      loggedOut:
+                        type: boolean
+                        example: true
+
+  /api/auth/me:
+    get:
+      tags: [Authentication]
+      summary: Get current user
+      description: Returns the authenticated user's information.
+      security:
+        - sessionAuth: []
+      responses:
+        '200':
+          description: Current user
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      user:
+                        $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/auth/csrf:
+    get:
+      tags: [Authentication]
+      summary: Get new CSRF token
+      description: Returns a new CSRF token for the current session.
+      security:
+        - sessionAuth: []
+      responses:
+        '200':
+          description: CSRF token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      csrfToken:
+                        type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/auth/change-password:
+    post:
+      tags: [Authentication]
+      summary: Change password
+      description: Changes the current user's password. Invalidates all other sessions.
+      security:
+        - sessionAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangePasswordRequest'
+      responses:
+        '200':
+          description: Password changed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      passwordChanged:
+                        type: boolean
+                        example: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  # Agent endpoints
+  /api/agents:
+    get:
+      tags: [Agents]
+      summary: List all agents
+      description: Returns all registered agents. Requires user authentication.
+      security:
+        - sessionAuth: []
+      responses:
+        '200':
+          description: List of agents
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Agent'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      tags: [Agents]
+      summary: Register a new agent
+      description: Creates a new agent. Requires admin role.
+      security:
+        - sessionAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAgentRequest'
+      responses:
+        '201':
+          description: Agent created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/Agent'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/agents/providers:
+    get:
+      tags: [Agents]
+      summary: List supported providers and models
+      description: Returns available LLM providers and their models for agent execution.
+      security:
+        - sessionAuth: []
+      responses:
+        '200':
+          description: Provider list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      anthropic:
+                        type: object
+                        properties:
+                          name:
+                            type: string
+                            example: Anthropic
+                          models:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                id:
+                                  type: string
+                                name:
+                                  type: string
+                                description:
+                                  type: string
+                      openai:
+                        type: object
+                        properties:
+                          name:
+                            type: string
+                          models:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                id:
+                                  type: string
+                                name:
+                                  type: string
+                                description:
+                                  type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/agents/me:
+    get:
+      tags: [Agents]
+      summary: Get current agent details
+      description: Returns the authenticated agent's information. Agent authentication required.
+      security:
+        - agentKey: []
+      responses:
+        '200':
+          description: Agent details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/Agent'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/agents/me/tasks:
+    get:
+      tags: [Agents]
+      summary: Get tasks assigned to current agent
+      description: Returns tasks assigned to the authenticated agent.
+      security:
+        - agentKey: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, assigned, in_progress, review, completed, cancelled]
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: List of tasks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Task'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/agents/me/tasks/next:
+    get:
+      tags: [Agents]
+      summary: Get next task from queue
+      description: |
+        Returns the next pending/assigned task for this agent, ordered by priority then creation time.
+        Returns null with a reason if no task is available or concurrent limit is reached.
+      security:
+        - agentKey: []
+      responses:
+        '200':
+          description: Next task or reason why none available
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/NextTaskResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/agents/{id}:
+    get:
+      tags: [Agents]
+      summary: Get agent details
+      description: Returns agent details including API keys.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Agent details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/AgentWithKeys'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      tags: [Agents]
+      summary: Update agent
+      description: Updates agent configuration. Requires admin role.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAgentRequest'
+      responses:
+        '200':
+          description: Agent updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/Agent'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+    delete:
+      tags: [Agents]
+      summary: Delete agent
+      description: Deletes an agent and all associated keys. Requires admin role.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Agent deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      deleted:
+                        type: boolean
+                        example: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/agents/{id}/keys:
+    post:
+      tags: [Agents]
+      summary: Generate API key for agent
+      description: |
+        Generates a new API key for the agent. The full key is only returned once.
+        Requires admin role.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerateKeyRequest'
+      responses:
+        '201':
+          description: API key generated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/GenerateKeyResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/agents/{id}/keys/{keyId}:
+    delete:
+      tags: [Agents]
+      summary: Revoke API key
+      description: Revokes an agent's API key. Requires admin role.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: keyId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Key revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      revoked:
+                        type: boolean
+                        example: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/agents/{id}/webhook-secret:
+    post:
+      tags: [Agents]
+      summary: Generate webhook secret
+      description: Generates a new webhook secret for the agent. Requires admin role.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Webhook secret generated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      secret:
+                        type: string
+                      message:
+                        type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/agents/{id}/owner:
+    put:
+      tags: [Agents]
+      summary: Link agent to user
+      description: Links or unlinks an agent to a user for "my tasks" queries. Requires admin role.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                userId:
+                  type: integer
+                  nullable: true
+                  description: User ID to link, or null to unlink
+      responses:
+        '200':
+          description: Owner updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      linked:
+                        type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/agents/{id}/execution:
+    patch:
+      tags: [Agents]
+      summary: Update execution configuration
+      description: Updates the agent's LLM provider configuration. Requires admin role.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateExecutionRequest'
+      responses:
+        '200':
+          description: Configuration updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      updated:
+                        type: boolean
+                        example: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/agents/{id}/test-connection:
+    post:
+      tags: [Agents]
+      summary: Test provider connection
+      description: Tests connectivity to the configured LLM provider. Requires admin role.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                apiKey:
+                  type: string
+                  description: Optional API key to test (uses stored if not provided)
+                provider:
+                  type: string
+                  enum: [anthropic, openai]
+                model:
+                  type: string
+      responses:
+        '200':
+          description: Connection test result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      success:
+                        type: boolean
+                      message:
+                        type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/agents/{id}/execute:
+    post:
+      tags: [Agents]
+      summary: Execute task with agent
+      description: Triggers task execution using the agent's configured LLM. Requires admin role.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - taskId
+              properties:
+                taskId:
+                  type: integer
+      responses:
+        '200':
+          description: Execution result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # Task endpoints
+  /api/tasks:
+    get:
+      tags: [Tasks]
+      summary: List all tasks
+      description: Returns tasks with optional filtering.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, assigned, in_progress, review, completed, cancelled]
+        - name: priority
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 4
+        - name: projectId
+          in: query
+          schema:
+            type: integer
+        - name: agentId
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: List of tasks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Task'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      tags: [Tasks]
+      summary: Create a new task
+      description: Creates a new task. If assignedAgentId is provided, triggers webhook notification.
+      security:
+        - sessionAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTaskRequest'
+      responses:
+        '201':
+          description: Task created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/Task'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/tasks/{id}:
+    get:
+      tags: [Tasks]
+      summary: Get task details
+      description: Returns task details including associated deliverables.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Task details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/TaskWithDeliverables'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      tags: [Tasks]
+      summary: Update task
+      description: Updates task properties. Triggers webhooks on significant changes.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateTaskRequest'
+      responses:
+        '200':
+          description: Task updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/Task'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+    delete:
+      tags: [Tasks]
+      summary: Delete task
+      description: Deletes a task. Requires admin role.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Task deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      deleted:
+                        type: boolean
+                        example: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/tasks/{id}/context:
+    get:
+      tags: [Tasks]
+      summary: Get full task context
+      description: |
+        Returns comprehensive context bundle for task execution including:
+        - Task details
+        - Project information
+        - Project knowledge base
+        - Previous deliverables and feedback
+        - Related tasks
+
+        Accessible by both agents (for their assigned tasks) and admins.
+      security:
+        - sessionAuth: []
+        - agentKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Task context
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/TaskContext'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/tasks/{id}/status:
+    patch:
+      tags: [Tasks]
+      summary: Update task status (agent endpoint)
+      description: |
+        Allows agents to update their task status. Agents can only set status to:
+        - `in_progress`: Started working on the task
+        - `review`: Submitted for review (after submitting deliverable)
+      security:
+        - agentKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateTaskStatusRequest'
+      responses:
+        '200':
+          description: Status updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/Task'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Task not assigned to this agent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  # Deliverable endpoints
+  /api/deliverables:
+    get:
+      tags: [Deliverables]
+      summary: List all deliverables
+      description: Returns deliverables with optional filtering.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, approved, revision_requested, rejected]
+        - name: taskId
+          in: query
+          schema:
+            type: integer
+        - name: agentId
+          in: query
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: List of deliverables
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Deliverable'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      tags: [Deliverables]
+      summary: Submit a deliverable
+      description: |
+        Submits a new deliverable. Can be linked to a task or standalone.
+
+        For task-linked deliverables, the agent must be assigned to the task.
+        For standalone deliverables, optionally specify a project.
+
+        Supports file attachments and action items.
+      security:
+        - agentKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitDeliverableRequest'
+      responses:
+        '201':
+          description: Deliverable submitted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/Deliverable'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Task not assigned to this agent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/deliverables/pending:
+    get:
+      tags: [Deliverables]
+      summary: List pending deliverables
+      description: Returns deliverables awaiting review, ordered by creation time.
+      security:
+        - sessionAuth: []
+      responses:
+        '200':
+          description: List of pending deliverables
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Deliverable'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/deliverables/mine:
+    get:
+      tags: [Deliverables]
+      summary: Get agent's deliverables
+      description: Returns deliverables submitted by the authenticated agent or user's agents.
+      security:
+        - agentKey: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, approved, revision_requested, rejected]
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: List of deliverables
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Deliverable'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/deliverables/{id}:
+    get:
+      tags: [Deliverables]
+      summary: Get deliverable details
+      description: Returns deliverable details including version history.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Deliverable details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/DeliverableWithVersions'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/deliverables/{id}/feedback:
+    get:
+      tags: [Deliverables]
+      summary: Get deliverable feedback
+      description: Returns feedback for a deliverable. Used by agents to understand revision requirements.
+      security:
+        - sessionAuth: []
+        - agentKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Deliverable feedback
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/DeliverableFeedback'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/deliverables/{id}/review:
+    patch:
+      tags: [Deliverables]
+      summary: Review a deliverable
+      description: |
+        Reviews a pending deliverable with one of:
+        - `approved`: Accept the deliverable (marks task as completed if linked)
+        - `revision_requested`: Request changes (feedback required)
+        - `rejected`: Reject the deliverable
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReviewDeliverableRequest'
+      responses:
+        '200':
+          description: Deliverable reviewed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/Deliverable'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/deliverables/{id}/revision:
+    post:
+      tags: [Deliverables]
+      summary: Submit a revision
+      description: Submits a revision to a deliverable that requires changes.
+      security:
+        - agentKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitRevisionRequest'
+      responses:
+        '201':
+          description: Revision submitted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/Deliverable'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  # Project endpoints
+  /api/projects:
+    get:
+      tags: [Projects]
+      summary: List all projects
+      description: Returns projects with task counts. Accessible by users and agents.
+      security:
+        - sessionAuth: []
+        - agentKey: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [active, archived, completed]
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: List of projects
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Project'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      tags: [Projects]
+      summary: Create a new project
+      description: Creates a new project. Requires admin role.
+      security:
+        - sessionAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateProjectRequest'
+      responses:
+        '201':
+          description: Project created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/Project'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/projects/{id}:
+    get:
+      tags: [Projects]
+      summary: Get project details
+      description: Returns project details including tasks. Accessible by users and agents.
+      security:
+        - sessionAuth: []
+        - agentKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Project details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/ProjectWithTasks'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      tags: [Projects]
+      summary: Update project
+      description: Updates project properties. Requires admin role.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateProjectRequest'
+      responses:
+        '200':
+          description: Project updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/Project'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+    delete:
+      tags: [Projects]
+      summary: Delete project
+      description: Deletes a project. Cannot delete if tasks are associated. Requires admin role.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Project deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      deleted:
+                        type: boolean
+                        example: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          description: Cannot delete project with associated tasks
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationError'
+
+  /api/projects/{id}/knowledge:
+    get:
+      tags: [Projects]
+      summary: Get project knowledge base
+      description: Returns knowledge entries for a project. Accessible by users and agents.
+      security:
+        - sessionAuth: []
+        - agentKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: category
+          in: query
+          schema:
+            type: string
+        - name: search
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: Project knowledge
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      project:
+                        $ref: '#/components/schemas/Project'
+                      knowledge:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Knowledge'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # Knowledge endpoints
+  /api/knowledge:
+    get:
+      tags: [Knowledge]
+      summary: List all knowledge entries
+      description: Returns knowledge entries with optional filtering.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: projectId
+          in: query
+          schema:
+            type: integer
+        - name: category
+          in: query
+          schema:
+            type: string
+        - name: search
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: List of knowledge entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Knowledge'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      tags: [Knowledge]
+      summary: Create knowledge entry
+      description: Creates a new knowledge entry. Triggers webhook for project notifications.
+      security:
+        - sessionAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateKnowledgeRequest'
+      responses:
+        '201':
+          description: Knowledge entry created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/Knowledge'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/knowledge/search:
+    get:
+      tags: [Knowledge]
+      summary: Search knowledge base
+      description: |
+        Searches knowledge entries by title and content.
+        For agents, search is restricted to projects they have tasks in.
+      security:
+        - sessionAuth: []
+        - agentKey: []
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 200
+        - name: projectId
+          in: query
+          schema:
+            type: integer
+        - name: category
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/KnowledgeSearchResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/knowledge/{id}:
+    get:
+      tags: [Knowledge]
+      summary: Get knowledge entry
+      description: Returns a single knowledge entry. Accessible by users and agents.
+      security:
+        - sessionAuth: []
+        - agentKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Knowledge entry
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/Knowledge'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      tags: [Knowledge]
+      summary: Update knowledge entry
+      description: Updates a knowledge entry. Triggers webhook for project notifications.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateKnowledgeRequest'
+      responses:
+        '200':
+          description: Knowledge entry updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/Knowledge'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+    delete:
+      tags: [Knowledge]
+      summary: Delete knowledge entry
+      description: Deletes a knowledge entry. Requires admin role.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Knowledge entry deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      deleted:
+                        type: boolean
+                        example: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # Webhook endpoints
+  /api/webhooks:
+    get:
+      tags: [Webhooks]
+      summary: List all webhooks
+      description: Returns all webhooks. Requires admin role.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: agentId
+          in: query
+          schema:
+            type: integer
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [active, inactive]
+      responses:
+        '200':
+          description: List of webhooks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Webhook'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+    post:
+      tags: [Webhooks]
+      summary: Create a webhook
+      description: Creates a new webhook for an agent. Returns secret once. Requires admin role.
+      security:
+        - sessionAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateWebhookRequest'
+      responses:
+        '201':
+          description: Webhook created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/CreateWebhookResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/webhooks/mine:
+    get:
+      tags: [Webhooks]
+      summary: Get agent's webhooks
+      description: Returns webhooks for the authenticated agent.
+      security:
+        - agentKey: []
+      responses:
+        '200':
+          description: List of webhooks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Webhook'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      tags: [Webhooks]
+      summary: Create webhook (agent self-service)
+      description: |
+        Allows agents to create their own webhooks.
+        Requires `webhook:create` scope on the API key.
+      security:
+        - agentKey: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - url
+                - events
+              properties:
+                url:
+                  type: string
+                  format: uri
+                events:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: string
+      responses:
+        '201':
+          description: Webhook created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/CreateWebhookResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Missing webhook:create scope
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /api/webhooks/{id}:
+    get:
+      tags: [Webhooks]
+      summary: Get webhook details
+      description: Returns webhook details including recent deliveries. Requires admin role.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Webhook details
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/WebhookWithDeliveries'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      tags: [Webhooks]
+      summary: Update webhook
+      description: Updates webhook configuration. Requires admin role.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateWebhookRequest'
+      responses:
+        '200':
+          description: Webhook updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/Webhook'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+    delete:
+      tags: [Webhooks]
+      summary: Delete webhook
+      description: Deletes a webhook. Requires admin role.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Webhook deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      deleted:
+                        type: boolean
+                        example: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/webhooks/{id}/rotate-secret:
+    post:
+      tags: [Webhooks]
+      summary: Rotate webhook secret
+      description: Generates a new webhook secret. Requires admin role.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: New secret generated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      secret:
+                        type: string
+                      message:
+                        type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/webhooks/{id}/deliveries:
+    get:
+      tags: [Webhooks]
+      summary: Get webhook delivery history
+      description: Returns delivery history for a webhook. Requires admin role.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [pending, delivered, failed]
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: Delivery history
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/WebhookDelivery'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/webhooks/{id}/deliveries/{deliveryId}/retry:
+    post:
+      tags: [Webhooks]
+      summary: Retry failed delivery
+      description: Retries a failed webhook delivery. Requires admin role.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: deliveryId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Delivery retried
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      retried:
+                        type: boolean
+                        example: true
+                      result:
+                        type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # Activity endpoints
+  /api/activity:
+    get:
+      tags: [Activity]
+      summary: List agent activity
+      description: Returns agent activity log with optional filtering.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: agentId
+          in: query
+          schema:
+            type: integer
+        - name: action
+          in: query
+          schema:
+            type: string
+        - name: resourceType
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: Activity log
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AgentActivity'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/activity/stats:
+    get:
+      tags: [Activity]
+      summary: Get activity statistics
+      description: Returns aggregated activity statistics for a time period.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: agentId
+          in: query
+          schema:
+            type: integer
+        - name: period
+          in: query
+          schema:
+            type: string
+            enum: ['24h', '7d', '30d']
+            default: '7d'
+      responses:
+        '200':
+          description: Activity statistics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/ActivityStats'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/activity/agents/{id}:
+    get:
+      tags: [Activity]
+      summary: Get agent activity
+      description: Returns activity for a specific agent with summary statistics.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: Agent activity
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      agent:
+                        type: object
+                        properties:
+                          id:
+                            type: integer
+                          name:
+                            type: string
+                      stats:
+                        type: object
+                        properties:
+                          total_actions:
+                            type: integer
+                          unique_actions:
+                            type: integer
+                          first_activity:
+                            type: string
+                            format: date-time
+                          last_activity:
+                            type: string
+                            format: date-time
+                      activities:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/AgentActivity'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # User endpoints
+  /api/users:
+    get:
+      tags: [Users]
+      summary: List all users
+      description: Returns all users. Requires admin role.
+      security:
+        - sessionAuth: []
+      responses:
+        '200':
+          description: List of users
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /api/users/me:
+    get:
+      tags: [Users]
+      summary: Get current user profile
+      description: Returns the authenticated user's profile.
+      security:
+        - sessionAuth: []
+      responses:
+        '200':
+          description: User profile
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/users/me/keys:
+    get:
+      tags: [Users]
+      summary: List personal API keys
+      description: Returns the user's personal API keys (prefixes only, not full keys).
+      security:
+        - sessionAuth: []
+      responses:
+        '200':
+          description: List of API keys
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/UserKey'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      tags: [Users]
+      summary: Generate personal API key
+      description: |
+        Generates a new personal API key for MCP integration.
+        The full key is only returned once at creation time.
+      security:
+        - sessionAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUserKeyRequest'
+      responses:
+        '201':
+          description: API key generated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/CreateUserKeyResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/users/me/keys/{keyId}:
+    patch:
+      tags: [Users]
+      summary: Update API key name
+      description: Updates the name of a personal API key.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: keyId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+      responses:
+        '200':
+          description: Key updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      updated:
+                        type: boolean
+                        example: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      tags: [Users]
+      summary: Revoke personal API key
+      description: Revokes a personal API key.
+      security:
+        - sessionAuth: []
+      parameters:
+        - name: keyId
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Key revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      revoked:
+                        type: boolean
+                        example: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'

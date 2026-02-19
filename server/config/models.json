@@ -1,0 +1,65 @@
+{
+  "providers": {
+    "anthropic": {
+      "name": "Anthropic (Claude)",
+      "models": [
+        {
+          "id": "claude-opus-4-6",
+          "name": "Claude Opus 4.6",
+          "description": "Most capable model for complex tasks",
+          "maxTokens": 32000,
+          "contextWindow": 200000
+        },
+        {
+          "id": "claude-sonnet-4-5-20250929",
+          "name": "Claude Sonnet 4.5",
+          "description": "Best balance of speed and intelligence",
+          "maxTokens": 8192,
+          "contextWindow": 200000,
+          "default": true
+        },
+        {
+          "id": "claude-haiku-4-5-20251001",
+          "name": "Claude Haiku 4.5",
+          "description": "Fast and cost-effective for simpler tasks",
+          "maxTokens": 8192,
+          "contextWindow": 200000
+        }
+      ]
+    },
+    "openai": {
+      "name": "OpenAI (GPT)",
+      "models": [
+        {
+          "id": "gpt-4o",
+          "name": "GPT-4o",
+          "description": "Most capable GPT model",
+          "maxTokens": 16384,
+          "contextWindow": 128000,
+          "default": true
+        },
+        {
+          "id": "gpt-4o-mini",
+          "name": "GPT-4o Mini",
+          "description": "Fast and affordable for simpler tasks",
+          "maxTokens": 16384,
+          "contextWindow": 128000
+        },
+        {
+          "id": "gpt-4-turbo",
+          "name": "GPT-4 Turbo",
+          "description": "High intelligence with vision capabilities",
+          "maxTokens": 4096,
+          "contextWindow": 128000
+        },
+        {
+          "id": "o3-mini",
+          "name": "o3-mini",
+          "description": "Fast reasoning model",
+          "maxTokens": 16384,
+          "contextWindow": 200000
+        }
+      ]
+    }
+  }
+}

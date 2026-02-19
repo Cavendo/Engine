@@ -1,0 +1,9 @@
+# Cavendo Engine OpenClaw Skill Dependencies
+
+# Core dependencies
+cavendo-engine>=0.1.0     # Official Cavendo Python SDK
+python-dotenv>=1.0.0      # Environment variable management
+
+# Optional dependencies (uncomment if needed)
+# requests>=2.31.0        # For custom HTTP calls
+# click>=8.1.0            # For enhanced CLI interfaces
