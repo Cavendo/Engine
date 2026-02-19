@@ -1,0 +1,41 @@
+name: Documentation Issue
+description: Report unclear, missing, or incorrect documentation
+title: "[Docs]: "
+labels: ["documentation"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Good docs matter. If something was confusing, missing, or wrong, let us know.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What's the issue?
+      description: Describe what was unclear, missing, or incorrect.
+      placeholder: Describe the documentation issue...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: where
+    attributes:
+      label: Where?
+      description: Which documentation is affected?
+      options:
+        - README
+        - API docs
+        - Setup / Installation guide
+        - Code comments
+        - Configuration
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: What would be clearer?
+      description: If you have a suggestion for how to fix it, share it here.
+    validations:
+      required: false

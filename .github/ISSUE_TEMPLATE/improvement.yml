@@ -1,0 +1,55 @@
+name: Improvement Suggestion
+description: Suggest an improvement to existing functionality
+title: "[Improvement]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have an idea for how something could work better? We'd love to hear it.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What could be improved?
+      description: Describe the current behavior and what you'd like to see changed.
+      placeholder: Describe the improvement...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of the system does this relate to?
+      options:
+        - API / Backend
+        - Admin UI / Frontend
+        - Database / Migrations
+        - Delivery Routes
+        - Agent Execution
+        - Knowledge Base
+        - Authentication / Security
+        - Documentation
+        - Setup / Installation
+        - Developer Experience
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why would this help?
+      description: What problem does this solve or what does it make easier?
+      placeholder: Explain the impact...
+    validations:
+      required: true
+
+  - type: textarea
+    id: approach
+    attributes:
+      label: Suggested approach (optional)
+      description: If you have ideas on how to implement this, share them here.
+    validations:
+      required: false
