@@ -1,4 +1,3 @@
-import Database from 'better-sqlite3';
 import { readFileSync, mkdirSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
@@ -6,20 +5,23 @@ import { hashPassword } from '../utils/crypto.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-const DB_PATH = process.env.DATABASE_PATH || join(__dirname, '../../data/cavendo.db');
+/**
+ * Initialize database schema and seed data.
+ * Accepts the shared db singleton — does NOT open/close its own connection.
+ * @param {import('better-sqlite3').Database} db
+ */
+export async function initializeDatabase(db) {
+  const DB_PATH = process.env.DATABASE_PATH || join(__dirname, '../../data/cavendo.db');
 
-export async function initializeDatabase() {
   // Ensure the data directory exists
   mkdirSync(dirname(DB_PATH), { recursive: true });
-
-  const db = new Database(DB_PATH);
 
   // Enable foreign keys
   db.pragma('foreign_keys = ON');
 
   // Read and execute schema
-  // Note: schema.sql is the canonical v0.1.0 baseline schema.
-  // For future upgrades, use the migrate.js script separately.
+  // Note: schema.sql is the canonical baseline schema.
+  // For upgrades, use the migrator (server/db/migrator.js) which runs before this.
   const schema = readFileSync(join(__dirname, 'schema.sql'), 'utf-8');
   db.exec(schema);
 
@@ -92,14 +94,22 @@ export async function initializeDatabase() {
     console.log('Default project created: "My First Project"');
   }
 
-  db.close();
   return true;
 }
 
-// Run if called directly
+// Run if called directly (standalone bootstrap)
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  initializeDatabase().catch(err => {
+  // When run standalone, create our own db connection
+  const Database = (await import('better-sqlite3')).default;
+  const DB_PATH = process.env.DATABASE_PATH || join(__dirname, '../../data/cavendo.db');
+  mkdirSync(dirname(DB_PATH), { recursive: true });
+  const db = new Database(DB_PATH);
+  db.pragma('journal_mode = WAL');
+  initializeDatabase(db).then(() => {
+    db.close();
+  }).catch(err => {
     console.error('Failed to initialize database:', err);
+    db.close();
     process.exit(1);
   });
 }

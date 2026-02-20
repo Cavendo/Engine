@@ -115,14 +115,14 @@ router.post('/', userAuth, requireRoles('admin'), validateBody(createConnectionS
     const result = db.prepare(`
       INSERT INTO storage_connections (
         name, provider, bucket, region, endpoint,
-        access_key_id_encrypted, access_key_id_iv, access_key_id_preview,
-        secret_access_key_encrypted, secret_access_key_iv,
+        access_key_id_encrypted, access_key_id_iv, access_key_id_key_version, access_key_id_preview,
+        secret_access_key_encrypted, secret_access_key_iv, secret_access_key_key_version,
         created_by
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       name, provider || 's3', bucket, region || 'us-east-1', endpoint || null,
-      akEncrypted.encrypted, akEncrypted.iv, akPreview,
-      skEncrypted.encrypted, skEncrypted.iv,
+      akEncrypted.encrypted, akEncrypted.iv, akEncrypted.keyVersion, akPreview,
+      skEncrypted.encrypted, skEncrypted.iv, skEncrypted.keyVersion,
       req.user?.id || null
     );
 
@@ -163,14 +163,14 @@ router.put('/:id', userAuth, requireRoles('admin'), validateParams(idParamSchema
 
     if (access_key_id !== undefined) {
       const akEncrypted = encrypt(access_key_id);
-      updates.push('access_key_id_encrypted = ?', 'access_key_id_iv = ?', 'access_key_id_preview = ?');
-      values.push(akEncrypted.encrypted, akEncrypted.iv, '...' + access_key_id.slice(-4));
+      updates.push('access_key_id_encrypted = ?', 'access_key_id_iv = ?', 'access_key_id_key_version = ?', 'access_key_id_preview = ?');
+      values.push(akEncrypted.encrypted, akEncrypted.iv, akEncrypted.keyVersion, '...' + access_key_id.slice(-4));
     }
 
     if (secret_access_key !== undefined) {
       const skEncrypted = encrypt(secret_access_key);
-      updates.push('secret_access_key_encrypted = ?', 'secret_access_key_iv = ?');
-      values.push(skEncrypted.encrypted, skEncrypted.iv);
+      updates.push('secret_access_key_encrypted = ?', 'secret_access_key_iv = ?', 'secret_access_key_key_version = ?');
+      values.push(skEncrypted.encrypted, skEncrypted.iv, skEncrypted.keyVersion);
     }
 
     updates.push("updated_at = datetime('now')");
@@ -240,8 +240,8 @@ router.post('/:id/test', userAuth, requireRoles('admin'), validateParams(idParam
       bucket: conn.bucket,
       region: conn.region,
       endpoint: conn.endpoint,
-      access_key_id: decrypt(conn.access_key_id_encrypted, conn.access_key_id_iv),
-      secret_access_key: decrypt(conn.secret_access_key_encrypted, conn.secret_access_key_iv)
+      access_key_id: decrypt(conn.access_key_id_encrypted, conn.access_key_id_iv, conn.access_key_id_key_version),
+      secret_access_key: decrypt(conn.secret_access_key_encrypted, conn.secret_access_key_iv, conn.secret_access_key_key_version)
     };
 
     const result = await testS3Connection(config);

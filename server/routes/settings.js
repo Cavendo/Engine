@@ -6,6 +6,8 @@ import * as response from '../utils/response.js';
 import { userAuth, requireRoles } from '../middleware/userAuth.js';
 import { getConfig, isConfigured, sendEmail, reloadConfig } from '../services/emailProvider.js';
 import { getDispatcherStatus } from '../services/taskDispatcher.js';
+import { runCryptoHealthCheck } from '../utils/crypto.js';
+import db from '../db/connection.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = join(__dirname, '../..');
@@ -193,6 +195,28 @@ router.get('/dispatcher', userAuth, requireRoles('admin'), (req, res) => {
     response.success(res, status);
   } catch (err) {
     console.error('Error getting dispatcher status:', err);
+    response.serverError(res);
+  }
+});
+
+/**
+ * GET /api/settings/crypto-health
+ * Admin-only endpoint to check encryption health status
+ */
+router.get('/crypto-health', userAuth, requireRoles('admin'), (req, res) => {
+  try {
+    const health = runCryptoHealthCheck(db);
+    response.success(res, {
+      ok: health.ok,
+      total: health.total,
+      failed: health.failed,
+      keyVersions: health.keyVersions,
+      currentVersion: health.currentVersion,
+      details: health.details,
+      truncated: health.truncated
+    });
+  } catch (err) {
+    console.error('Error running crypto health check:', err);
     response.serverError(res);
   }
 });

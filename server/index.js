@@ -31,8 +31,10 @@ import { startRetrySweep, stopRetrySweep } from './services/routeDispatcher.js';
 // Import response utilities
 import * as response from './utils/response.js';
 
-// Import database initialization
+// Import database initialization and migration
 import { initializeDatabase } from './db/init.js';
+import { runMigrations } from './db/migrator.js';
+import { runCryptoHealthCheck } from './utils/crypto.js';
 
 // Import security middleware
 import {
@@ -222,15 +224,47 @@ app.use((req, res) => {
 // ============================================
 
 async function startServer() {
-  // Initialize database (async for bcrypt)
+  // 1. Run migrations (schema changes, backfills)
   try {
-    await initializeDatabase();
+    runMigrations(db);
+  } catch (err) {
+    console.error('Failed to run migrations:', err);
+    process.exit(1);
+  }
+
+  // 2. Initialize database (schema exec + seeding) — uses shared db singleton
+  try {
+    await initializeDatabase(db);
   } catch (err) {
     console.error('Failed to initialize database:', err);
     process.exit(1);
   }
 
-  // Start server
+  // 3. Crypto health check — verify all encrypted rows are decryptable
+  try {
+    const health = runCryptoHealthCheck(db);
+    if (!health.ok) {
+      console.error(`[Crypto] Health check FAILED: ${health.failed}/${health.total} encrypted values cannot be decrypted`);
+      for (const d of health.details.slice(0, 10)) {
+        console.error(`  - ${d.table}#${d.id} ${d.column} (keyVersion=${d.keyVersion}): ${d.error}`);
+      }
+      if (process.env.NODE_ENV === 'production') {
+        console.error('[Crypto] Aborting startup in production. Fix encryption keys or run crypto-rotate script.');
+        process.exit(1);
+      } else {
+        console.warn('[Crypto] Continuing in development mode despite crypto health failures.');
+      }
+    } else if (health.total > 0) {
+      console.log(`[Crypto] Health check passed: ${health.total} encrypted value(s) verified`);
+    }
+  } catch (err) {
+    console.error('[Crypto] Health check error:', err.message);
+    if (process.env.NODE_ENV === 'production') {
+      process.exit(1);
+    }
+  }
+
+  // 4. Start server
   app.listen(PORT, () => {
     console.log(`
 ╔══════════════════════════════════════════════════════════╗

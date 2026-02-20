@@ -88,7 +88,7 @@ export async function executeTask(agent, task) {
   // Decrypt API key
   let apiKey;
   try {
-    apiKey = decrypt(agent.provider_api_key_encrypted, agent.provider_api_key_iv);
+    apiKey = decrypt(agent.provider_api_key_encrypted, agent.provider_api_key_iv, agent.encryption_key_version);
   } catch (decryptErr) {
     const err = new Error('Failed to decrypt provider API key — check ENCRYPTION_KEY and re-save the key in agent settings');
     err.category = 'config_error';

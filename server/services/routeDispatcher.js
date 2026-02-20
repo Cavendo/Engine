@@ -438,8 +438,8 @@ function resolveStorageConfig(config) {
     bucket: conn.bucket,
     region: conn.region,
     endpoint: conn.endpoint,
-    access_key_id: decrypt(conn.access_key_id_encrypted, conn.access_key_id_iv),
-    secret_access_key: decrypt(conn.secret_access_key_encrypted, conn.secret_access_key_iv)
+    access_key_id: decrypt(conn.access_key_id_encrypted, conn.access_key_id_iv, conn.access_key_id_key_version),
+    secret_access_key: decrypt(conn.secret_access_key_encrypted, conn.secret_access_key_iv, conn.secret_access_key_key_version)
   };
 }
 

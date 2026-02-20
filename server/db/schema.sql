@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS agents (
     provider TEXT, -- 'anthropic', 'openai', etc.
     provider_api_key_encrypted TEXT,
     provider_api_key_iv TEXT,
+    encryption_key_version INTEGER DEFAULT NULL, -- Keyring version used for provider_api_key
     provider_model TEXT, -- 'claude-opus-4', 'gpt-4o', etc.
     system_prompt TEXT, -- Standing instructions for this agent
     execution_mode TEXT DEFAULT 'manual' CHECK (execution_mode IN ('manual', 'auto', 'polling', 'human')),
@@ -303,9 +304,11 @@ CREATE TABLE IF NOT EXISTS storage_connections (
     endpoint TEXT,
     access_key_id_encrypted TEXT NOT NULL,
     access_key_id_iv TEXT NOT NULL,
+    access_key_id_key_version INTEGER DEFAULT NULL, -- Keyring version used for access_key_id
     access_key_id_preview TEXT NOT NULL,  -- Last 4 chars for display: "...ABCD"
     secret_access_key_encrypted TEXT NOT NULL,
     secret_access_key_iv TEXT NOT NULL,
+    secret_access_key_key_version INTEGER DEFAULT NULL, -- Keyring version used for secret_access_key
     created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now'))

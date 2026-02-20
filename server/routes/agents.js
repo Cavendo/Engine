@@ -1144,7 +1144,7 @@ router.put('/:id/owner', userAuth, requireRoles('admin'), validateBody(updateAge
 router.post('/:id/test-connection', userAuth, requireRoles('admin'), async (req, res) => {
   try {
     const agent = db.prepare(`
-      SELECT id, provider, provider_api_key_encrypted, provider_api_key_iv, provider_model
+      SELECT id, provider, provider_api_key_encrypted, provider_api_key_iv, encryption_key_version, provider_model
       FROM agents WHERE id = ?
     `).get(req.params.id);
 
@@ -1158,7 +1158,7 @@ router.post('/:id/test-connection', userAuth, requireRoles('admin'), async (req,
     const model = req.body.model || agent.provider_model;
 
     if (!apiKey && agent.provider_api_key_encrypted) {
-      apiKey = decrypt(agent.provider_api_key_encrypted, agent.provider_api_key_iv);
+      apiKey = decrypt(agent.provider_api_key_encrypted, agent.provider_api_key_iv, agent.encryption_key_version);
     }
 
     if (!apiKey || !provider) {
@@ -1302,12 +1302,12 @@ router.patch('/:id/execution', userAuth, requireRoles('admin'), validateBody(upd
 
     if (providerApiKey !== undefined) {
       if (providerApiKey) {
-        const { encrypted, iv } = encrypt(providerApiKey);
-        updates.push('provider_api_key_encrypted = ?', 'provider_api_key_iv = ?');
-        values.push(encrypted, iv);
+        const { encrypted, iv, keyVersion } = encrypt(providerApiKey);
+        updates.push('provider_api_key_encrypted = ?', 'provider_api_key_iv = ?', 'encryption_key_version = ?');
+        values.push(encrypted, iv, keyVersion);
       } else {
-        updates.push('provider_api_key_encrypted = ?', 'provider_api_key_iv = ?');
-        values.push(null, null);
+        updates.push('provider_api_key_encrypted = ?', 'provider_api_key_iv = ?', 'encryption_key_version = ?');
+        values.push(null, null, null);
       }
     }
 
