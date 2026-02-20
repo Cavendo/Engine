@@ -76,23 +76,15 @@ export default function Tasks() {
   };
 
   const handleCreateTask = async (data) => {
-    try {
-      await api.tasks.create(data);
-      loadData();
-      setShowCreateModal(false);
-    } catch (err) {
-      console.error('Failed to create task:', err);
-    }
+    const result = await api.tasks.create(data);
+    loadData();
+    return result;
   };
 
   const handleUpdateTask = async (id, data) => {
-    try {
-      await api.tasks.update(id, data);
-      loadData();
-      setEditTask(null);
-    } catch (err) {
-      console.error('Failed to update task:', err);
-    }
+    const result = await api.tasks.update(id, data);
+    loadData();
+    return result;
   };
 
   const handleDeleteTask = async (id) => {
@@ -227,7 +219,14 @@ export default function Tasks() {
                         <span className="text-sm">{task.agentName}</span>
                       </div>
                     ) : (
-                      <span className="text-sm text-gray-400">Unassigned</span>
+                      <div>
+                        <span className="text-sm text-gray-400">Unassigned</span>
+                        {task.routingDecision && (
+                          <p className="text-xs text-amber-500 mt-0.5 truncate max-w-[200px]" title={task.routingDecision}>
+                            {task.routingDecision}
+                          </p>
+                        )}
+                      </div>
                     )}
                   </td>
                   <td className="px-6 py-4">
@@ -290,6 +289,7 @@ function EditTaskModal({ task, onClose, onSave, onDelete, onExecuted, agents, pr
   const [context, setContext] = useState(null);
   const [showContext, setShowContext] = useState(false);
   const [contextLoading, setContextLoading] = useState(false);
+  const [routingWarning, setRoutingWarning] = useState(null);
 
   // Parse execution error from task context
   const execError = task?.context?.lastExecutionError;
@@ -312,6 +312,7 @@ function EditTaskModal({ task, onClose, onSave, onDelete, onExecuted, agents, pr
       setContext(null);
       setShowContext(false);
       setExecResult(null);
+      setRoutingWarning(null);
     }
   }, [task]);
 
@@ -344,17 +345,33 @@ function EditTaskModal({ task, onClose, onSave, onDelete, onExecuted, agents, pr
   const handleSubmit = async (e) => {
     e.preventDefault();
     setSaving(true);
+    setRoutingWarning(null);
     try {
-      await onSave(task.id, {
+      const result = await onSave(task.id, {
         title: formData.title,
         description: formData.description,
         projectId: formData.projectId ? parseInt(formData.projectId) : null,
-        assignedAgentId: (formData.assignedAgentId && formData.assignedAgentId !== 'auto') ? parseInt(formData.assignedAgentId) : null,
+        assignedAgentId: formData.assignedAgentId === 'auto' ? 'auto' : (formData.assignedAgentId ? parseInt(formData.assignedAgentId) : null),
         priority: parseInt(formData.priority),
         status: formData.status,
         dueDate: formData.dueDate || null,
         tags: formData.tags ? formData.tags.split(',').map(s => s.trim()).filter(Boolean) : []
       });
+
+      // Check for routing warning (auto-assign attempted but failed)
+      if (result?.routing?.attempted && !result.routing.matched) {
+        setRoutingWarning({
+          decision: result.routing.decision,
+          needsConfiguration: result.routing.needsConfiguration,
+          projectId: formData.projectId
+        });
+        // Don't close modal — let user see the warning
+        return;
+      }
+
+      onClose();
+    } catch (err) {
+      console.error('Failed to update task:', err);
     } finally { setSaving(false); }
   };
 
@@ -363,6 +380,28 @@ function EditTaskModal({ task, onClose, onSave, onDelete, onExecuted, agents, pr
   return (
     <Modal isOpen={!!task} onClose={onClose} title="Edit Task">
       <form onSubmit={handleSubmit} className="space-y-4">
+        {routingWarning && (
+          <div className="rounded-lg border border-amber-200 bg-amber-50 p-4">
+            <div className="flex gap-3">
+              <AlertTriangle className="h-5 w-5 text-amber-500 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-medium text-amber-800">Auto-assign could not find an agent</p>
+                <p className="text-sm text-amber-700 mt-1">
+                  {routingWarning.decision || 'No routing rules or default agent configured for this project.'}
+                </p>
+                {routingWarning.needsConfiguration && (
+                  <p className="text-sm text-amber-700 mt-2">
+                    To enable auto-assign, configure{' '}
+                    <a href={routingWarning.projectId ? `/projects/${routingWarning.projectId}` : '/projects'} className="underline font-medium">
+                      routing rules or a default agent
+                    </a>{' '}
+                    for this project.
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
         <Input label="Title" value={formData.title} onChange={(e) => setFormData({ ...formData, title: e.target.value })} required />
         <TextArea label="Description" value={formData.description} onChange={(e) => setFormData({ ...formData, description: e.target.value })} />
         <div className="grid grid-cols-3 gap-4">
@@ -538,59 +577,124 @@ function TagInput({ value, onChange }) {
 function CreateTaskModal({ isOpen, onClose, onSubmit, agents, projects }) {
   const [formData, setFormData] = useState({ title: '', description: '', projectId: '', assignedAgentId: '', priority: '2', dueDate: '', tags: '' });
   const [loading, setLoading] = useState(false);
+  const [routingWarning, setRoutingWarning] = useState(null);
+  const [error, setError] = useState(null);
 
   const showAutoHint = formData.assignedAgentId === 'auto' && !formData.projectId;
+
+  const resetForm = () => {
+    setFormData({ title: '', description: '', projectId: '', assignedAgentId: '', priority: '2', dueDate: '', tags: '' });
+    setRoutingWarning(null);
+    setError(null);
+  };
+
+  const handleClose = () => {
+    resetForm();
+    onClose();
+  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     setLoading(true);
+    setError(null);
+    setRoutingWarning(null);
     try {
-      await onSubmit({
+      const result = await onSubmit({
         title: formData.title,
         description: formData.description,
         projectId: formData.projectId ? parseInt(formData.projectId) : null,
-        assignedAgentId: (formData.assignedAgentId && formData.assignedAgentId !== 'auto') ? parseInt(formData.assignedAgentId) : null,
+        assignedAgentId: formData.assignedAgentId === 'auto' ? 'auto' : (formData.assignedAgentId ? parseInt(formData.assignedAgentId) : null),
         priority: parseInt(formData.priority),
         dueDate: formData.dueDate || null,
         tags: formData.tags ? formData.tags.split(',').map(s => s.trim()).filter(Boolean) : []
       });
-      setFormData({ title: '', description: '', projectId: '', assignedAgentId: '', priority: '2', dueDate: '', tags: '' });
-    } finally { setLoading(false); }
+
+      // Check for routing warning (task created but auto-assign failed)
+      if (result?.routing?.attempted && !result.routing.matched) {
+        setRoutingWarning({
+          decision: result.routing.decision,
+          needsConfiguration: result.routing.needsConfiguration,
+          projectId: formData.projectId
+        });
+        // Don't close modal — let user see the warning
+        return;
+      }
+
+      resetForm();
+      onClose();
+    } catch (err) {
+      setError(err.message || 'Failed to create task.');
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
-    <Modal isOpen={isOpen} onClose={onClose} title="Create Task">
-      <form onSubmit={handleSubmit} className="space-y-4">
-        <Input label="Title" value={formData.title} onChange={(e) => setFormData({ ...formData, title: e.target.value })} placeholder="Task title" required />
-        <TextArea label="Description" value={formData.description} onChange={(e) => setFormData({ ...formData, description: e.target.value })} placeholder="Describe what needs to be done..." />
-        <div className="grid grid-cols-2 gap-4">
-          <Select label="Project" value={formData.projectId} onChange={(e) => setFormData({ ...formData, projectId: e.target.value })}
-            options={[{ value: '', label: 'None' }, ...projects.map(p => ({ value: p.id, label: p.name }))]}
-          />
-          <div>
-            <Select label="Assign to Agent" value={formData.assignedAgentId} onChange={(e) => setFormData({ ...formData, assignedAgentId: e.target.value })}
-              options={buildAgentOptions(agents, {
-                prefix: [{ value: '', label: 'Unassigned' }, { value: 'auto', label: 'Auto-assign (best available)' }],
-                activeOnly: true
-              })}
-            />
-            {showAutoHint && (
-              <p className="text-xs text-amber-600 mt-1">Select a project for auto-assign to work via routing rules.</p>
-            )}
+    <Modal isOpen={isOpen} onClose={handleClose} title="Create Task">
+      {routingWarning ? (
+        <div className="space-y-4">
+          <div className="rounded-lg border border-amber-200 bg-amber-50 p-4">
+            <div className="flex gap-3">
+              <AlertTriangle className="h-5 w-5 text-amber-500 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-medium text-amber-800">Task created, but auto-assign could not find an agent</p>
+                <p className="text-sm text-amber-700 mt-1">
+                  {routingWarning.decision || 'No routing rules or default agent configured for this project.'}
+                </p>
+                {routingWarning.needsConfiguration && (
+                  <p className="text-sm text-amber-700 mt-2">
+                    To enable auto-assign, configure{' '}
+                    <a href={routingWarning.projectId ? `/projects/${routingWarning.projectId}` : '/projects'} className="underline font-medium">
+                      routing rules or a default agent
+                    </a>{' '}
+                    for this project.
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
+          <div className="flex justify-end">
+            <Button onClick={handleClose}>Close</Button>
           </div>
         </div>
-        <div className="grid grid-cols-2 gap-4">
-          <Select label="Priority" value={formData.priority} onChange={(e) => setFormData({ ...formData, priority: e.target.value })}
-            options={[{ value: '1', label: 'Critical' }, { value: '2', label: 'High' }, { value: '3', label: 'Medium' }, { value: '4', label: 'Low' }]}
-          />
-          <Input label="Due Date" type="date" value={formData.dueDate} onChange={(e) => setFormData({ ...formData, dueDate: e.target.value })} />
-        </div>
-        <TagInput value={formData.tags} onChange={(v) => setFormData({ ...formData, tags: v })} />
-        <div className="flex justify-end gap-3 pt-4">
-          <Button type="button" variant="secondary" onClick={onClose}>Cancel</Button>
-          <Button type="submit" loading={loading}>Create</Button>
-        </div>
-      </form>
+      ) : (
+        <form onSubmit={handleSubmit} className="space-y-4">
+          {error && (
+            <div className="rounded-lg border border-red-200 bg-red-50 p-3">
+              <p className="text-sm text-red-700">{error}</p>
+            </div>
+          )}
+          <Input label="Title" value={formData.title} onChange={(e) => setFormData({ ...formData, title: e.target.value })} placeholder="Task title" required />
+          <TextArea label="Description" value={formData.description} onChange={(e) => setFormData({ ...formData, description: e.target.value })} placeholder="Describe what needs to be done..." />
+          <div className="grid grid-cols-2 gap-4">
+            <Select label="Project" value={formData.projectId} onChange={(e) => setFormData({ ...formData, projectId: e.target.value })}
+              options={[{ value: '', label: 'None' }, ...projects.map(p => ({ value: p.id, label: p.name }))]}
+            />
+            <div>
+              <Select label="Assign to Agent" value={formData.assignedAgentId} onChange={(e) => setFormData({ ...formData, assignedAgentId: e.target.value })}
+                options={buildAgentOptions(agents, {
+                  prefix: [{ value: '', label: 'Unassigned' }, { value: 'auto', label: 'Auto-assign (best available)' }],
+                  activeOnly: true
+                })}
+              />
+              {showAutoHint && (
+                <p className="text-xs text-amber-600 mt-1">Select a project for auto-assign to work via routing rules.</p>
+              )}
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-4">
+            <Select label="Priority" value={formData.priority} onChange={(e) => setFormData({ ...formData, priority: e.target.value })}
+              options={[{ value: '1', label: 'Critical' }, { value: '2', label: 'High' }, { value: '3', label: 'Medium' }, { value: '4', label: 'Low' }]}
+            />
+            <Input label="Due Date" type="date" value={formData.dueDate} onChange={(e) => setFormData({ ...formData, dueDate: e.target.value })} />
+          </div>
+          <TagInput value={formData.tags} onChange={(v) => setFormData({ ...formData, tags: v })} />
+          <div className="flex justify-end gap-3 pt-4">
+            <Button type="button" variant="secondary" onClick={handleClose}>Cancel</Button>
+            <Button type="submit" loading={loading}>Create</Button>
+          </div>
+        </form>
+      )}
     </Modal>
   );
 }

@@ -159,7 +159,7 @@ export const createTaskSchema = z.object({
   description: z.string().max(10000).optional().nullable(),
   projectId: z.number().int().positive().optional().nullable(),
   sprintId: z.number().int().positive().optional().nullable(),
-  assignedAgentId: z.number().int().positive().optional().nullable(),
+  assignedAgentId: z.union([z.number().int().positive(), z.literal('auto')]).optional().nullable(),
   priority: z.number().int().min(1).max(4).optional().default(2),
   tags: z.array(z.string().max(50)).max(20).optional().default([]), // For routing rules matching
   context: z.record(z.any()).optional().default({}),
@@ -175,7 +175,7 @@ export const updateTaskSchema = z.object({
   description: z.string().max(10000).optional().nullable(),
   projectId: z.number().int().positive().optional().nullable(),
   sprintId: z.number().int().positive().optional().nullable(),
-  assignedAgentId: z.number().int().positive().optional().nullable(),
+  assignedAgentId: z.union([z.number().int().positive(), z.literal('auto')]).optional().nullable(),
   status: z.enum(['pending', 'assigned', 'in_progress', 'review', 'completed', 'cancelled']).optional(),
   priority: z.number().int().min(1).max(4).optional(),
   context: z.record(z.any()).optional(),

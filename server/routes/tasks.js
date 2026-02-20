@@ -171,8 +171,10 @@ router.post('/', dualAuth, validateBody(createTaskSchema), (req, res) => {
       taskType, requiredCapabilities, preferredAgentId
     } = req.body;
 
-    // Validate agent exists if provided
-    if (assignedAgentId) {
+    const isAutoAssign = assignedAgentId === 'auto';
+
+    // Validate agent exists if directly assigned (not 'auto')
+    if (assignedAgentId && !isAutoAssign) {
       const agent = db.prepare('SELECT id FROM agents WHERE id = ?').get(assignedAgentId);
       if (!agent) {
         return response.validationError(res, 'Invalid agent ID');
@@ -196,12 +198,12 @@ router.post('/', dualAuth, validateBody(createTaskSchema), (req, res) => {
     }
 
     // Determine assignment: use provided agent or run routing rules
-    let finalAgentId = assignedAgentId || null;
+    let finalAgentId = (assignedAgentId && !isAutoAssign) ? assignedAgentId : null;
     let routingRuleId = null;
     let routingDecision = null;
 
-    // If no agent specified but project exists, try routing rules
-    if (!assignedAgentId && projectId) {
+    // Auto-assign: evaluate routing rules when 'auto' and project exists
+    if (isAutoAssign && projectId) {
       const taskData = {
         tags: tags || [],
         priority: priority || 2,
@@ -330,7 +332,26 @@ router.post('/', dualAuth, validateBody(createTaskSchema), (req, res) => {
       }).catch(err => console.error('[Tasks] Route dispatch error:', err));
     }
 
-    response.created(res, normalizeTaskTimestamps(task));
+    // Build response with routing metadata when auto-assign was attempted
+    const taskData = normalizeTaskTimestamps(task);
+    const autoAssignAttempted = isAutoAssign && !!projectId;
+
+    if (autoAssignAttempted) {
+      // needsConfiguration = true only when routing is genuinely unconfigured,
+      // NOT when agents exist but are at capacity/disabled/unavailable.
+      const isUnconfigured = !routingDecision ||
+        routingDecision === 'No matching rule and no default agent configured';
+      const needsConfiguration = !finalAgentId && isUnconfigured;
+      taskData.routing = {
+        attempted: true,
+        matched: !!finalAgentId,
+        assignedAgentId: finalAgentId,
+        decision: routingDecision,
+        needsConfiguration
+      };
+    }
+
+    response.created(res, taskData);
   } catch (err) {
     console.error('Error creating task:', err);
     response.serverError(res);
@@ -361,8 +382,10 @@ router.post('/bulk', userAuth, requireRoles('admin'), validateBody(bulkCreateTas
           priority, tags, context, dueDate
         } = taskData;
 
-        // Validate agent exists if provided
-        if (assignedAgentId) {
+        const isBulkAutoAssign = assignedAgentId === 'auto';
+
+        // Validate agent exists if directly assigned (not 'auto')
+        if (assignedAgentId && !isBulkAutoAssign) {
           const agent = db.prepare('SELECT id FROM agents WHERE id = ?').get(assignedAgentId);
           if (!agent) {
             errors.push({ index: i, title, error: 'Invalid agent ID' });
@@ -389,12 +412,12 @@ router.post('/bulk', userAuth, requireRoles('admin'), validateBody(bulkCreateTas
         }
 
         // Determine assignment: use provided agent or run routing rules
-        let finalAgentId = assignedAgentId || null;
+        let finalAgentId = (assignedAgentId && !isBulkAutoAssign) ? assignedAgentId : null;
         let routingRuleId = null;
         let routingDecision = null;
 
-        // If no agent specified but project exists, try routing rules
-        if (!assignedAgentId && projectId) {
+        // Auto-assign: evaluate routing rules when 'auto' and project exists
+        if (isBulkAutoAssign && projectId) {
           const routingTaskData = {
             tags: tags || [],
             priority: priority || 2,
@@ -1110,10 +1133,47 @@ router.patch('/:id', userAuth, validateBody(updateTaskSchema), (req, res) => {
       updates.push('sprint_id = ?');
       values.push(sprintId);
     }
+    // Track routing metadata for auto-assign attempts
+    let patchRoutingDecision = null;
+    let patchFinalAgentId = null;
+    let patchAutoAssignAttempted = false;
+
     if (assignedAgentId !== undefined) {
+      const isPatchAutoAssign = assignedAgentId === 'auto';
+      let resolvedAgentId = isPatchAutoAssign ? null : assignedAgentId;
+
+      // Auto-assign: evaluate routing rules when 'auto' and task has a project
+      if (isPatchAutoAssign) {
+        const effectiveProjectId = projectId !== undefined ? projectId : task.project_id;
+        if (effectiveProjectId) {
+          patchAutoAssignAttempted = true;
+          const routingTaskData = {
+            title: title || task.title,
+            description: description || task.description,
+            priority: priority || task.priority,
+            tags: tags !== undefined ? tags : safeJsonParse(task.tags, [])
+          };
+          const routingResult = evaluateRoutingRules(effectiveProjectId, routingTaskData);
+          patchRoutingDecision = routingResult.decision;
+          if (routingResult.matched && routingResult.agentId) {
+            resolvedAgentId = routingResult.agentId;
+            if (routingResult.ruleId) {
+              updates.push('routing_rule_id = ?');
+              values.push(routingResult.ruleId);
+            }
+            updates.push('routing_decision = ?');
+            values.push(routingResult.decision);
+          } else {
+            updates.push('routing_decision = ?');
+            values.push(routingResult.decision);
+          }
+          patchFinalAgentId = resolvedAgentId || null;
+        }
+      }
+
       // Check if this is a new assignment or reassignment
-      if (assignedAgentId && assignedAgentId !== task.assigned_agent_id) {
-        const agent = db.prepare('SELECT id FROM agents WHERE id = ?').get(assignedAgentId);
+      if (resolvedAgentId && resolvedAgentId !== task.assigned_agent_id) {
+        const agent = db.prepare('SELECT id FROM agents WHERE id = ?').get(resolvedAgentId);
         if (!agent) {
           return response.validationError(res, 'Invalid agent ID');
         }
@@ -1123,14 +1183,14 @@ router.patch('/:id', userAuth, validateBody(updateTaskSchema), (req, res) => {
         if (task.assigned_agent_id) {
           decrementActiveTaskCount(task.assigned_agent_id);
         }
-        incrementActiveTaskCount(assignedAgentId);
-      } else if (!assignedAgentId && task.assigned_agent_id) {
+        incrementActiveTaskCount(resolvedAgentId);
+      } else if (!resolvedAgentId && task.assigned_agent_id) {
         // Unassigning from agent - decrement old agent's count
         decrementActiveTaskCount(task.assigned_agent_id);
       }
       updates.push('assigned_agent_id = ?');
-      values.push(assignedAgentId);
-      if (assignedAgentId && !task.assigned_at) {
+      values.push(resolvedAgentId);
+      if (resolvedAgentId && !task.assigned_at) {
         updates.push("assigned_at = datetime('now')");
       }
     }
@@ -1252,6 +1312,20 @@ router.patch('/:id', userAuth, validateBody(updateTaskSchema), (req, res) => {
           timestamp: new Date().toISOString()
         }).catch(err => console.error('[Tasks] Route dispatch error:', err));
       }
+    }
+
+    // Attach routing metadata when auto-assign was attempted
+    if (patchAutoAssignAttempted) {
+      const isUnconfigured = !patchRoutingDecision ||
+        patchRoutingDecision === 'No matching rule and no default agent configured';
+      const needsConfiguration = !patchFinalAgentId && isUnconfigured;
+      parsedTask.routing = {
+        attempted: true,
+        matched: !!patchFinalAgentId,
+        assignedAgentId: patchFinalAgentId,
+        decision: patchRoutingDecision,
+        needsConfiguration
+      };
     }
 
     response.success(res, parsedTask);
