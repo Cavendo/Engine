@@ -77,7 +77,7 @@ function findEligibleTasks() {
       AND a.provider IS NOT NULL
       AND a.provider_api_key_encrypted IS NOT NULL
       AND (a.max_concurrent_tasks IS NULL OR a.active_task_count < a.max_concurrent_tasks)
-      AND (t.due_date IS NULL OR t.due_date <= datetime('now', '+1 hour'))
+      -- due_date is a deadline, not a start schedule; do not gate auto-dispatch on it
     ORDER BY t.priority ASC, t.created_at ASC
     LIMIT ?
   `).all(MAX_BATCH_SIZE);
