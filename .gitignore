@@ -56,3 +56,4 @@ uploads/*
 
 # Internal docs (not for OSS)
 LANDING_PAGE_SPEC.md
+CODE_REVIEW.md

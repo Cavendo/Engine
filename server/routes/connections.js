@@ -7,7 +7,7 @@ import express from 'express';
 import db from '../db/connection.js';
 import { userAuth, requireRoles } from '../middleware/userAuth.js';
 import * as response from '../utils/response.js';
-import { validateBody, validateParams, idParamSchema } from '../utils/validation.js';
+import { validateBody, validateParams, idParamSchema, validateEndpoint, validateEndpointWithDns } from '../utils/validation.js';
 import { z } from 'zod';
 import { encrypt, decrypt } from '../utils/crypto.js';
 import { testS3Connection } from '../services/s3Provider.js';
@@ -23,7 +23,10 @@ const createConnectionSchema = z.object({
   provider: z.enum(['s3']).default('s3'),
   bucket: z.string().min(1, 'Bucket name is required'),
   region: z.string().optional().default('us-east-1'),
-  endpoint: z.string().url().optional().nullable(),
+  endpoint: z.string().url().optional().nullable().refine(
+    val => val === null || val === undefined || validateEndpoint(val),
+    { message: 'Endpoint must not target internal or private addresses' }
+  ),
   access_key_id: z.string().min(1, 'Access key is required'),
   secret_access_key: z.string().min(1, 'Secret key is required')
 });
@@ -32,7 +35,10 @@ const updateConnectionSchema = z.object({
   name: z.string().min(1).max(255).optional(),
   bucket: z.string().min(1).optional(),
   region: z.string().optional(),
-  endpoint: z.string().url().optional().nullable(),
+  endpoint: z.string().url().optional().nullable().refine(
+    val => val === null || val === undefined || validateEndpoint(val),
+    { message: 'Endpoint must not target internal or private addresses' }
+  ),
   access_key_id: z.string().min(1).optional(),
   secret_access_key: z.string().min(1).optional()
 }).refine(data => Object.keys(data).length > 0, {
@@ -93,6 +99,14 @@ router.post('/', userAuth, requireRoles('admin'), validateBody(createConnectionS
   try {
     const { name, provider, bucket, region, endpoint, access_key_id, secret_access_key } = req.body;
 
+    // DNS-level SSRF check on endpoint before storing
+    if (endpoint) {
+      const endpointCheck = await validateEndpointWithDns(endpoint);
+      if (!endpointCheck.valid) {
+        return response.error(res, `Endpoint blocked: ${endpointCheck.reason}`, 400, 'SSRF_BLOCKED');
+      }
+    }
+
     // Encrypt credentials
     const akEncrypted = encrypt(access_key_id);
     const skEncrypted = encrypt(secret_access_key);
@@ -130,6 +144,14 @@ router.put('/:id', userAuth, requireRoles('admin'), validateParams(idParamSchema
     if (!conn) return response.notFound(res, 'Storage connection');
 
     const { name, bucket, region, endpoint, access_key_id, secret_access_key } = req.body;
+
+    // DNS-level SSRF check on endpoint before storing
+    if (endpoint) {
+      const endpointCheck = await validateEndpointWithDns(endpoint);
+      if (!endpointCheck.valid) {
+        return response.error(res, `Endpoint blocked: ${endpointCheck.reason}`, 400, 'SSRF_BLOCKED');
+      }
+    }
 
     const updates = [];
     const values = [];
@@ -204,6 +226,14 @@ router.post('/:id/test', userAuth, requireRoles('admin'), validateParams(idParam
   try {
     const conn = db.prepare('SELECT * FROM storage_connections WHERE id = ?').get(req.params.id);
     if (!conn) return response.notFound(res, 'Storage connection');
+
+    // Re-validate endpoint at call time with DNS resolution (defense-in-depth against stored data tampering and DNS rebinding)
+    if (conn.endpoint) {
+      const endpointCheck = await validateEndpointWithDns(conn.endpoint);
+      if (!endpointCheck.valid) {
+        return response.error(res, `Endpoint blocked: ${endpointCheck.reason}`, 400, 'SSRF_BLOCKED');
+      }
+    }
 
     const config = {
       provider: conn.provider,

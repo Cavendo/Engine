@@ -3,6 +3,7 @@ import db from '../db/connection.js';
 import { generateUserKey, hashApiKey, getUserKeyPrefix, hashPassword } from '../utils/crypto.js';
 import * as response from '../utils/response.js';
 import { userAuth, requireRoles } from '../middleware/userAuth.js';
+import { keyGenLimiter } from '../middleware/security.js';
 import { dispatchEvent } from '../services/routeDispatcher.js';
 import { validateBody, createUserKeySchema, updateUserKeySchema, createUserSchema, updateUserSchema } from '../utils/validation.js';
 
@@ -78,7 +79,7 @@ router.get('/me/keys', userAuth, (req, res) => {
  * POST /api/users/me/keys
  * Generate a new personal API key
  */
-router.post('/me/keys', userAuth, validateBody(createUserKeySchema), (req, res) => {
+router.post('/me/keys', userAuth, keyGenLimiter, validateBody(createUserKeySchema), (req, res) => {
   try {
     const { name } = req.body;
 

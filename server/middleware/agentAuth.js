@@ -79,16 +79,31 @@ function authenticateUserKey(keyHash, req, res, next) {
     'SELECT id FROM agents WHERE owner_user_id = ? AND status = \'active\''
   ).all(userKey.user_id).map(a => a.id);
 
+  // VULN-005: Scope user keys to actual user role instead of granting wildcard
+  const ROLE_SCOPES = {
+    admin: ['*'],
+    reviewer: ['tasks:read', 'tasks:write', 'deliverables:read', 'deliverables:write', 'deliverables:review', 'projects:read', 'agents:read', 'knowledge:read', 'knowledge:write'],
+    viewer: ['tasks:read', 'deliverables:read', 'projects:read', 'agents:read', 'knowledge:read']
+  };
+  const ROLE_CAPABILITIES = {
+    admin: ['*'],
+    reviewer: ['review', 'write', 'read'],
+    viewer: ['read']
+  };
+
+  const roleScopes = ROLE_SCOPES[userKey.role] || ROLE_SCOPES.viewer;
+  const roleCapabilities = ROLE_CAPABILITIES[userKey.role] || ROLE_CAPABILITIES.viewer;
+
   // Create a virtual agent representing the user
   req.agent = {
     id: null, // No agent ID for user keys
     name: userKey.user_name || userKey.email,
     type: 'user',
-    capabilities: ['*'], // Users have all capabilities
+    capabilities: roleCapabilities,
     status: 'active',
     maxConcurrentTasks: 999,
     keyId: userKey.key_id,
-    scopes: ['*'],
+    scopes: roleScopes,
     // User-specific fields
     isUserKey: true,
     userId: userKey.user_id,

@@ -196,16 +196,15 @@ export function securityHeaders(req, res, next) {
  */
 export function sanitizeRequest(req, res, next) {
   if (req.body && typeof req.body === 'object') {
-    // Remove __proto__ and constructor to prevent prototype pollution
-    const sanitize = (obj) => {
-      if (obj && typeof obj === 'object') {
-        delete obj.__proto__;
-        delete obj.constructor;
-        delete obj.prototype;
-        for (const key of Object.keys(obj)) {
-          if (typeof obj[key] === 'object') {
-            sanitize(obj[key]);
-          }
+    const MAX_DEPTH = 20;
+    const sanitize = (obj, depth = 0) => {
+      if (!obj || typeof obj !== 'object' || depth > MAX_DEPTH) return;
+      delete obj.__proto__;
+      delete obj.constructor;
+      delete obj.prototype;
+      for (const key of Object.keys(obj)) {
+        if (typeof obj[key] === 'object') {
+          sanitize(obj[key], depth + 1);
         }
       }
     };

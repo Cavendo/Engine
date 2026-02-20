@@ -411,7 +411,7 @@ router.get('/:id/feedback', dualAuth, (req, res) => {
  * Review a deliverable (approve/revise/reject)
  * Works for both task-linked and standalone deliverables
  */
-router.patch('/:id/review', userAuth, validateBody(reviewDeliverableSchema), (req, res) => {
+router.patch('/:id/review', userAuth, requireRoles('admin', 'reviewer'), validateBody(reviewDeliverableSchema), (req, res) => {
   try {
     const deliverable = db.prepare(`
       SELECT d.*, t.assigned_agent_id

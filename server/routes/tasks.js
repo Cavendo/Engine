@@ -950,10 +950,11 @@ router.get('/:id/context', dualAuth, (req, res) => {
 
     // Authorization check
     if (req.agent) {
-      // Check if this is a user key (req.agent.id is null but isUserKey is true)
       if (req.agent.isUserKey) {
-        // User keys can access any task context (user has broader permissions)
-        // No additional check needed - user keys have admin-like access
+        // User keys inherit the user's role — only admin/reviewer can access task context
+        if (!req.agent.userRole || !['admin', 'reviewer'].includes(req.agent.userRole)) {
+          return response.forbidden(res, 'Insufficient role for task context access');
+        }
       } else {
         // Agent key: verify this task is assigned to them OR to an agent they own
         if (task.assigned_agent_id !== req.agent.id) {

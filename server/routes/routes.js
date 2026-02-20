@@ -7,7 +7,7 @@ import express from 'express';
 import db from '../db/connection.js';
 import { userAuth, requireRoles } from '../middleware/userAuth.js';
 import * as response from '../utils/response.js';
-import { validateBody, validateParams, validateQuery, idParamSchema, TRIGGER_EVENTS } from '../utils/validation.js';
+import { validateBody, validateParams, validateQuery, idParamSchema, TRIGGER_EVENTS, validateEndpoint, validateEndpointWithDns } from '../utils/validation.js';
 import { z } from 'zod';
 import { dispatchRoute, testRoute } from '../services/routeDispatcher.js';
 import { safeJsonParse, sanitizeDestinationConfig, formatDeliveryLog } from '../utils/routeHelpers.js';
@@ -59,7 +59,10 @@ const storageConfigSchema = z.object({
   connection_id: z.number().int().positive().optional(),
   bucket: z.string().min(1).optional(),
   region: z.string().optional().default('us-east-1'),
-  endpoint: z.string().url().optional(),
+  endpoint: z.string().url().optional().refine(
+    val => val === undefined || validateEndpoint(val),
+    { message: 'Endpoint must not target internal or private addresses' }
+  ),
   access_key_id: z.string().min(1).optional(),
   secret_access_key: z.string().min(1).optional(),
   path_prefix: z.string().max(500).optional().default(''),
@@ -230,6 +233,14 @@ router.post('/routes/global', userAuth, requireRoles('admin'), validateBody(crea
       destination_type, destination_config, field_mapping, retry_policy, enabled
     } = req.body;
 
+    // DNS-level SSRF check for inline storage endpoints
+    if (destination_type === 'storage' && destination_config?.endpoint) {
+      const check = await validateEndpointWithDns(destination_config.endpoint);
+      if (!check.valid) {
+        return response.error(res, `Storage endpoint blocked: ${check.reason}`, 400, 'SSRF_BLOCKED');
+      }
+    }
+
     const result = db.prepare(`
       INSERT INTO routes (
         project_id, name, description, trigger_event, trigger_conditions,
@@ -285,6 +296,14 @@ router.post('/projects/:id/routes', userAuth, requireRoles('admin'), validatePar
       retry_policy,
       enabled
     } = req.body;
+
+    // DNS-level SSRF check for inline storage endpoints
+    if (destination_type === 'storage' && destination_config?.endpoint) {
+      const check = await validateEndpointWithDns(destination_config.endpoint);
+      if (!check.valid) {
+        return response.error(res, `Storage endpoint blocked: ${check.reason}`, 400, 'SSRF_BLOCKED');
+      }
+    }
 
     const result = db.prepare(`
       INSERT INTO routes (
@@ -421,6 +440,14 @@ router.put('/routes/:id', userAuth, requireRoles('admin'), validateParams(idPara
       }
       if (!configValid) {
         return response.validationError(res, 'Invalid destination configuration for the specified destination type');
+      }
+
+      // DNS-level SSRF check for inline storage endpoints
+      if (effectiveType === 'storage' && destination_config?.endpoint) {
+        const check = await validateEndpointWithDns(destination_config.endpoint);
+        if (!check.valid) {
+          return response.error(res, `Storage endpoint blocked: ${check.reason}`, 400, 'SSRF_BLOCKED');
+        }
       }
     }
 

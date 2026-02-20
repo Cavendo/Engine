@@ -75,7 +75,9 @@ function readEnvFile() {
  * Update or add a key=value in the .env file lines
  */
 function setEnvVar(lines, vars, key, value) {
-  const line = `${key}=${value}`;
+  // VULN-002: Sanitize newlines to prevent env var injection
+  const sanitizedValue = String(value).replace(/[\r\n]/g, '');
+  const line = `${key}=${sanitizedValue}`;
   if (vars.has(key)) {
     lines[vars.get(key)] = line;
   } else {

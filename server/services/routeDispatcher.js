@@ -316,7 +316,8 @@ async function deliverWebhook(config, payload) {
       method: method || 'POST',
       headers: requestHeaders,
       body: JSON.stringify(payload),
-      signal: controller.signal
+      signal: controller.signal,
+      redirect: 'manual'
     });
 
     clearTimeout(timeoutId);
@@ -371,10 +372,13 @@ async function deliverEmail(config, eventData, fieldMapping) {
   let subject = 'Notification from Cavendo';
   if (subject_template) {
     try {
-      const compiled = Handlebars.compile(subject_template);
+      const compiled = Handlebars.compile(subject_template, { strict: true });
       subject = compiled({
         ...eventData,
         event_label: formatEventLabel(eventData.event)
+      }, {
+        allowProtoMethodsByDefault: false,
+        allowProtoPropertiesByDefault: false
       });
     } catch (e) {
       console.warn('[RouteDispatcher] Failed to compile subject template:', e);
@@ -560,8 +564,14 @@ function getNestedValue(obj, path) {
   return path.split('.').reduce((current, key) => current?.[key], obj);
 }
 
+const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
 function setNestedValue(obj, path, value) {
   const keys = path.split('.');
+  if (keys.some(k => DANGEROUS_KEYS.has(k))) {
+    console.warn(`[RouteDispatcher] Blocked dangerous field mapping key: ${path}`);
+    return;
+  }
   const lastKey = keys.pop();
   const target = keys.reduce((current, key) => {
     if (!current[key]) current[key] = {};

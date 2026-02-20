@@ -25,7 +25,7 @@ import settingsRouter from './routes/settings.js';
 
 // Import services
 import { processPendingDeliveries } from './services/webhooks.js';
-import { startDispatcher, stopDispatcher, executeTaskNow, getDispatcherStatus } from './services/taskDispatcher.js';
+import { startDispatcher, stopDispatcher } from './services/taskDispatcher.js';
 import { startRetrySweep, stopRetrySweep } from './services/routeDispatcher.js';
 
 // Import response utilities
@@ -99,6 +99,11 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:5173';
 
+// Trust proxy for correct IP detection behind reverse proxy
+if (process.env.TRUST_PROXY) {
+  app.set('trust proxy', process.env.TRUST_PROXY === 'true' ? 1 : process.env.TRUST_PROXY);
+}
+
 // ============================================
 // Middleware Stack
 // ============================================
@@ -148,10 +153,9 @@ if (process.env.NODE_ENV !== 'production') {
 // Routes
 // ============================================
 
-// Health check (no rate limiting)
+// Health check (no rate limiting) — minimal info for unauthenticated callers
 app.get('/health', (req, res) => {
-  const dispatcherStatus = getDispatcherStatus();
-  res.json({ status: 'ok', version: '0.1.0', dispatcher: dispatcherStatus });
+  res.json({ status: 'ok' });
 });
 
 // API routes

@@ -59,18 +59,28 @@ export async function validateWebhookUrl(urlString) {
       }
     }
 
-    // Resolve hostname and check IP
+    // Resolve hostname and check both IPv4 and IPv6
     try {
-      const addresses = await dns.resolve4(hostname);
-      for (const ip of addresses) {
+      const ipv4 = await dns.resolve4(hostname).catch(() => []);
+      const ipv6 = await dns.resolve6(hostname).catch(() => []);
+      const allAddresses = [...ipv4, ...ipv6];
+
+      if (allAddresses.length === 0) {
+        return { valid: false, reason: 'Could not resolve hostname' };
+      }
+
+      for (const ip of allAddresses) {
         for (const pattern of PRIVATE_IP_PATTERNS) {
           if (pattern.test(ip)) {
             return { valid: false, reason: 'URL resolves to private IP' };
           }
         }
+        // Block IPv6 loopback and private ranges
+        if (ip === '::1' || ip.startsWith('fe80:') || ip.startsWith('fd') || ip.startsWith('fc') || ip.startsWith('::ffff:')) {
+          return { valid: false, reason: 'URL resolves to private IP' };
+        }
       }
     } catch {
-      // DNS resolution failed - could be internal hostname
       return { valid: false, reason: 'Could not resolve hostname' };
     }
 
@@ -286,7 +296,8 @@ export async function deliverWebhook(deliveryId, url, secret, payload) {
       method: 'POST',
       headers,
       body: payload,
-      signal: controller.signal
+      signal: controller.signal,
+      redirect: 'manual'
     });
 
     clearTimeout(timeoutId);

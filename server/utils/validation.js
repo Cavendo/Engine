@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import dns from 'dns/promises';
 
 // ============================================
 // Common Schemas
@@ -511,4 +512,101 @@ export function validateParams(schema) {
     req.params = result.data;
     next();
   };
+}
+
+// ============================================
+// SSRF Protection
+// ============================================
+
+/**
+ * Validate that a URL endpoint does not target internal/private addresses (VULN-006)
+ * @param {string} endpoint
+ * @returns {boolean}
+ */
+// Private IP patterns (shared with webhooks.js SSRF checks)
+const PRIVATE_IP_PATTERNS = [
+  /^10\./,
+  /^172\.(1[6-9]|2[0-9]|3[01])\./,
+  /^192\.168\./,
+  /^127\./,
+  /^0\./,
+  /^169\.254\./,
+];
+
+/**
+ * Synchronous hostname-level check (used in Zod schema refinements)
+ * Catches obvious private/internal hostnames but NOT DNS rebinding.
+ * Always pair with validateEndpointWithDns() before making actual connections.
+ * @param {string} endpoint
+ * @returns {boolean}
+ */
+export function validateEndpoint(endpoint) {
+  if (!endpoint) return true;
+  try {
+    const url = new URL(endpoint);
+    const hostname = url.hostname.toLowerCase();
+    // Block internal hostnames and metadata services
+    if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' ||
+        hostname === '0.0.0.0' || hostname.endsWith('.local') ||
+        hostname === 'metadata.google.internal' || hostname === '169.254.169.254' ||
+        hostname.startsWith('10.') || hostname.startsWith('192.168.') ||
+        /^172\.(1[6-9]|2\d|3[01])\./.test(hostname) ||
+        hostname.startsWith('fd') || hostname.startsWith('fc') ||
+        hostname.startsWith('fe80') || hostname === '[::1]') {
+      return false;
+    }
+    // Must be HTTPS in production
+    if (process.env.NODE_ENV === 'production' && url.protocol !== 'https:') {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Async endpoint validation with DNS resolution (VULN-006 full fix)
+ * Resolves the hostname and checks resolved IPs against private ranges.
+ * Call this before making any outbound connection to the endpoint.
+ * @param {string} endpoint
+ * @returns {Promise<{valid: boolean, reason?: string}>}
+ */
+export async function validateEndpointWithDns(endpoint) {
+  if (!endpoint) return { valid: true };
+
+  // First pass: sync hostname check
+  if (!validateEndpoint(endpoint)) {
+    return { valid: false, reason: 'Endpoint targets an internal or private address' };
+  }
+
+  // Second pass: resolve DNS and check IPs
+  try {
+    const url = new URL(endpoint);
+    const hostname = url.hostname.toLowerCase();
+
+    const ipv4 = await dns.resolve4(hostname).catch(() => []);
+    const ipv6 = await dns.resolve6(hostname).catch(() => []);
+    const allAddresses = [...ipv4, ...ipv6];
+
+    if (allAddresses.length === 0) {
+      return { valid: false, reason: 'Could not resolve hostname' };
+    }
+
+    for (const ip of allAddresses) {
+      for (const pattern of PRIVATE_IP_PATTERNS) {
+        if (pattern.test(ip)) {
+          return { valid: false, reason: 'Endpoint resolves to private IP' };
+        }
+      }
+      // Block IPv6 loopback and private ranges
+      if (ip === '::1' || ip.startsWith('fe80:') || ip.startsWith('fd') || ip.startsWith('fc') || ip.startsWith('::ffff:')) {
+        return { valid: false, reason: 'Endpoint resolves to private IP' };
+      }
+    }
+
+    return { valid: true };
+  } catch {
+    return { valid: false, reason: 'Invalid endpoint URL' };
+  }
 }

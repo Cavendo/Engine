@@ -27,7 +27,8 @@ async function safeFetch(url, body, timeoutMs) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-      signal: controller.signal
+      signal: controller.signal,
+      redirect: 'manual'
     });
     clearTimeout(timeoutId);
     return response;

@@ -52,7 +52,11 @@ export function generateWebhookSignature(payload, secret) {
  */
 export function verifyWebhookSignature(payload, signature, secret) {
   const expected = generateWebhookSignature(payload, secret);
-  return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+  const sigBuffer = Buffer.from(signature);
+  const expBuffer = Buffer.from(expected);
+  // VULN-011: timingSafeEqual crashes if buffers differ in length
+  if (sigBuffer.length !== expBuffer.length) return false;
+  return crypto.timingSafeEqual(sigBuffer, expBuffer);
 }
 
 /**
@@ -141,7 +145,7 @@ function getEncryptionKey() {
     if (keyBuffer.length === KEY_LENGTH) {
       return keyBuffer;
     }
-    return crypto.scryptSync(envKey, 'cavendo-salt', KEY_LENGTH);
+    return crypto.scryptSync(envKey, process.env.ENCRYPTION_SALT || 'cavendo-dev-salt', KEY_LENGTH);
   }
 
   // FAIL in production, warn and use fallback only in development
@@ -155,7 +159,7 @@ function getEncryptionKey() {
     throw new Error('No ENCRYPTION_KEY, SESSION_SECRET, or JWT_SECRET configured');
   }
   console.warn('[Crypto] WARNING: No ENCRYPTION_KEY set, using derived key (development only)');
-  return crypto.scryptSync(secret, 'cavendo-salt', KEY_LENGTH);
+  return crypto.scryptSync(secret, process.env.ENCRYPTION_SALT || 'cavendo-dev-salt', KEY_LENGTH);
 }
 
 /**
