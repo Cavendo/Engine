@@ -19,7 +19,7 @@ router.post('/login', authLimiter, validateBody(loginSchema), async (req, res) =
     const { email, password } = req.body;
 
     const user = db.prepare(`
-      SELECT id, email, password_hash, name, role, status
+      SELECT id, email, password_hash, name, role, status, force_password_change
       FROM users
       WHERE email = ?
     `).get(email.toLowerCase());
@@ -74,7 +74,8 @@ router.post('/login', authLimiter, validateBody(loginSchema), async (req, res) =
         id: user.id,
         email: user.email,
         name: user.name,
-        role: user.role
+        role: user.role,
+        forcePasswordChange: Boolean(user.force_password_change)
       },
       expiresAt,
       csrfToken // Return token so client can store it
@@ -142,7 +143,9 @@ router.post('/change-password', userAuth, validateBody(changePasswordSchema), as
     const newHash = await hashPassword(newPassword);
 
     db.prepare(`
-      UPDATE users SET password_hash = ?, updated_at = datetime('now') WHERE id = ?
+      UPDATE users
+      SET password_hash = ?, force_password_change = 0, updated_at = datetime('now')
+      WHERE id = ?
     `).run(newHash, req.user.id);
 
     // Invalidate all other sessions

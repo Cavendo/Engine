@@ -225,7 +225,9 @@ router.get('/me', agentAuth, (req, res) => {
  */
 router.get('/me/tasks', agentAuth, (req, res) => {
   try {
-    const { status, userName, limit = 50, offset = 0 } = req.query;
+    const { status, userName } = req.query;
+    const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 50));
+    const offset = Math.max(0, parseInt(req.query.offset) || 0);
 
     let query;
     let params;
@@ -267,7 +269,7 @@ router.get('/me/tasks', agentAuth, (req, res) => {
     }
 
     query += ' ORDER BY t.priority ASC, t.created_at ASC LIMIT ? OFFSET ?';
-    params.push(parseInt(limit), parseInt(offset));
+    params.push(limit, offset);
 
     const tasks = db.prepare(query).all(...params);
 

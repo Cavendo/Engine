@@ -60,7 +60,9 @@ function normalizeStatsTimestamps(stats) {
  */
 router.get('/', userAuth, (req, res) => {
   try {
-    const { agentId, action, resourceType, period, limit = 100, offset = 0 } = req.query;
+    const { agentId, action, resourceType, period } = req.query;
+    const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
+    const offset = Math.max(0, parseInt(req.query.offset) || 0);
 
     let query = `
       SELECT
@@ -98,7 +100,7 @@ router.get('/', userAuth, (req, res) => {
     }
 
     query += ' ORDER BY aa.created_at DESC LIMIT ? OFFSET ?';
-    params.push(parseInt(limit), parseInt(offset));
+    params.push(limit, offset);
 
     const activities = db.prepare(query).all(...params);
 
@@ -203,14 +205,15 @@ router.get('/agents/:id', userAuth, (req, res) => {
       return response.notFound(res, 'Agent');
     }
 
-    const { limit = 50, offset = 0 } = req.query;
+    const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 50));
+    const offset = Math.max(0, parseInt(req.query.offset) || 0);
 
     const activities = db.prepare(`
       SELECT * FROM agent_activity
       WHERE agent_id = ?
       ORDER BY created_at DESC
       LIMIT ? OFFSET ?
-    `).all(req.params.id, parseInt(limit), parseInt(offset));
+    `).all(req.params.id, limit, offset);
 
     const parsed = activities.map(a => normalizeActivityTimestamps({
       ...a,
@@ -250,7 +253,8 @@ router.get('/agents/:id', userAuth, (req, res) => {
 router.get('/entity/:type/:id', userAuth, (req, res) => {
   try {
     const { type, id } = req.params;
-    const { limit = 100, offset = 0 } = req.query;
+    const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
+    const offset = Math.max(0, parseInt(req.query.offset) || 0);
 
     if (!['deliverable', 'task'].includes(type)) {
       return response.validationError(res, 'Entity type must be "deliverable" or "task"');
@@ -262,7 +266,7 @@ router.get('/entity/:type/:id', userAuth, (req, res) => {
       WHERE entity_type = ? AND entity_id = ?
       ORDER BY created_at DESC
       LIMIT ? OFFSET ?
-    `).all(type, parseInt(id), parseInt(limit), parseInt(offset));
+    `).all(type, parseInt(id), limit, offset);
 
     const parsed = activities.map(a => normalizeActivityTimestamps({
       ...a,

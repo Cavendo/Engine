@@ -25,18 +25,38 @@ export async function initializeDatabase() {
 
   console.log('Database initialized at:', DB_PATH);
 
+  // Backfill users.force_password_change for existing databases
+  const userColumns = db.prepare(`PRAGMA table_info(users)`).all();
+  const hasForcePasswordChange = userColumns.some(c => c.name === 'force_password_change');
+  if (!hasForcePasswordChange) {
+    db.exec(`
+      ALTER TABLE users
+      ADD COLUMN force_password_change INTEGER DEFAULT 0 CHECK (force_password_change IN (0, 1))
+    `);
+  }
+
   // Create default admin user if none exists
   const existingAdmin = db.prepare('SELECT id FROM users WHERE role = ?').get('admin');
   if (!existingAdmin) {
     // Use bcrypt for password hashing
     const passwordHash = await hashPassword('admin');
     db.prepare(`
-      INSERT INTO users (email, password_hash, name, role)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO users (email, password_hash, name, role, force_password_change)
+      VALUES (?, ?, ?, ?, 1)
     `).run('admin@cavendo.local', passwordHash, 'Admin', 'admin');
     console.log('Default admin user created: admin@cavendo.local / admin');
     console.log('!! CHANGE THIS PASSWORD IMMEDIATELY IN PRODUCTION !!');
   }
+
+  // Existing seeded admin should be forced to change password on first login
+  db.prepare(`
+    UPDATE users
+    SET force_password_change = 1
+    WHERE email = 'admin@cavendo.local'
+      AND role = 'admin'
+      AND COALESCE(last_login_at, '') = ''
+      AND force_password_change = 0
+  `).run();
 
   // Ensure all users have a linked human agent (backfill for existing users)
   const usersWithoutAgent = db.prepare(`

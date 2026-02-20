@@ -70,7 +70,9 @@ function getTaskSummary(sprintId) {
  */
 router.get('/', dualAuth, (req, res) => {
   try {
-    const { status, projectId, limit = 100, offset = 0 } = req.query;
+    const { status, projectId } = req.query;
+    const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
+    const offset = Math.max(0, parseInt(req.query.offset) || 0);
 
     let query = `
       SELECT
@@ -92,7 +94,7 @@ router.get('/', dualAuth, (req, res) => {
     }
 
     query += ' ORDER BY s.created_at DESC LIMIT ? OFFSET ?';
-    params.push(parseInt(limit), parseInt(offset));
+    params.push(limit, offset);
 
     const sprints = db.prepare(query).all(...params);
 
@@ -155,7 +157,9 @@ router.get('/:id/tasks', dualAuth, (req, res) => {
       return response.notFound(res, 'Sprint');
     }
 
-    const { status, priority, limit = 100, offset = 0 } = req.query;
+    const { status, priority } = req.query;
+    const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
+    const offset = Math.max(0, parseInt(req.query.offset) || 0);
 
     let query = `
       SELECT
@@ -179,7 +183,7 @@ router.get('/:id/tasks', dualAuth, (req, res) => {
     }
 
     query += ' ORDER BY t.priority ASC, t.created_at DESC LIMIT ? OFFSET ?';
-    params.push(parseInt(limit), parseInt(offset));
+    params.push(limit, offset);
 
     const tasks = db.prepare(query).all(...params);
 

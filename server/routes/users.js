@@ -457,7 +457,9 @@ router.post('/:id/reset-password', userAuth, requireRoles('admin'), async (req, 
 
     const passwordHash = await hashPassword(password);
     db.prepare(`
-      UPDATE users SET password_hash = ?, updated_at = datetime('now') WHERE id = ?
+      UPDATE users
+      SET password_hash = ?, force_password_change = 1, updated_at = datetime('now')
+      WHERE id = ?
     `).run(passwordHash, req.params.id);
 
     // Invalidate all sessions for this user

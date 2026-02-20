@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { Key, Plus, Copy, Check, Trash2, Lock, Mail, Send, CheckCircle, XCircle, Loader2, Activity, HardDrive, Pencil, Play, Cloud } from 'lucide-react';
 import { api } from '../lib/api';
+import { useAuth } from '../hooks/useAuth';
 import Button from '../components/Button';
 import Card, { CardHeader, CardBody } from '../components/Card';
 import Modal from '../components/Modal';
@@ -8,7 +10,17 @@ import { Input } from '../components/Input';
 import { safeTimeAgo } from '../lib/dates';
 
 export default function Settings() {
-  const [tab, setTab] = useState('keys');
+  const [searchParams] = useSearchParams();
+  const { user } = useAuth();
+  const forcePasswordChange = Boolean(user?.forcePasswordChange);
+  const initialTab = searchParams.get('tab');
+  const [tab, setTab] = useState(initialTab === 'password' ? 'password' : 'keys');
+
+  useEffect(() => {
+    if (forcePasswordChange && tab !== 'password') {
+      setTab('password');
+    }
+  }, [forcePasswordChange, tab]);
 
   const tabClass = (t) => `px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
     tab === t ? 'border-primary-600 text-primary-600' : 'border-transparent text-gray-500 hover:text-gray-700'
@@ -21,11 +33,17 @@ export default function Settings() {
         <p className="text-gray-500">Manage your account and API access</p>
       </div>
 
+      {forcePasswordChange && (
+        <div className="mb-6 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+          You must change your password before accessing other areas.
+        </div>
+      )}
+
       <div className="flex gap-1 mb-6 border-b border-gray-200">
-        <button type="button" className={tabClass('keys')} onClick={() => setTab('keys')}>API Keys</button>
-        <button type="button" className={tabClass('email')} onClick={() => setTab('email')}>Email Provider</button>
-        <button type="button" className={tabClass('storage')} onClick={() => setTab('storage')}>Cloud Storage</button>
-        <button type="button" className={tabClass('dispatcher')} onClick={() => setTab('dispatcher')}>Task Dispatcher</button>
+        <button type="button" disabled={forcePasswordChange} className={tabClass('keys')} onClick={() => setTab('keys')}>API Keys</button>
+        <button type="button" disabled={forcePasswordChange} className={tabClass('email')} onClick={() => setTab('email')}>Email Provider</button>
+        <button type="button" disabled={forcePasswordChange} className={tabClass('storage')} onClick={() => setTab('storage')}>Cloud Storage</button>
+        <button type="button" disabled={forcePasswordChange} className={tabClass('dispatcher')} onClick={() => setTab('dispatcher')}>Task Dispatcher</button>
         <button type="button" className={tabClass('password')} onClick={() => setTab('password')}>Password</button>
       </div>
 

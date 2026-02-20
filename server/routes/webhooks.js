@@ -508,7 +508,9 @@ router.get('/:id/deliveries', userAuth, requireRoles('admin'), (req, res) => {
       return response.notFound(res, 'Webhook');
     }
 
-    const { status, limit = 50, offset = 0 } = req.query;
+    const { status } = req.query;
+    const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 50));
+    const offset = Math.max(0, parseInt(req.query.offset) || 0);
 
     let query = 'SELECT * FROM webhook_deliveries WHERE webhook_id = ?';
     const params = [req.params.id];
@@ -519,7 +521,7 @@ router.get('/:id/deliveries', userAuth, requireRoles('admin'), (req, res) => {
     }
 
     query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
-    params.push(parseInt(limit), parseInt(offset));
+    params.push(limit, offset);
 
     const deliveries = db.prepare(query).all(...params);
 

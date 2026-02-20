@@ -75,7 +75,8 @@ function normalizeKnowledgeTimestamps(knowledge) {
  */
 router.get('/search', dualAuth, validateQuery(searchKnowledgeSchema), (req, res) => {
   try {
-    const { q, projectId, category, limit = 20 } = req.query;
+    const { q, projectId, category } = req.query;
+    const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 20));
 
     let query = `
       SELECT
@@ -106,7 +107,7 @@ router.get('/search', dualAuth, validateQuery(searchKnowledgeSchema), (req, res)
     }
 
     query += ' ORDER BY k.created_at DESC LIMIT ?';
-    params.push(parseInt(limit));
+    params.push(limit);
 
     const results = db.prepare(query).all(...params);
 
@@ -131,7 +132,9 @@ router.get('/search', dualAuth, validateQuery(searchKnowledgeSchema), (req, res)
  */
 router.get('/', dualAuth, (req, res) => {
   try {
-    const { projectId, category, search, limit = 100, offset = 0 } = req.query;
+    const { projectId, category, search } = req.query;
+    const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
+    const offset = Math.max(0, parseInt(req.query.offset) || 0);
 
     let query = `
       SELECT
@@ -157,7 +160,7 @@ router.get('/', dualAuth, (req, res) => {
     }
 
     query += ' ORDER BY k.created_at DESC LIMIT ? OFFSET ?';
-    params.push(parseInt(limit), parseInt(offset));
+    params.push(limit, offset);
 
     const knowledge = db.prepare(query).all(...params);
 

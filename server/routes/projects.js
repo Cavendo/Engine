@@ -51,7 +51,9 @@ function normalizeProjectTimestamps(project) {
  */
 router.get('/', dualAuth, (req, res) => {
   try {
-    const { status, limit = 100, offset = 0 } = req.query;
+    const { status } = req.query;
+    const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
+    const offset = Math.max(0, parseInt(req.query.offset) || 0);
 
     let query = 'SELECT * FROM projects WHERE 1=1';
     const params = [];
@@ -62,7 +64,7 @@ router.get('/', dualAuth, (req, res) => {
     }
 
     query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
-    params.push(parseInt(limit), parseInt(offset));
+    params.push(limit, offset);
 
     const projects = db.prepare(query).all(...params);
 
@@ -249,7 +251,9 @@ router.get('/:id/knowledge', dualAuth, (req, res) => {
       return response.notFound(res, 'Project');
     }
 
-    const { category, search, limit = 100, offset = 0 } = req.query;
+    const { category, search } = req.query;
+    const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
+    const offset = Math.max(0, parseInt(req.query.offset) || 0);
 
     let query = `
       SELECT id, title, content, content_type, category, tags, created_at, updated_at
@@ -269,7 +273,7 @@ router.get('/:id/knowledge', dualAuth, (req, res) => {
     }
 
     query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
-    params.push(parseInt(limit), parseInt(offset));
+    params.push(limit, offset);
 
     const knowledge = db.prepare(query).all(...params);
 

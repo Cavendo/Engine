@@ -136,7 +136,9 @@ async function saveFile(filename, content, deliverableId) {
  */
 router.get('/', userAuth, (req, res) => {
   try {
-    const { status, taskId, agentId, projectId, limit = 100, offset = 0 } = req.query;
+    const { status, taskId, agentId, projectId } = req.query;
+    const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
+    const offset = Math.max(0, parseInt(req.query.offset) || 0);
 
     let query = `
       SELECT
@@ -168,7 +170,7 @@ router.get('/', userAuth, (req, res) => {
     }
 
     query += ' ORDER BY d.created_at DESC LIMIT ? OFFSET ?';
-    params.push(parseInt(limit), parseInt(offset));
+    params.push(limit, offset);
 
     const deliverables = db.prepare(query).all(...params);
 
@@ -231,7 +233,9 @@ router.get('/pending', userAuth, (req, res) => {
  */
 router.get('/mine', agentAuth, (req, res) => {
   try {
-    const { status, limit = 50, offset = 0 } = req.query;
+    const { status } = req.query;
+    const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 50));
+    const offset = Math.max(0, parseInt(req.query.offset) || 0);
 
     let query;
     let params;
@@ -278,7 +282,7 @@ router.get('/mine', agentAuth, (req, res) => {
     }
 
     query += ' ORDER BY d.created_at DESC LIMIT ? OFFSET ?';
-    params.push(parseInt(limit), parseInt(offset));
+    params.push(limit, offset);
 
     const deliverables = db.prepare(query).all(...params);
 
@@ -450,6 +454,12 @@ router.patch('/:id/review', userAuth, requireRoles('admin', 'reviewer'), validat
           SET status = 'completed', completed_at = datetime('now'), updated_at = datetime('now')
           WHERE id = ?
         `).run(deliverable.task_id);
+
+        // Log task completion in activity trail
+        logActivity('task', deliverable.task_id, 'completed', req.user.name || req.user.email, {
+          completedVia: 'deliverable_approval',
+          deliverableId: parseInt(req.params.id)
+        });
       } else if (decision === 'revision_requested') {
         // Reset task to assigned so agent/dispatcher can re-execute
         db.prepare(`
@@ -524,6 +534,35 @@ router.patch('/:id/review', userAuth, requireRoles('admin', 'reviewer'), validat
         ...eventData,
         decision
       }).catch(err => console.error('[Deliverables] Route dispatch error:', err));
+
+      // Fire task.completed and task.status_changed events when approval completes a task
+      if (decision === 'approved' && deliverable.task_id) {
+        const completedTask = db.prepare('SELECT * FROM tasks WHERE id = ?').get(deliverable.task_id);
+        if (completedTask) {
+          const taskPayload = {
+            id: completedTask.id,
+            title: completedTask.title,
+            status: 'completed',
+            priority: completedTask.priority
+          };
+
+          dispatchEvent('task.status_changed', {
+            project: eventData.project,
+            projectId,
+            task: taskPayload,
+            old_status: 'review',
+            new_status: 'completed',
+            timestamp: new Date().toISOString()
+          }).catch(err => console.error('[Deliverables] Route dispatch error (task.status_changed):', err));
+
+          dispatchEvent('task.completed', {
+            project: eventData.project,
+            projectId,
+            task: taskPayload,
+            timestamp: new Date().toISOString()
+          }).catch(err => console.error('[Deliverables] Route dispatch error (task.completed):', err));
+        }
+      }
     }
 
     response.success(res, {

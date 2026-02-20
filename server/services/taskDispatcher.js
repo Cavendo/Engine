@@ -245,6 +245,16 @@ function decrementActiveTaskCount(agentId) {
  * so the dispatcher doesn't retry it in a loop.
  */
 function flagTaskError(taskId, agentName, errorMessage, errorCategory) {
+  // Step 1: Always reset status — must not be silenced by context-building failures
+  try {
+    db.prepare(`
+      UPDATE tasks SET status = 'assigned', updated_at = datetime('now') WHERE id = ?
+    `).run(taskId);
+  } catch (err) {
+    console.error(`[Dispatcher] CRITICAL: Failed to reset task #${taskId} status from in_progress:`, err);
+  }
+
+  // Step 2: Store error details in context — secondary, safe to fail independently
   try {
     const task = db.prepare('SELECT context FROM tasks WHERE id = ?').get(taskId);
     let context = {};
@@ -258,17 +268,11 @@ function flagTaskError(taskId, agentName, errorMessage, errorCategory) {
       retryable: isRetryableError(errorMessage, errorCategory)
     };
 
-    // Set status back to 'assigned' with error flag so it doesn't re-dispatch
-    // The 'assigned' status + lastExecutionError signals a failed auto-execution
     db.prepare(`
-      UPDATE tasks
-      SET status = 'assigned',
-          context = ?,
-          updated_at = datetime('now')
-      WHERE id = ?
+      UPDATE tasks SET context = ?, updated_at = datetime('now') WHERE id = ?
     `).run(JSON.stringify(context), taskId);
   } catch (err) {
-    console.error(`[Dispatcher] Failed to flag task #${taskId} error:`, err);
+    console.error(`[Dispatcher] Failed to store error context for task #${taskId}:`, err);
   }
 }
 

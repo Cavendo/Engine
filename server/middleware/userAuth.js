@@ -20,7 +20,8 @@ export function userAuth(req, res, next) {
       u.email,
       u.name,
       u.role,
-      u.status
+      u.status,
+      u.force_password_change
     FROM sessions s
     JOIN users u ON u.id = s.user_id
     WHERE s.id = ?
@@ -49,7 +50,8 @@ export function userAuth(req, res, next) {
     id: session.user_id,
     email: session.email,
     name: session.name,
-    role: session.role
+    role: session.role,
+    forcePasswordChange: Boolean(session.force_password_change)
   };
 
   next();
@@ -91,7 +93,8 @@ export function optionalUserAuth(req, res, next) {
       u.email,
       u.name,
       u.role,
-      u.status
+      u.status,
+      u.force_password_change
     FROM sessions s
     JOIN users u ON u.id = s.user_id
     WHERE s.id = ? AND u.status = 'active'
@@ -102,7 +105,8 @@ export function optionalUserAuth(req, res, next) {
       id: session.user_id,
       email: session.email,
       name: session.name,
-      role: session.role
+      role: session.role,
+      forcePasswordChange: Boolean(session.force_password_change)
     };
   }
 

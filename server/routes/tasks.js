@@ -102,7 +102,9 @@ function normalizeTaskTimestamps(task) {
  */
 router.get('/', userAuth, (req, res) => {
   try {
-    const { status, priority, projectId, agentId, sprintId, limit = 100, offset = 0 } = req.query;
+    const { status, priority, projectId, agentId, sprintId } = req.query;
+    const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
+    const offset = Math.max(0, parseInt(req.query.offset) || 0);
 
     let query = `
       SELECT
@@ -140,7 +142,7 @@ router.get('/', userAuth, (req, res) => {
     }
 
     query += ' ORDER BY t.priority ASC, t.created_at DESC LIMIT ? OFFSET ?';
-    params.push(parseInt(limit), parseInt(offset));
+    params.push(limit, offset);
 
     const tasks = db.prepare(query).all(...params);
 

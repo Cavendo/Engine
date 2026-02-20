@@ -206,6 +206,7 @@ CREATE TABLE IF NOT EXISTS users (
     name TEXT,
     role TEXT DEFAULT 'reviewer' CHECK (role IN ('admin', 'reviewer', 'viewer')),
     status TEXT DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+    force_password_change INTEGER DEFAULT 0 CHECK (force_password_change IN (0, 1)),
     last_login_at TEXT,
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now'))
