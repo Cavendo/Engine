@@ -483,9 +483,10 @@ router.post('/match', userAuth, validateBody(matchAgentsSchema), (req, res) => {
         matchReasons.push(`content_types: ${contentTypeMatches.join(', ')}`);
       }
 
-      // Check availability
+      // Check availability (treat NULL active_task_count as 0)
+      const activeCount = agent.active_task_count ?? 0;
       const available = agent.max_concurrent_tasks === null ||
-        agent.active_task_count < agent.max_concurrent_tasks;
+        activeCount < agent.max_concurrent_tasks;
 
       // Slight boost for available agents
       if (available) {
@@ -1014,9 +1015,21 @@ router.patch('/:id', userAuth, requireRoles('admin'), validateBody(updateAgentSc
  */
 router.delete('/:id', userAuth, requireRoles('admin'), (req, res) => {
   try {
-    const agent = db.prepare('SELECT id FROM agents WHERE id = ?').get(req.params.id);
+    const agent = db.prepare('SELECT id, name FROM agents WHERE id = ?').get(req.params.id);
     if (!agent) {
       return response.notFound(res, 'Agent');
+    }
+
+    // Block deletion if agent has active (non-terminal) tasks
+    const activeTaskCount = db.prepare(`
+      SELECT COUNT(*) as count FROM tasks
+      WHERE assigned_agent_id = ? AND status NOT IN ('completed', 'cancelled')
+    `).get(req.params.id).count;
+
+    if (activeTaskCount > 0) {
+      return response.validationError(res,
+        `Cannot delete agent "${agent.name}" — ${activeTaskCount} active task(s) are still assigned. Reassign or complete them first.`
+      );
     }
 
     db.prepare('DELETE FROM agents WHERE id = ?').run(req.params.id);

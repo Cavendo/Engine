@@ -235,10 +235,11 @@ export function checkAgentAvailability(agentId) {
 
   // Check capacity if max_concurrent_tasks is set
   if (agent.max_concurrent_tasks !== null && agent.max_concurrent_tasks > 0) {
-    if (agent.active_task_count >= agent.max_concurrent_tasks) {
+    const activeCount = agent.active_task_count ?? 0;
+    if (activeCount >= agent.max_concurrent_tasks) {
       return {
         available: false,
-        reason: `At capacity (${agent.active_task_count}/${agent.max_concurrent_tasks} tasks)`
+        reason: `At capacity (${activeCount}/${agent.max_concurrent_tasks} tasks)`
       };
     }
   }
