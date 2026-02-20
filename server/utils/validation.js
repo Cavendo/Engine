@@ -32,7 +32,28 @@ export const changePasswordSchema = z.object({
 // Agent Schemas
 // ============================================
 
-export const createAgentSchema = z.object({
+export const createAgentSchema = z.preprocess((data) => {
+  // Normalize snake_case aliases → camelCase for execution fields
+  if (data && typeof data === 'object') {
+    const d = { ...data };
+    if ('provider_api_key' in d && !('providerApiKey' in d)) d.providerApiKey = d.provider_api_key;
+    if ('provider_model' in d && !('providerModel' in d)) d.providerModel = d.provider_model;
+    if ('execution_mode' in d && !('executionMode' in d)) d.executionMode = d.execution_mode;
+    if ('system_prompt' in d && !('systemPrompt' in d)) d.systemPrompt = d.system_prompt;
+    if ('max_tokens' in d && !('maxTokens' in d)) d.maxTokens = d.max_tokens;
+    // Also normalize 'model' shorthand → providerModel
+    if ('model' in d && !('providerModel' in d)) d.providerModel = d.model;
+    // Clean up snake_case keys so strict validation doesn't reject them
+    delete d.provider_api_key;
+    delete d.provider_model;
+    delete d.execution_mode;
+    delete d.system_prompt;
+    delete d.max_tokens;
+    delete d.model;
+    return d;
+  }
+  return data;
+}, z.object({
   name: z.string().min(1, 'Name is required').max(255),
   type: z.enum(['autonomous', 'semi-autonomous', 'supervised'], {
     errorMap: () => ({ message: 'Type must be autonomous, semi-autonomous, or supervised' })
@@ -42,12 +63,20 @@ export const createAgentSchema = z.object({
   specializations: z.record(z.any()).optional().nullable(), // JSON object for rich metadata
   metadata: z.record(z.any()).optional().nullable(), // JSON object for custom extensions
   maxConcurrentTasks: z.number().int().min(1).max(100).optional().default(1),
-  // New agent routing fields
+  // Agent routing fields
   agentType: z.enum(['business_line', 'skill_agent', 'general']).optional().default('general'),
   specialization: z.string().max(100).optional().nullable(), // e.g., 'boardsite', 'seo', 'research'
   projectAccess: z.array(z.string().max(100)).optional().default(['*']), // Project names/ids or '*' for all
-  taskTypes: z.array(z.string().max(50)).optional().default(['*']) // Task types this agent handles
-});
+  taskTypes: z.array(z.string().max(50)).optional().default(['*']), // Task types this agent handles
+  // Optional execution fields (one-step create with provider config)
+  provider: z.enum(['anthropic', 'openai']).optional().nullable(),
+  providerApiKey: z.string().optional(),
+  providerModel: z.string().max(100).optional().nullable(),
+  systemPrompt: z.string().max(50000).optional().nullable(),
+  executionMode: z.enum(['manual', 'auto', 'polling', 'human']).optional(),
+  maxTokens: z.number().int().min(1).max(200000).optional(),
+  temperature: z.number().min(0).max(2).optional()
+}));
 
 export const updateAgentSchema = z.object({
   name: z.string().min(1).max(255).optional(),

@@ -602,15 +602,28 @@ router.post('/', userAuth, requireRoles('admin'), validateBody(createAgentSchema
   try {
     const {
       name, type, description, capabilities, specializations, metadata, maxConcurrentTasks,
-      agentType, specialization, projectAccess, taskTypes
+      agentType, specialization, projectAccess, taskTypes,
+      // Optional execution fields (one-step create)
+      provider, providerApiKey, providerModel, systemPrompt, executionMode, maxTokens, temperature
     } = req.body;
+
+    // Encrypt provider API key if provided
+    let encryptedKey = null, encryptedIv = null, keyVersion = null;
+    if (providerApiKey) {
+      const encResult = encrypt(providerApiKey);
+      encryptedKey = encResult.encrypted;
+      encryptedIv = encResult.iv;
+      keyVersion = encResult.keyVersion;
+    }
 
     const result = db.prepare(`
       INSERT INTO agents (
         name, type, description, capabilities, specializations, metadata, max_concurrent_tasks,
-        agent_type, specialization, project_access, task_types
+        agent_type, specialization, project_access, task_types,
+        provider, provider_api_key_encrypted, provider_api_key_iv, encryption_key_version,
+        provider_model, system_prompt, execution_mode, max_tokens, temperature
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       name,
       type,
@@ -622,7 +635,16 @@ router.post('/', userAuth, requireRoles('admin'), validateBody(createAgentSchema
       agentType || 'general',
       specialization || null,
       JSON.stringify(projectAccess || ['*']),
-      JSON.stringify(taskTypes || ['*'])
+      JSON.stringify(taskTypes || ['*']),
+      provider || null,
+      encryptedKey,
+      encryptedIv,
+      keyVersion,
+      providerModel || null,
+      systemPrompt || null,
+      executionMode || (provider ? 'manual' : 'manual'),
+      maxTokens || 4096,
+      temperature ?? 0.7
     );
 
     const agent = db.prepare('SELECT * FROM agents WHERE id = ?').get(result.lastInsertRowid);
