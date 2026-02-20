@@ -49,6 +49,9 @@ export function generateWebhookSignature(payload, secret) {
  * @param {string} signature
  * @param {string} secret
  * @returns {boolean}
+ *
+ * TODO: Wire this into any future inbound webhook receiver endpoints.
+ * Current webhook flow is outbound-only (Engine signs outgoing deliveries).
  */
 export function verifyWebhookSignature(payload, signature, secret) {
   const expected = generateWebhookSignature(payload, secret);
