@@ -11,7 +11,7 @@ import { safeTimeAgo } from '../lib/dates';
 
 export default function Settings() {
   const [searchParams] = useSearchParams();
-  const { user } = useAuth();
+  const { user, refreshUser } = useAuth();
   const forcePasswordChange = Boolean(user?.forcePasswordChange);
   const initialTab = searchParams.get('tab');
   const [tab, setTab] = useState(initialTab === 'password' ? 'password' : 'keys');
@@ -51,7 +51,7 @@ export default function Settings() {
       {tab === 'email' && <EmailProviderSection />}
       {tab === 'storage' && <CloudStorageSection />}
       {tab === 'dispatcher' && <DispatcherSection />}
-      {tab === 'password' && <ChangePasswordSection />}
+      {tab === 'password' && <ChangePasswordSection onPasswordChanged={refreshUser} />}
     </div>
   );
 }
@@ -942,7 +942,7 @@ function CloudStorageSection() {
   );
 }
 
-function ChangePasswordSection() {
+function ChangePasswordSection({ onPasswordChanged }) {
   const [formData, setFormData] = useState({ currentPassword: '', newPassword: '', confirmPassword: '' });
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState(null);
@@ -966,6 +966,8 @@ function ChangePasswordSection() {
       await api.auth.changePassword(formData.currentPassword, formData.newPassword);
       setFormData({ currentPassword: '', newPassword: '', confirmPassword: '' });
       setMessage({ type: 'success', text: 'Password changed successfully.' });
+      // Refresh auth state so forcePasswordChange is cleared
+      if (onPasswordChanged) onPasswordChanged();
     } catch (err) {
       setMessage({ type: 'error', text: err.message || 'Failed to change password.' });
     } finally {

@@ -153,7 +153,18 @@ router.post('/change-password', userAuth, validateBody(changePasswordSchema), as
       DELETE FROM sessions WHERE user_id = ? AND id != ?
     `).run(req.user.id, req.cookies?.session);
 
-    response.success(res, { passwordChanged: true });
+    // Return updated user so frontend can refresh auth state
+    const updated = db.prepare('SELECT id, email, name, role, force_password_change FROM users WHERE id = ?').get(req.user.id);
+    response.success(res, {
+      passwordChanged: true,
+      user: {
+        id: updated.id,
+        email: updated.email,
+        name: updated.name,
+        role: updated.role,
+        forcePasswordChange: Boolean(updated.force_password_change)
+      }
+    });
   } catch (err) {
     console.error('Error changing password:', err);
     response.serverError(res);
