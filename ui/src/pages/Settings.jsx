@@ -967,7 +967,9 @@ function ChangePasswordSection({ onPasswordChanged }) {
       setFormData({ currentPassword: '', newPassword: '', confirmPassword: '' });
       setMessage({ type: 'success', text: 'Password changed successfully.' });
       // Refresh auth state so forcePasswordChange is cleared
-      if (onPasswordChanged) onPasswordChanged();
+      if (onPasswordChanged) {
+        try { await onPasswordChanged(); } catch { /* transient /me failure; unlock on next navigation */ }
+      }
     } catch (err) {
       setMessage({ type: 'error', text: err.message || 'Failed to change password.' });
     } finally {
