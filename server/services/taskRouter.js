@@ -317,12 +317,51 @@ export function findAgentByCapability(capability, strategy = 'least_busy', requi
 // ============================================
 
 /**
- * Increment the active task count for an agent (atomic update)
+ * Atomically reserve one capacity slot for an agent.
+ * Only succeeds if the agent is active and below max_concurrent_tasks.
+ * Use this in auto-assign paths (POST/PATCH 'auto', bulk, dispatcher).
+ *
+ * Issue #18: Prevents capacity oversubscription by combining the check
+ * and increment into a single atomic UPDATE with a WHERE guard.
+ *
  * @param {number|string} agentId - Agent ID
+ * @param {import('better-sqlite3').Database} [_db] - Optional DB override (for testing)
+ * @returns {{ ok: boolean, reason?: string }}
+ */
+export function reserveAgentCapacity(agentId, _db) {
+  const d = _db || db;
+  const result = d.prepare(`
+    UPDATE agents
+    SET active_task_count = COALESCE(active_task_count, 0) + 1,
+        updated_at = datetime('now')
+    WHERE id = ?
+      AND status = 'active'
+      AND (max_concurrent_tasks IS NULL
+           OR COALESCE(active_task_count, 0) < max_concurrent_tasks)
+  `).run(agentId);
+
+  if (result.changes === 1) {
+    return { ok: true };
+  }
+
+  // Determine reason for failure
+  const agent = d.prepare('SELECT status, active_task_count, max_concurrent_tasks FROM agents WHERE id = ?').get(agentId);
+  if (!agent) return { ok: false, reason: 'Agent not found' };
+  if (agent.status !== 'active') return { ok: false, reason: `Agent status is ${agent.status}` };
+  const count = agent.active_task_count ?? 0;
+  return { ok: false, reason: `At capacity (${count}/${agent.max_concurrent_tasks} tasks)` };
+}
+
+/**
+ * Increment the active task count for an agent (unconditional).
+ * Used for direct/manual assignment where capacity is not enforced.
+ * @param {number|string} agentId - Agent ID
+ * @param {import('better-sqlite3').Database} [_db] - Optional DB override (for testing)
  * @returns {boolean} True if successful
  */
-export function incrementActiveTaskCount(agentId) {
-  const result = db.prepare(`
+export function incrementActiveTaskCount(agentId, _db) {
+  const d = _db || db;
+  const result = d.prepare(`
     UPDATE agents
     SET active_task_count = COALESCE(active_task_count, 0) + 1,
         updated_at = datetime('now')
@@ -333,12 +372,15 @@ export function incrementActiveTaskCount(agentId) {
 }
 
 /**
- * Decrement the active task count for an agent (atomic update)
+ * Decrement the active task count for an agent (atomic update).
+ * Alias: releaseAgentCapacity
  * @param {number|string} agentId - Agent ID
+ * @param {import('better-sqlite3').Database} [_db] - Optional DB override (for testing)
  * @returns {boolean} True if successful
  */
-export function decrementActiveTaskCount(agentId) {
-  const result = db.prepare(`
+export function decrementActiveTaskCount(agentId, _db) {
+  const d = _db || db;
+  const result = d.prepare(`
     UPDATE agents
     SET active_task_count = MAX(0, COALESCE(active_task_count, 0) - 1),
         updated_at = datetime('now')
@@ -347,6 +389,9 @@ export function decrementActiveTaskCount(agentId) {
 
   return result.changes > 0;
 }
+
+/** Alias for decrementActiveTaskCount */
+export const releaseAgentCapacity = decrementActiveTaskCount;
 
 // ============================================
 // Project Default Agent

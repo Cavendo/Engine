@@ -8,6 +8,7 @@
 import db from '../db/connection.js';
 import { decrypt } from '../utils/crypto.js';
 import { dispatchEvent } from './routeDispatcher.js';
+import { insertDeliverableWithRetry } from '../utils/deliverableVersioning.js';
 
 const EXECUTION_TIMEOUT_MS = parseInt(process.env.EXECUTION_TIMEOUT_MS) || 120000;
 
@@ -434,48 +435,57 @@ function buildTaskPrompt(task, context) {
  * sets parent_id to the most recent one and updates its status to 'revised'.
  */
 function createDeliverable(taskId, agentId, content, title, usage, provider, model) {
-  // Determine version number and find parent deliverable
-  const existing = db.prepare(`
-    SELECT id, version FROM deliverables WHERE task_id = ? ORDER BY version DESC LIMIT 1
-  `).get(taskId);
-
-  const version = (existing?.version || 0) + 1;
-  const parentId = existing?.id || null;
-
   // Get project_id from the task so route dispatch works on review
   const task = db.prepare('SELECT project_id FROM tasks WHERE id = ?').get(taskId);
   const projectId = task?.project_id || null;
 
-  const result = db.prepare(`
-    INSERT INTO deliverables (
-      task_id, project_id, agent_id, title, content, content_type, status, version, parent_id,
-      input_tokens, output_tokens, provider, model
-    )
-    VALUES (?, ?, ?, ?, ?, 'markdown', 'pending', ?, ?, ?, ?, ?, ?)
-  `).run(
-    taskId,
-    projectId,
-    agentId,
-    `Deliverable: ${title}`,
-    content,
-    version,
-    parentId,
-    usage?.inputTokens || null,
-    usage?.outputTokens || null,
-    provider || null,
-    model || null
-  );
+  // Insert with version retry (Issue #15: prevents duplicate versions)
+  let deliverableId;
+  let finalVersion;
 
-  // If this is a revision, update the parent deliverable status to 'revised'
-  if (parentId) {
-    db.prepare(`
-      UPDATE deliverables SET status = 'revised', updated_at = datetime('now') WHERE id = ?
-    `).run(parentId);
-  }
+  const insertResult = insertDeliverableWithRetry(db, () => {
+    // Re-read version inside transaction for atomicity
+    const existing = db.prepare(`
+      SELECT id, version FROM deliverables WHERE task_id = ? ORDER BY version DESC LIMIT 1
+    `).get(taskId);
 
-  const deliverableId = result.lastInsertRowid;
+    const version = (existing?.version || 0) + 1;
+    const parentId = existing?.id || null;
 
-  // Dispatch deliverable.submitted event for delivery routes
+    const result = db.prepare(`
+      INSERT INTO deliverables (
+        task_id, project_id, agent_id, title, content, content_type, status, version, parent_id,
+        input_tokens, output_tokens, provider, model
+      )
+      VALUES (?, ?, ?, ?, ?, 'markdown', 'pending', ?, ?, ?, ?, ?, ?)
+    `).run(
+      taskId,
+      projectId,
+      agentId,
+      `Deliverable: ${title}`,
+      content,
+      version,
+      parentId,
+      usage?.inputTokens || null,
+      usage?.outputTokens || null,
+      provider || null,
+      model || null
+    );
+
+    // If this is a revision, update the parent deliverable status to 'revised'
+    if (parentId) {
+      db.prepare(`
+        UPDATE deliverables SET status = 'revised', updated_at = datetime('now') WHERE id = ?
+      `).run(parentId);
+    }
+
+    return { id: result.lastInsertRowid, version };
+  });
+
+  deliverableId = insertResult.id;
+  finalVersion = insertResult.version;
+
+  // Dispatch deliverable.submitted event for delivery routes (outside transaction)
   if (projectId) {
     const project = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(projectId);
     const agent = db.prepare('SELECT id, name FROM agents WHERE id = ?').get(agentId);
@@ -489,7 +499,7 @@ function createDeliverable(taskId, agentId, content, title, usage, provider, mod
         content,
         content_type: 'markdown',
         status: 'pending',
-        version,
+        version: finalVersion,
         submitted_by: agent ? { id: agent.id, name: agent.name } : null
       },
       taskId,

@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useSearchParams, useNavigate } from 'react-router-dom';
 import { Key, Plus, Copy, Check, Trash2, Lock, Mail, Send, CheckCircle, XCircle, Loader2, Activity, HardDrive, Pencil, Play, Cloud } from 'lucide-react';
 import { api } from '../lib/api';
 import { useAuth } from '../hooks/useAuth';
@@ -11,7 +11,7 @@ import { safeTimeAgo } from '../lib/dates';
 
 export default function Settings() {
   const [searchParams] = useSearchParams();
-  const { user, refreshUser } = useAuth();
+  const { user, refreshUser, setAuthUser } = useAuth();
   const forcePasswordChange = Boolean(user?.forcePasswordChange);
   const initialTab = searchParams.get('tab');
   const [tab, setTab] = useState(initialTab === 'password' ? 'password' : 'keys');
@@ -51,7 +51,13 @@ export default function Settings() {
       {tab === 'email' && <EmailProviderSection />}
       {tab === 'storage' && <CloudStorageSection />}
       {tab === 'dispatcher' && <DispatcherSection />}
-      {tab === 'password' && <ChangePasswordSection onPasswordChanged={refreshUser} />}
+      {tab === 'password' && (
+        <ChangePasswordSection
+          forcePasswordChange={forcePasswordChange}
+          onImmediateUnlock={setAuthUser}
+          onBackgroundRefresh={refreshUser}
+        />
+      )}
     </div>
   );
 }
@@ -942,10 +948,11 @@ function CloudStorageSection() {
   );
 }
 
-function ChangePasswordSection({ onPasswordChanged }) {
+function ChangePasswordSection({ forcePasswordChange, onImmediateUnlock, onBackgroundRefresh }) {
   const [formData, setFormData] = useState({ currentPassword: '', newPassword: '', confirmPassword: '' });
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState(null);
+  const navigate = useNavigate();
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -963,12 +970,25 @@ function ChangePasswordSection({ onPasswordChanged }) {
 
     setSaving(true);
     try {
-      await api.auth.changePassword(formData.currentPassword, formData.newPassword);
+      const data = await api.auth.changePassword(formData.currentPassword, formData.newPassword);
       setFormData({ currentPassword: '', newPassword: '', confirmPassword: '' });
-      setMessage({ type: 'success', text: 'Password changed successfully.' });
-      // Refresh auth state so forcePasswordChange is cleared
-      if (onPasswordChanged) {
-        try { await onPasswordChanged(); } catch { /* transient /me failure; unlock on next navigation */ }
+
+      // Immediately update auth state from the change-password response
+      // so forcePasswordChange is cleared without depending on /auth/me
+      if (data.user && onImmediateUnlock) {
+        onImmediateUnlock(data.user);
+      }
+
+      // Best-effort background sync (non-blocking)
+      if (onBackgroundRefresh) {
+        onBackgroundRefresh().catch(() => {});
+      }
+
+      // If this was a forced password change, navigate away from the lock screen
+      if (forcePasswordChange) {
+        navigate('/review', { replace: true });
+      } else {
+        setMessage({ type: 'success', text: 'Password changed successfully.' });
       }
     } catch (err) {
       setMessage({ type: 'error', text: err.message || 'Failed to change password.' });

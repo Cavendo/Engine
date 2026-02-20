@@ -16,7 +16,12 @@
 import db from '../db/connection.js';
 import { executeTask } from './agentExecutor.js';
 import { dispatchEvent } from './routeDispatcher.js';
-import { evaluateRoutingRules, incrementActiveTaskCount as routerIncrementCount } from './taskRouter.js';
+import {
+  evaluateRoutingRules,
+  incrementActiveTaskCount,
+  decrementActiveTaskCount,
+  reserveAgentCapacity
+} from './taskRouter.js';
 
 const POLL_INTERVAL_MS = parseInt(process.env.DISPATCHER_INTERVAL_MS) || 30000; // 30 seconds
 const MAX_BATCH_SIZE = parseInt(process.env.DISPATCHER_BATCH_SIZE) || 5; // max tasks per cycle
@@ -207,37 +212,8 @@ async function dispatchTask(eligible) {
   }
 }
 
-/**
- * Increment agent active_task_count when starting execution
- */
-function incrementActiveTaskCount(agentId) {
-  try {
-    db.prepare(`
-      UPDATE agents
-      SET active_task_count = COALESCE(active_task_count, 0) + 1,
-          updated_at = datetime('now')
-      WHERE id = ?
-    `).run(agentId);
-  } catch (err) {
-    console.error('[Dispatcher] Failed to increment active_task_count:', err);
-  }
-}
-
-/**
- * Decrement agent active_task_count when execution finishes (success or failure)
- */
-function decrementActiveTaskCount(agentId) {
-  try {
-    db.prepare(`
-      UPDATE agents
-      SET active_task_count = MAX(0, COALESCE(active_task_count, 0) - 1),
-          updated_at = datetime('now')
-      WHERE id = ?
-    `).run(agentId);
-  } catch (err) {
-    console.error('[Dispatcher] Failed to decrement active_task_count:', err);
-  }
-}
+// incrementActiveTaskCount and decrementActiveTaskCount imported from taskRouter.js
+// (removed duplicate local copies — Issue #18)
 
 /**
  * Flag a task with an error so the user can see it in the UI.
@@ -377,18 +353,31 @@ function routeUnassignedTasks() {
         preferredAgentId: task.preferred_agent_id
       };
 
+      // Evaluate routing rules (read-only, outside transaction)
       const routingResult = evaluateRoutingRules(task.project_id, taskData);
       if (routingResult.matched && routingResult.agentId) {
-        const updateResult = db.prepare(`
-          UPDATE tasks SET assigned_agent_id = ?, status = 'assigned',
-            assigned_at = datetime('now'), updated_at = datetime('now'),
-            routing_rule_id = ?, routing_decision = ?
-          WHERE id = ? AND assigned_agent_id IS NULL
-        `).run(routingResult.agentId, routingResult.ruleId || null, routingResult.decision, task.id);
+        // Reserve capacity + assign in same transaction (Issue #18)
+        let assigned = false;
+        db.transaction(() => {
+          const reservation = reserveAgentCapacity(routingResult.agentId);
+          if (!reservation.ok) return; // skip — agent at capacity
 
-        // Only increment if the row was actually updated (guards against concurrent assignment)
-        if (updateResult.changes > 0) {
-          routerIncrementCount(routingResult.agentId);
+          const updateResult = db.prepare(`
+            UPDATE tasks SET assigned_agent_id = ?, status = 'assigned',
+              assigned_at = datetime('now'), updated_at = datetime('now'),
+              routing_rule_id = ?, routing_decision = ?
+            WHERE id = ? AND assigned_agent_id IS NULL
+          `).run(routingResult.agentId, routingResult.ruleId || null, routingResult.decision, task.id);
+
+          if (updateResult.changes === 0) {
+            // Someone else won the race — release reservation
+            decrementActiveTaskCount(routingResult.agentId);
+          } else {
+            assigned = true;
+          }
+        })();
+
+        if (assigned) {
           console.log(`[Dispatcher] Routed task #${task.id} "${task.title}" → agent ${routingResult.agentId}`);
 
           // Dispatch task.assigned to delivery routes (e.g., notify human agents via email)

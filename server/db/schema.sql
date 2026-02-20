@@ -321,6 +321,8 @@ CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_priority_status ON tasks(priority, status);
 CREATE INDEX IF NOT EXISTS idx_deliverables_task ON deliverables(task_id);
 CREATE INDEX IF NOT EXISTS idx_deliverables_task_version ON deliverables(task_id, version DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_deliverables_task_version_unique
+  ON deliverables(task_id, version) WHERE task_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_deliverables_project ON deliverables(project_id);
 CREATE INDEX IF NOT EXISTS idx_deliverables_status ON deliverables(status);
 CREATE INDEX IF NOT EXISTS idx_deliverables_agent ON deliverables(agent_id);

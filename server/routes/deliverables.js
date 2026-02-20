@@ -16,6 +16,7 @@ import {
   submitRevisionSchema,
   reviewDeliverableSchema
 } from '../utils/validation.js';
+import { insertDeliverableWithRetry } from '../utils/deliverableVersioning.js';
 
 const router = Router();
 
@@ -683,43 +684,80 @@ router.post('/', agentAuth, validateBody(submitDeliverableSchema), logAgentActiv
     // Determine submitted_by_user_id for user key submissions
     const submittedByUserId = req.agent.isUserKey ? req.agent.userId : null;
 
-    // Insert the deliverable (files already validated)
-    const result = db.prepare(`
-      INSERT INTO deliverables (
-        task_id, project_id, agent_id, submitted_by_user_id, title, summary, content, content_type,
-        version, parent_id, files, actions, metadata,
-        input_tokens, output_tokens, provider, model
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      taskId || null,
-      resolvedProjectId,
-      req.agent.id || null,
-      submittedByUserId,
-      title,
-      summary || null,
-      finalContent,
-      finalContentType,
-      version,
-      parentId,
-      '[]', // Placeholder for files, will update after saving
-      JSON.stringify(actions || []),
-      JSON.stringify(metadata || {}),
-      inputTokens || null,
-      outputTokens || null,
-      provider || null,
-      model || null
-    );
+    // Insert deliverable with version retry (Issue #15: prevents duplicate versions)
+    let deliverableId;
+    try {
+      const insertResult = insertDeliverableWithRetry(db, () => {
+        // Re-read version inside transaction for atomicity
+        let txVersion = version;
+        let txParentId = parentId;
+        if (taskId) {
+          const lastVersion = db.prepare(`
+            SELECT MAX(version) as max_version FROM deliverables WHERE task_id = ?
+          `).get(taskId);
+          txVersion = (lastVersion?.max_version || 0) + 1;
+          if (txVersion > 1) {
+            const parent = db.prepare(`
+              SELECT id FROM deliverables WHERE task_id = ? AND version = ?
+            `).get(taskId, txVersion - 1);
+            txParentId = parent?.id || null;
+          }
+        }
 
-    const deliverableId = result.lastInsertRowid;
+        const result = db.prepare(`
+          INSERT INTO deliverables (
+            task_id, project_id, agent_id, submitted_by_user_id, title, summary, content, content_type,
+            version, parent_id, files, actions, metadata,
+            input_tokens, output_tokens, provider, model
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          taskId || null,
+          resolvedProjectId,
+          req.agent.id || null,
+          submittedByUserId,
+          title,
+          summary || null,
+          finalContent,
+          finalContentType,
+          txVersion,
+          txParentId,
+          '[]', // Placeholder for files, will update after saving
+          JSON.stringify(actions || []),
+          JSON.stringify(metadata || {}),
+          inputTokens || null,
+          outputTokens || null,
+          provider || null,
+          model || null
+        );
 
-    // Log activity
+        // Update task status to review (if task-linked)
+        if (taskId) {
+          db.prepare(`
+            UPDATE tasks SET status = 'review', updated_at = datetime('now') WHERE id = ?
+          `).run(taskId);
+        }
+
+        return result.lastInsertRowid;
+      });
+      deliverableId = insertResult;
+    } catch (err) {
+      if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+        return res.status(409).json({
+          success: false,
+          error: 'Concurrent version conflict after retries. Please retry submission.'
+        });
+      }
+      throw err;
+    }
+
+    // Log activity (outside transaction — safe to fail independently)
     const submitActorName = req.agent.id
       ? (db.prepare('SELECT name FROM agents WHERE id = ?').get(req.agent.id)?.name || 'agent')
       : 'user';
     logActivity('deliverable', Number(deliverableId), 'created', submitActorName, { title, source: submitActorName });
 
-    // Save file attachments if provided (already validated above)
+    // Save file attachments if provided (already validated above — async, outside transaction)
     let savedFiles = [];
     if (files && files.length > 0) {
       for (const file of files) {
@@ -735,13 +773,6 @@ router.post('/', agentAuth, validateBody(submitDeliverableSchema), logAgentActiv
       db.prepare(`
         UPDATE deliverables SET files = ?, updated_at = datetime('now') WHERE id = ?
       `).run(JSON.stringify(savedFiles), deliverableId);
-    }
-
-    // Update task status to review (if task-linked)
-    if (taskId) {
-      db.prepare(`
-        UPDATE tasks SET status = 'review', updated_at = datetime('now') WHERE id = ?
-      `).run(taskId);
     }
 
     const deliverable = db.prepare('SELECT * FROM deliverables WHERE id = ?').get(deliverableId);
@@ -845,35 +876,55 @@ router.post('/:id/revision', agentAuth, validateBody(submitRevisionSchema), logA
     // Determine submitted_by_user_id for user key submissions
     const submittedByUserId = req.agent.isUserKey ? req.agent.userId : null;
 
-    // Insert the revision deliverable (files already validated)
-    const result = db.prepare(`
-      INSERT INTO deliverables (
-        task_id, agent_id, submitted_by_user_id, title, summary, content, content_type, version, parent_id, files, actions, metadata
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      parent.task_id,
-      req.agent.id,
-      submittedByUserId,
-      title || parent.title,
-      finalSummary,
-      finalContent,
-      contentType || parent.content_type,
-      parent.version + 1,
-      parent.id,
-      '[]', // Placeholder for files, will update after saving
-      JSON.stringify(finalActions),
-      JSON.stringify(metadata || safeJsonParse(parent.metadata, {}))
-    );
+    // Insert revision with version retry (Issue #15: use MAX(version) instead of parent.version + 1)
+    let deliverableId;
+    try {
+      const insertResult = insertDeliverableWithRetry(db, () => {
+        // Re-read max version inside transaction for atomicity
+        const lastVersion = db.prepare(`
+          SELECT MAX(version) as max_version FROM deliverables WHERE task_id = ?
+        `).get(parent.task_id);
+        const txVersion = (lastVersion?.max_version || 0) + 1;
 
-    const deliverableId = result.lastInsertRowid;
+        const result = db.prepare(`
+          INSERT INTO deliverables (
+            task_id, agent_id, submitted_by_user_id, title, summary, content, content_type, version, parent_id, files, actions, metadata
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          parent.task_id,
+          req.agent.id,
+          submittedByUserId,
+          title || parent.title,
+          finalSummary,
+          finalContent,
+          contentType || parent.content_type,
+          txVersion,
+          parent.id,
+          '[]', // Placeholder for files, will update after saving
+          JSON.stringify(finalActions),
+          JSON.stringify(metadata || safeJsonParse(parent.metadata, {}))
+        );
 
-    // Update parent deliverable status to 'revised'
-    db.prepare(`
-      UPDATE deliverables SET status = 'revised', updated_at = datetime('now') WHERE id = ?
-    `).run(parent.id);
+        // Update parent deliverable status to 'revised'
+        db.prepare(`
+          UPDATE deliverables SET status = 'revised', updated_at = datetime('now') WHERE id = ?
+        `).run(parent.id);
 
-    // Log activity
+        return result.lastInsertRowid;
+      });
+      deliverableId = insertResult;
+    } catch (err) {
+      if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+        return res.status(409).json({
+          success: false,
+          error: 'Concurrent version conflict after retries. Please retry submission.'
+        });
+      }
+      throw err;
+    }
+
+    // Log activity (outside transaction)
     const revisionActorName = req.agent.id
       ? (db.prepare('SELECT name FROM agents WHERE id = ?').get(req.agent.id)?.name || 'agent')
       : 'user';

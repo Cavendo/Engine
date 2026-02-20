@@ -60,6 +60,12 @@ export function runMigrations(db) {
       if (err.message.includes('duplicate column name')) {
         console.log(`[Migrator] Skipped (columns already exist): ${file}`);
         db.prepare('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)').run(version);
+      } else if (version === '003_deliverables_task_version_unique' &&
+                 err.message.includes('UNIQUE constraint failed')) {
+        console.error(`[Migrator] Migration ${file} cannot be applied: existing duplicate (task_id, version) rows in deliverables.`);
+        console.error(`[Migrator] Run: SELECT task_id, version, COUNT(*) FROM deliverables WHERE task_id IS NOT NULL GROUP BY task_id, version HAVING COUNT(*) > 1;`);
+        console.error(`[Migrator] Resolve duplicates, then restart.`);
+        throw err;
       } else {
         console.error(`[Migrator] Failed to apply ${file}:`, err.message);
         throw err;

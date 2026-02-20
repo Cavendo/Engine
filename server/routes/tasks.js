@@ -10,7 +10,8 @@ import { canAccessTask } from '../utils/authorization.js';
 import {
   evaluateRoutingRules,
   incrementActiveTaskCount,
-  decrementActiveTaskCount
+  decrementActiveTaskCount,
+  reserveAgentCapacity
 } from '../services/taskRouter.js';
 import {
   validateBody,
@@ -202,7 +203,8 @@ router.post('/', dualAuth, validateBody(createTaskSchema), (req, res) => {
     let routingRuleId = null;
     let routingDecision = null;
 
-    // Auto-assign: evaluate routing rules when 'auto' and project exists
+    // Auto-assign: evaluate routing rules when 'auto' and project exists (read-only)
+    let candidateAgentId = null;
     if (isAutoAssign && projectId) {
       const taskData = {
         tags: tags || [],
@@ -215,47 +217,88 @@ router.post('/', dualAuth, validateBody(createTaskSchema), (req, res) => {
       const routingResult = evaluateRoutingRules(projectId, taskData);
 
       if (routingResult.matched && routingResult.agentId) {
-        finalAgentId = routingResult.agentId;
+        candidateAgentId = routingResult.agentId;
         routingRuleId = routingResult.ruleId || null;
         routingDecision = routingResult.decision;
       } else {
-        // No match - log the reason but create task as pending
         routingDecision = routingResult.decision;
       }
     }
 
-    const status = finalAgentId ? 'assigned' : 'pending';
+    // Reservation + task INSERT in same transaction (Issue #18)
+    let result;
+    if (candidateAgentId) {
+      db.transaction(() => {
+        const reservation = reserveAgentCapacity(candidateAgentId);
+        if (reservation.ok) {
+          finalAgentId = candidateAgentId;
+        } else {
+          // Capacity race — treat as routing miss
+          finalAgentId = null;
+          routingDecision = reservation.reason;
+        }
 
-    const result = db.prepare(`
-      INSERT INTO tasks (
-        title, description, project_id, sprint_id, assigned_agent_id,
-        status, priority, tags, context, due_date, assigned_at,
-        routing_rule_id, routing_decision,
-        task_type, required_capabilities, preferred_agent_id
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      title,
-      description || null,
-      projectId || null,
-      sprintId || null,
-      finalAgentId,
-      status,
-      priority || 2,
-      JSON.stringify(tags || []),
-      JSON.stringify(context || {}),
-      dueDate || null,
-      finalAgentId ? new Date().toISOString() : null,
-      routingRuleId,
-      routingDecision,
-      taskType || null,
-      JSON.stringify(requiredCapabilities || []),
-      preferredAgentId || null
-    );
-
-    // Update agent's active task count if assigned
-    if (finalAgentId) {
-      incrementActiveTaskCount(finalAgentId);
+        const status = finalAgentId ? 'assigned' : 'pending';
+        result = db.prepare(`
+          INSERT INTO tasks (
+            title, description, project_id, sprint_id, assigned_agent_id,
+            status, priority, tags, context, due_date, assigned_at,
+            routing_rule_id, routing_decision,
+            task_type, required_capabilities, preferred_agent_id
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          title,
+          description || null,
+          projectId || null,
+          sprintId || null,
+          finalAgentId,
+          status,
+          priority || 2,
+          JSON.stringify(tags || []),
+          JSON.stringify(context || {}),
+          dueDate || null,
+          finalAgentId ? new Date().toISOString() : null,
+          routingRuleId,
+          routingDecision,
+          taskType || null,
+          JSON.stringify(requiredCapabilities || []),
+          preferredAgentId || null
+        );
+      })();
+    } else {
+      // No candidate (direct assignment or no routing match) — no reservation needed
+      const status = finalAgentId ? 'assigned' : 'pending';
+      result = db.prepare(`
+        INSERT INTO tasks (
+          title, description, project_id, sprint_id, assigned_agent_id,
+          status, priority, tags, context, due_date, assigned_at,
+          routing_rule_id, routing_decision,
+          task_type, required_capabilities, preferred_agent_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        title,
+        description || null,
+        projectId || null,
+        sprintId || null,
+        finalAgentId,
+        status,
+        priority || 2,
+        JSON.stringify(tags || []),
+        JSON.stringify(context || {}),
+        dueDate || null,
+        finalAgentId ? new Date().toISOString() : null,
+        routingRuleId,
+        routingDecision,
+        taskType || null,
+        JSON.stringify(requiredCapabilities || []),
+        preferredAgentId || null
+      );
+      // Direct assignment bypasses capacity check (admin override)
+      if (finalAgentId) {
+        incrementActiveTaskCount(finalAgentId);
+      }
     }
 
     const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(result.lastInsertRowid);
@@ -429,12 +472,22 @@ router.post('/bulk', userAuth, requireRoles('admin'), validateBody(bulkCreateTas
           const routingResult = evaluateRoutingRules(projectId, routingTaskData);
 
           if (routingResult.matched && routingResult.agentId) {
-            finalAgentId = routingResult.agentId;
-            routingRuleId = routingResult.ruleId || null;
-            routingDecision = routingResult.decision;
+            // Atomic capacity reservation (Issue #18)
+            const reservation = reserveAgentCapacity(routingResult.agentId);
+            if (reservation.ok) {
+              finalAgentId = routingResult.agentId;
+              routingRuleId = routingResult.ruleId || null;
+              routingDecision = routingResult.decision;
+            } else {
+              // Capacity race — treat as routing miss for this task
+              routingDecision = reservation.reason;
+            }
           } else {
             routingDecision = routingResult.decision;
           }
+        } else if (finalAgentId) {
+          // Direct assignment bypasses capacity check (admin override)
+          incrementActiveTaskCount(finalAgentId);
         }
 
         const status = finalAgentId ? 'assigned' : 'pending';
@@ -461,11 +514,6 @@ router.post('/bulk', userAuth, requireRoles('admin'), validateBody(bulkCreateTas
           routingRuleId,
           routingDecision
         );
-
-        // Update agent's active task count if assigned
-        if (finalAgentId) {
-          incrementActiveTaskCount(finalAgentId);
-        }
 
         const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(result.lastInsertRowid);
         results.push(normalizeTaskTimestamps(task));
@@ -1138,11 +1186,15 @@ router.patch('/:id', userAuth, validateBody(updateTaskSchema), (req, res) => {
     let patchFinalAgentId = null;
     let patchAutoAssignAttempted = false;
 
+    // Track whether we need deferred count changes (done inside transaction with UPDATE)
+    let deferredCountChanges = null; // { type: 'reassign'|'unassign'|'auto_assign', ... }
+    let assignedAgentValueIdx = -1; // positional index of assigned_agent_id in values[]
+
     if (assignedAgentId !== undefined) {
       const isPatchAutoAssign = assignedAgentId === 'auto';
       let resolvedAgentId = isPatchAutoAssign ? null : assignedAgentId;
 
-      // Auto-assign: evaluate routing rules when 'auto' and task has a project
+      // Auto-assign: evaluate routing rules when 'auto' and task has a project (read-only)
       if (isPatchAutoAssign) {
         const effectiveProjectId = projectId !== undefined ? projectId : task.project_id;
         if (effectiveProjectId) {
@@ -1179,16 +1231,19 @@ router.patch('/:id', userAuth, validateBody(updateTaskSchema), (req, res) => {
         }
         shouldTriggerAssignedWebhook = true;
 
-        // Update task counts: decrement old agent, increment new
-        if (task.assigned_agent_id) {
-          decrementActiveTaskCount(task.assigned_agent_id);
+        // Defer count changes to happen in transaction with UPDATE (Issue #18)
+        if (isPatchAutoAssign) {
+          deferredCountChanges = { type: 'auto_assign', newAgentId: resolvedAgentId, oldAgentId: task.assigned_agent_id };
+        } else {
+          // Direct assignment bypasses capacity check (admin override)
+          deferredCountChanges = { type: 'reassign', newAgentId: resolvedAgentId, oldAgentId: task.assigned_agent_id };
         }
-        incrementActiveTaskCount(resolvedAgentId);
       } else if (!resolvedAgentId && task.assigned_agent_id) {
-        // Unassigning from agent - decrement old agent's count
-        decrementActiveTaskCount(task.assigned_agent_id);
+        // Unassigning from agent
+        deferredCountChanges = { type: 'unassign', oldAgentId: task.assigned_agent_id };
       }
       updates.push('assigned_agent_id = ?');
+      assignedAgentValueIdx = values.length; // track position before push
       values.push(resolvedAgentId);
       if (resolvedAgentId && !task.assigned_at) {
         updates.push("assigned_at = datetime('now')");
@@ -1232,26 +1287,65 @@ router.patch('/:id', userAuth, validateBody(updateTaskSchema), (req, res) => {
     updates.push("updated_at = datetime('now')");
     values.push(req.params.id);
 
-    db.prepare(`UPDATE tasks SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+    // Wrap UPDATE + count changes in transaction so counts don't drift (Issue #18)
+    db.transaction(() => {
+      // Handle deferred assignment count changes
+      if (deferredCountChanges) {
+        if (deferredCountChanges.type === 'auto_assign') {
+          // Auto-assign: enforce capacity via reservation
+          const reservation = reserveAgentCapacity(deferredCountChanges.newAgentId);
+          if (!reservation.ok) {
+            // Capacity race — clear assignment, update routing decision
+            // Use tracked index (not indexOf) to avoid corrupting unrelated params
+            values[assignedAgentValueIdx] = null;
+            patchFinalAgentId = null;
+            patchRoutingDecision = reservation.reason;
+            const rdIdx = updates.findIndex(u => u === 'routing_decision = ?');
+            if (rdIdx !== -1) {
+              values[rdIdx] = reservation.reason;
+            }
+            shouldTriggerAssignedWebhook = false;
+          }
+          // Always release old agent — task is moving away regardless of
+          // whether the new reservation succeeded or fell back to unassigned
+          if (deferredCountChanges.oldAgentId) {
+            decrementActiveTaskCount(deferredCountChanges.oldAgentId);
+          }
+        } else if (deferredCountChanges.type === 'reassign') {
+          // Direct assignment bypasses capacity check (admin override)
+          incrementActiveTaskCount(deferredCountChanges.newAgentId);
+          if (deferredCountChanges.oldAgentId) {
+            decrementActiveTaskCount(deferredCountChanges.oldAgentId);
+          }
+        } else if (deferredCountChanges.type === 'unassign') {
+          decrementActiveTaskCount(deferredCountChanges.oldAgentId);
+        }
+      }
+
+      db.prepare(`UPDATE tasks SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+
+      // Handle active_task_count changes based on status transitions
+      const terminalStatuses = ['completed', 'cancelled'];
+      const activeStatuses = ['in_progress'];
+      const oldWasTerminal = terminalStatuses.includes(task.status);
+      const newIsTerminal = terminalStatuses.includes(status);
+      const newIsActive = activeStatuses.includes(status);
+
+      // Need to read the updated task for agent ID
+      const updatedForCount = db.prepare('SELECT assigned_agent_id FROM tasks WHERE id = ?').get(req.params.id);
+
+      // If task moved FROM terminal TO active status, increment active count
+      if (oldWasTerminal && newIsActive && updatedForCount.assigned_agent_id) {
+        incrementActiveTaskCount(updatedForCount.assigned_agent_id);
+      }
+      // If task moved FROM active TO terminal status, decrement active count
+      else if (!oldWasTerminal && newIsTerminal && updatedForCount.assigned_agent_id) {
+        decrementActiveTaskCount(updatedForCount.assigned_agent_id);
+      }
+    })();
 
     const updated = db.prepare('SELECT * FROM tasks WHERE id = ?').get(req.params.id);
     const parsedTask = normalizeTaskTimestamps(updated);
-
-    // Handle active_task_count changes based on status transitions
-    const terminalStatuses = ['completed', 'cancelled'];
-    const activeStatuses = ['in_progress'];
-    const oldWasTerminal = terminalStatuses.includes(task.status);
-    const newIsTerminal = terminalStatuses.includes(status);
-    const newIsActive = activeStatuses.includes(status);
-
-    // If task moved FROM terminal TO active status, increment active count
-    if (oldWasTerminal && newIsActive && updated.assigned_agent_id) {
-      incrementActiveTaskCount(updated.assigned_agent_id);
-    }
-    // If task moved FROM active TO terminal status, decrement active count
-    else if (!oldWasTerminal && newIsTerminal && updated.assigned_agent_id) {
-      decrementActiveTaskCount(updated.assigned_agent_id);
-    }
 
     // Trigger webhooks
     if (shouldTriggerAssignedWebhook && updated.assigned_agent_id) {

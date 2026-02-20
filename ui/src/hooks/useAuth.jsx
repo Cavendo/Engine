@@ -32,8 +32,14 @@ export function AuthProvider({ children }) {
     return data.user;
   };
 
+  // Immediate auth state update (e.g., from change-password response)
+  // without requiring a /auth/me round-trip
+  const setAuthUser = (userData) => {
+    setUser(userData);
+  };
+
   return (
-    <AuthContext.Provider value={{ user, loading, login, logout, refreshUser }}>
+    <AuthContext.Provider value={{ user, loading, login, logout, refreshUser, setAuthUser }}>
       {children}
     </AuthContext.Provider>
   );

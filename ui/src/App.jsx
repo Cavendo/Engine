@@ -30,6 +30,8 @@ function ProtectedRoute({ children }) {
     return <Navigate to="/login" replace />;
   }
 
+  // Unlock is driven by setAuthUser() from the change-password response,
+  // not by /auth/me — so transient refresh failures don't trap the user.
   if (user.forcePasswordChange && location.pathname !== '/settings') {
     return <Navigate to="/settings?tab=password" replace />;
   }
