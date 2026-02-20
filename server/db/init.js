@@ -21,7 +21,7 @@ export async function initializeDatabase(db) {
 
   // Read and execute schema
   // Note: schema.sql is the canonical baseline schema.
-  // For upgrades, use the migrator (server/db/migrator.js) which runs before this.
+  // For upgrades, use the migrator (server/db/migrator.js) which runs after this.
   const schema = readFileSync(join(__dirname, 'schema.sql'), 'utf-8');
   db.exec(schema);
 

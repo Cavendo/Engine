@@ -224,19 +224,20 @@ app.use((req, res) => {
 // ============================================
 
 async function startServer() {
-  // 1. Run migrations (schema changes, backfills)
-  try {
-    runMigrations(db);
-  } catch (err) {
-    console.error('Failed to run migrations:', err);
-    process.exit(1);
-  }
-
-  // 2. Initialize database (schema exec + seeding) — uses shared db singleton
+  // 1. Initialize database (schema exec + seeding) — uses shared db singleton
+  //    Must run before migrations so tables exist for ALTER TABLE statements.
   try {
     await initializeDatabase(db);
   } catch (err) {
     console.error('Failed to initialize database:', err);
+    process.exit(1);
+  }
+
+  // 2. Run migrations (incremental schema changes, backfills)
+  try {
+    runMigrations(db);
+  } catch (err) {
+    console.error('Failed to run migrations:', err);
     process.exit(1);
   }
 
