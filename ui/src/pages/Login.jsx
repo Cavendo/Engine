@@ -56,7 +56,7 @@ export default function Login() {
               type="email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              placeholder="admin@cavendo.local"
+              placeholder="Enter your email"
               required
             />
 

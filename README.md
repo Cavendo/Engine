@@ -452,6 +452,87 @@ data/cavendo.db
 
 `server/db/schema.sql` is the canonical **v0.1.0 baseline schema**. On fresh installs, `db:init` runs this file directly — no migrations are needed. Future releases will include a `migrations/` directory for post-v0.1.0 schema upgrades.
 
+## Environment Variables
+
+All configuration is via environment variables in `.env`. See [`.env.example`](.env.example) for a ready-to-copy template.
+
+> **Production security:** Always set strong, unique values for `JWT_SECRET` and encryption key material (`ENCRYPTION_KEY` or `ENCRYPTION_KEYRING`). If `SESSION_SECRET` is not set, the server falls back to `JWT_SECRET` for key derivation — set it explicitly in production to separate concerns.
+
+### Core
+
+| Variable | Purpose | Default | Required |
+|----------|---------|---------|----------|
+| `PORT` | Server listen port | `3001` | No |
+| `NODE_ENV` | Environment (`development` / `production`) | `development` | Yes (prod) |
+| `DATABASE_PATH` | SQLite database file path | `./data/cavendo.db` | No |
+| `CORS_ORIGIN` | Allowed CORS origin for UI | `http://localhost:5173` | No |
+| `TRUST_PROXY` | Set `true` or proxy count when behind reverse proxy | — | No |
+
+### Authentication & Security
+
+| Variable | Purpose | Default | Required |
+|----------|---------|---------|----------|
+| `JWT_SECRET` | Server secret used as fallback entropy for encryption key derivation | Auto-generated on first run | Yes (prod) |
+| `SESSION_SECRET` | Preferred secret for encryption key derivation (takes priority over `JWT_SECRET`) | Falls back to `JWT_SECRET` | Recommended (prod) |
+| `API_KEY_PREFIX` | Prefix for agent API keys | `cav_ak` | No |
+| `RATE_LIMIT_API` | Max API requests per minute | `300` | No |
+
+### Encryption
+
+| Variable | Purpose | Default | Required |
+|----------|---------|---------|----------|
+| `ENCRYPTION_KEY` | AES-256 key for provider API key encryption | Derived from session secret (dev only) | Yes (prod) |
+| `ENCRYPTION_SALT` | Salt for key derivation | `cavendo-dev-salt` | Yes (prod) |
+| `ENCRYPTION_KEYRING` | JSON keyring for key rotation (overrides above) | — | No |
+| `ENCRYPTION_KEY_VERSION_CURRENT` | Active keyring version | Latest in keyring | No |
+
+### Task Dispatcher
+
+| Variable | Purpose | Default | Required |
+|----------|---------|---------|----------|
+| `DISPATCHER_INTERVAL_MS` | Auto-execution polling interval | `30000` (30s) | No |
+| `DISPATCHER_BATCH_SIZE` | Max tasks to execute per cycle | `5` | No |
+| `EXECUTION_TIMEOUT_MS` | Provider API call timeout | `120000` (2 min) | No |
+
+### Webhooks & Delivery Routes
+
+| Variable | Purpose | Default | Required |
+|----------|---------|---------|----------|
+| `WEBHOOK_TIMEOUT_MS` | Webhook delivery timeout | `5000` (5s) | No |
+| `WEBHOOK_MAX_RETRIES` | Max webhook retry attempts | `3` | No |
+| `ALLOW_PRIVATE_WEBHOOKS` | Allow localhost/private IP webhook URLs | `false` | No (dev only) |
+| `RETRY_SWEEP_INTERVAL_MS` | Failed delivery retry sweep interval | `15000` (15s) | No |
+
+### Local Model Endpoints
+
+| Variable | Purpose | Default | Required |
+|----------|---------|---------|----------|
+| `ALLOW_CUSTOM_PROVIDER_BASE_URLS` | Allow remote HTTPS provider endpoints | `false` | No |
+| `PROVIDER_BASE_URL_ALLOWLIST` | Comma-separated trusted hosts (e.g., `gpu-box.lan:11434`) | — | No |
+| `OPENAI_COMPAT_DEFAULT_BASE_URL` | Fallback base URL for `openai_compatible` agents | `http://localhost:11434` | No |
+
+### Email (Delivery Routes)
+
+| Variable | Purpose | Default | Required |
+|----------|---------|---------|----------|
+| `EMAIL_PROVIDER` | Provider: `smtp`, `sendgrid`, `mailjet`, `postmark`, `ses` | `smtp` | No |
+| `EMAIL_FROM` | Sender email address | `notifications@cavendo.local` | No |
+| `EMAIL_FROM_NAME` | Sender display name | `Cavendo` | No |
+| `EMAIL_SMTP_HOST` | SMTP server hostname | — | If using SMTP |
+| `EMAIL_SMTP_PORT` | SMTP server port | `587` | No |
+| `EMAIL_SMTP_SECURE` | Use TLS (`true`/`false`) | `false` | No |
+| `EMAIL_SMTP_USER` | SMTP username | — | If using SMTP auth |
+| `EMAIL_SMTP_PASS` | SMTP password | — | If using SMTP auth |
+| `EMAIL_SENDGRID_API_KEY` | SendGrid API key | — | If using SendGrid |
+| `EMAIL_MAILJET_API_KEY` | Mailjet API key | — | If using Mailjet |
+| `EMAIL_MAILJET_SECRET_KEY` | Mailjet secret key | — | If using Mailjet |
+| `EMAIL_POSTMARK_SERVER_TOKEN` | Postmark server token | — | If using Postmark |
+| `EMAIL_SES_REGION` | AWS SES region | — | If using SES |
+| `EMAIL_SES_ACCESS_KEY_ID` | AWS access key ID | — | If using SES |
+| `EMAIL_SES_SECRET_ACCESS_KEY` | AWS secret access key | — | If using SES |
+
+> **Maintenance note:** When adding new `process.env.*` usage in server code, update both this table and `.env.example`.
+
 ## Troubleshooting
 
 ### Native Module Build Failures
