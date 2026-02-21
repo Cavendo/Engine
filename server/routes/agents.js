@@ -15,6 +15,7 @@ import {
   updateAgentOwnerSchema,
   updateAgentExecutionSchema
 } from '../utils/validation.js';
+import { validateProviderBaseUrl, resolveBaseUrl } from '../utils/providerEndpoint.js';
 
 const router = Router();
 
@@ -51,6 +52,8 @@ function normalizeAgentTimestamps(agent) {
     project_access: safeJsonParse(agent.project_access, ['*']),
     task_types: safeJsonParse(agent.task_types, ['*']),
     has_api_key: !!(provider_api_key_encrypted),
+    provider_base_url: agent.provider_base_url || null,
+    provider_label: agent.provider_label || null,
     created_at: toISOTimestamp(agent.created_at),
     updated_at: toISOTimestamp(agent.updated_at)
   };
@@ -163,6 +166,15 @@ const PROVIDERS = {
       { id: 'gpt-4o', name: 'GPT-4o', description: 'Latest multimodal model' },
       { id: 'gpt-4-turbo', name: 'GPT-4 Turbo', description: 'Fast and capable' },
       { id: 'gpt-3.5-turbo', name: 'GPT-3.5 Turbo', description: 'Fast and affordable' }
+    ]
+  },
+  openai_compatible: {
+    name: 'OpenAI-Compatible (Local/Self-Hosted)',
+    models: [
+      { id: 'qwen2.5:latest', name: 'Qwen 2.5', description: 'Fast local model' },
+      { id: 'llama3.2:latest', name: 'Llama 3.2', description: 'Meta open-source model' },
+      { id: 'deepseek-r1:latest', name: 'DeepSeek R1', description: 'Reasoning model' },
+      { id: 'mistral:latest', name: 'Mistral', description: 'Efficient local model' }
     ]
   }
 };
@@ -544,6 +556,8 @@ router.get('/', userAuth, (req, res) => {
         id, name, type, description, capabilities, specializations, metadata, status,
         webhook_url, webhook_events, max_concurrent_tasks, active_task_count,
         execution_mode, owner_user_id,
+        provider, provider_model, provider_base_url, provider_label,
+        provider_api_key_encrypted,
         created_at, updated_at,
         (SELECT COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0) FROM deliverables WHERE agent_id = agents.id) as total_tokens
       FROM agents
@@ -599,14 +613,30 @@ router.get('/', userAuth, (req, res) => {
  * POST /api/agents
  * Register a new agent
  */
-router.post('/', userAuth, requireRoles('admin'), validateBody(createAgentSchema), (req, res) => {
+router.post('/', userAuth, requireRoles('admin'), validateBody(createAgentSchema), async (req, res) => {
   try {
     const {
       name, type, description, capabilities, specializations, metadata, maxConcurrentTasks,
       agentType, specialization, projectAccess, taskTypes,
       // Optional execution fields (one-step create)
-      provider, providerApiKey, providerModel, systemPrompt, executionMode, maxTokens, temperature
+      provider, providerApiKey, providerModel, providerBaseUrl, providerLabel,
+      systemPrompt, executionMode, maxTokens, temperature
     } = req.body;
+
+    // Reject providerBaseUrl for openai provider (use openai_compatible instead)
+    if (provider === 'openai' && providerBaseUrl) {
+      return response.badRequest(res, 'Base URL is not supported for OpenAI provider. Use openai_compatible instead.');
+    }
+
+    // Validate providerBaseUrl if provided
+    let validatedBaseUrl = null;
+    if (providerBaseUrl && providerBaseUrl.trim()) {
+      const urlCheck = await validateProviderBaseUrl(providerBaseUrl);
+      if (!urlCheck.valid) {
+        return response.badRequest(res, `Invalid base URL: ${urlCheck.reason}`);
+      }
+      validatedBaseUrl = urlCheck.normalizedUrl;
+    }
 
     // Encrypt provider API key if provided
     let encryptedKey = null, encryptedIv = null, keyVersion = null;
@@ -622,9 +652,10 @@ router.post('/', userAuth, requireRoles('admin'), validateBody(createAgentSchema
         name, type, description, capabilities, specializations, metadata, max_concurrent_tasks,
         agent_type, specialization, project_access, task_types,
         provider, provider_api_key_encrypted, provider_api_key_iv, encryption_key_version,
-        provider_model, system_prompt, execution_mode, max_tokens, temperature
+        provider_model, provider_base_url, provider_label,
+        system_prompt, execution_mode, max_tokens, temperature
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       name,
       type,
@@ -642,6 +673,8 @@ router.post('/', userAuth, requireRoles('admin'), validateBody(createAgentSchema
       encryptedIv,
       keyVersion,
       providerModel || null,
+      validatedBaseUrl,
+      providerLabel || null,
       systemPrompt || null,
       executionMode || (provider ? 'manual' : 'manual'),
       maxTokens || 4096,
@@ -1179,7 +1212,7 @@ router.put('/:id/owner', userAuth, requireRoles('admin'), validateBody(updateAge
 router.post('/:id/test-connection', userAuth, requireRoles('admin'), async (req, res) => {
   try {
     const agent = db.prepare(`
-      SELECT id, provider, provider_api_key_encrypted, provider_api_key_iv, encryption_key_version, provider_model
+      SELECT id, provider, provider_api_key_encrypted, provider_api_key_iv, encryption_key_version, provider_model, provider_base_url
       FROM agents WHERE id = ?
     `).get(req.params.id);
 
@@ -1196,62 +1229,40 @@ router.post('/:id/test-connection', userAuth, requireRoles('admin'), async (req,
       apiKey = decrypt(agent.provider_api_key_encrypted, agent.provider_api_key_iv, agent.encryption_key_version);
     }
 
-    if (!apiKey || !provider) {
-      return response.badRequest(res, 'Provider and API key are required');
+    if (!provider) {
+      return response.badRequest(res, 'Provider is required');
     }
 
-    // Test the connection based on provider
-    try {
-      if (provider === 'anthropic') {
-        const result = await fetch('https://api.anthropic.com/v1/messages', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'x-api-key': apiKey,
-            'anthropic-version': '2023-06-01'
-          },
-          body: JSON.stringify({
-            model: model || 'claude-sonnet-4-20250514',
-            max_tokens: 10,
-            messages: [{ role: 'user', content: 'Hi' }]
-          })
-        });
+    // API key is required for anthropic and openai, optional for openai_compatible
+    if (!apiKey && provider !== 'openai_compatible') {
+      return response.badRequest(res, 'API key is required for this provider');
+    }
 
-        if (result.ok) {
-          return response.success(res, { success: true, message: 'Connection successful' });
-        } else {
-          const error = await result.json();
-          return response.success(res, {
-            success: false,
-            message: error.error?.message || 'Connection failed'
-          });
-        }
-      } else if (provider === 'openai') {
-        const result = await fetch('https://api.openai.com/v1/chat/completions', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${apiKey}`
-          },
-          body: JSON.stringify({
-            model: model || 'gpt-4o',
-            max_tokens: 10,
-            messages: [{ role: 'user', content: 'Hi' }]
-          })
-        });
-
-        if (result.ok) {
-          return response.success(res, { success: true, message: 'Connection successful' });
-        } else {
-          const error = await result.json();
-          return response.success(res, {
-            success: false,
-            message: error.error?.message || 'Connection failed'
-          });
-        }
-      } else {
-        return response.badRequest(res, `Unsupported provider: ${provider}`);
+    // Resolve base URL for openai_compatible
+    let baseUrl = null;
+    if (provider === 'openai_compatible' || provider === 'openai') {
+      // Use request body baseUrl, or fall back to agent's saved URL
+      const requestBaseUrl = req.body.baseUrl;
+      if (provider === 'openai_compatible') {
+        baseUrl = requestBaseUrl || agent.provider_base_url || resolveBaseUrl({ ...agent, provider });
       }
+
+      // Validate the base URL if present
+      if (baseUrl) {
+        const urlCheck = await validateProviderBaseUrl(baseUrl);
+        if (!urlCheck.valid) {
+          return response.badRequest(res, `Invalid base URL: ${urlCheck.reason}`);
+        }
+        baseUrl = urlCheck.normalizedUrl;
+      }
+    }
+
+    // Import and use agent executor for test
+    const { testConnection } = await import('../services/agentExecutor.js');
+
+    try {
+      const result = await testConnection(provider, apiKey, model, baseUrl);
+      return response.success(res, result);
     } catch (fetchError) {
       return response.success(res, {
         success: false,
@@ -1278,8 +1289,11 @@ router.post('/:id/execute', userAuth, requireRoles('admin'), async (req, res) =>
       return response.notFound(res, 'Agent');
     }
 
-    if (!agent.provider || !agent.provider_api_key_encrypted) {
-      return response.badRequest(res, 'Agent execution not configured');
+    if (!agent.provider) {
+      return response.badRequest(res, 'Agent provider not configured');
+    }
+    if (!agent.provider_api_key_encrypted && agent.provider !== 'openai_compatible') {
+      return response.badRequest(res, 'Agent API key not configured');
     }
 
     const { taskId } = req.body;
@@ -1310,9 +1324,9 @@ router.post('/:id/execute', userAuth, requireRoles('admin'), async (req, res) =>
  * PATCH /api/agents/:id/execution
  * Update agent execution configuration
  */
-router.patch('/:id/execution', userAuth, requireRoles('admin'), validateBody(updateAgentExecutionSchema), (req, res) => {
+router.patch('/:id/execution', userAuth, requireRoles('admin'), validateBody(updateAgentExecutionSchema), async (req, res) => {
   try {
-    const agent = db.prepare('SELECT id FROM agents WHERE id = ?').get(req.params.id);
+    const agent = db.prepare('SELECT id, provider FROM agents WHERE id = ?').get(req.params.id);
     if (!agent) {
       return response.notFound(res, 'Agent');
     }
@@ -1321,11 +1335,21 @@ router.patch('/:id/execution', userAuth, requireRoles('admin'), validateBody(upd
       provider,
       providerApiKey,
       providerModel,
+      providerBaseUrl,
+      providerLabel,
       systemPrompt,
       executionMode,
       maxTokens,
       temperature
     } = req.body;
+
+    // Determine the effective provider (what it will be after this update)
+    const effectiveProvider = provider !== undefined ? provider : agent.provider;
+
+    // Reject providerBaseUrl for openai provider
+    if (effectiveProvider === 'openai' && providerBaseUrl) {
+      return response.badRequest(res, 'Base URL is not supported for OpenAI provider. Use openai_compatible instead.');
+    }
 
     const updates = [];
     const values = [];
@@ -1349,6 +1373,28 @@ router.patch('/:id/execution', userAuth, requireRoles('admin'), validateBody(upd
     if (providerModel !== undefined) {
       updates.push('provider_model = ?');
       values.push(providerModel || null);
+    }
+
+    // Handle providerBaseUrl
+    if (providerBaseUrl !== undefined) {
+      if (providerBaseUrl && providerBaseUrl.trim()) {
+        const urlCheck = await validateProviderBaseUrl(providerBaseUrl);
+        if (!urlCheck.valid) {
+          return response.badRequest(res, `Invalid base URL: ${urlCheck.reason}`);
+        }
+        updates.push('provider_base_url = ?');
+        values.push(urlCheck.normalizedUrl);
+      } else {
+        // Explicitly clearing the base URL
+        updates.push('provider_base_url = ?');
+        values.push(null);
+      }
+    }
+
+    // Handle providerLabel
+    if (providerLabel !== undefined) {
+      updates.push('provider_label = ?');
+      values.push(providerLabel || null);
     }
 
     if (systemPrompt !== undefined) {

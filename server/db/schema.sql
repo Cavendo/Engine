@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS agents (
     provider_api_key_iv TEXT,
     encryption_key_version INTEGER DEFAULT NULL, -- Keyring version used for provider_api_key
     provider_model TEXT, -- 'claude-opus-4', 'gpt-4o', etc.
+    provider_base_url TEXT, -- Custom API base URL origin (for local/self-hosted models)
+    provider_label TEXT, -- Display-only label (e.g., "Ollama", "LM Studio")
     system_prompt TEXT, -- Standing instructions for this agent
     execution_mode TEXT DEFAULT 'manual' CHECK (execution_mode IN ('manual', 'auto', 'polling', 'human')),
     max_tokens INTEGER DEFAULT 4096,

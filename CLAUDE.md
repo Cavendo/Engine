@@ -70,7 +70,7 @@ server/
 │   └── userAuth.js       # Session validation
 ├── services/
 │   ├── webhooks.js       # Webhook delivery
-│   ├── agentExecutor.js  # AI provider execution (Anthropic/OpenAI)
+│   ├── agentExecutor.js  # AI provider execution (Anthropic/OpenAI/OpenAI-compatible)
 │   ├── taskDispatcher.js # Background auto-execution polling service
 │   ├── taskRouter.js     # Task routing rule evaluation + agent matching
 │   ├── activityLogger.js # Universal activity log (fire-and-forget)
@@ -79,7 +79,9 @@ server/
 └── utils/
     ├── crypto.js         # Hashing, encryption, signatures
     ├── validation.js     # Zod schemas for routing rules
-    └── response.js       # API response helpers + route formatting
+    ├── response.js       # API response helpers + route formatting
+    ├── networkUtils.js   # Shared IP classification (private/local detection)
+    └── providerEndpoint.js # Provider base URL validation + security
 ```
 
 ### UI Structure
@@ -112,6 +114,7 @@ Both authenticate via `X-Agent-Key` header.
 Agents can execute tasks via AI provider APIs:
 - **Anthropic**: Claude Opus/Sonnet/Haiku
 - **OpenAI**: GPT-4o/Turbo/3.5
+- **OpenAI-Compatible**: Ollama, LM Studio, vLLM, any `/v1/chat/completions` endpoint
 - Execution modes: manual, auto, polling, human (human workers — dispatcher skips, notified via delivery routes)
 - Provider API keys stored encrypted (AES-256-GCM)
 
@@ -172,10 +175,12 @@ SQLite database at `data/cavendo.db`. Key tables:
 
 ```sql
 owner_user_id          -- Link agent to user for "my tasks"
-provider               -- 'anthropic' or 'openai'
+provider               -- 'anthropic', 'openai', or 'openai_compatible'
 provider_api_key_encrypted  -- AES-256-GCM encrypted
 provider_api_key_iv    -- Initialization vector
 provider_model         -- Model ID
+provider_base_url      -- Custom API base URL origin (openai_compatible)
+provider_label         -- Display label (e.g., "Ollama", "LM Studio")
 system_prompt          -- Custom instructions
 execution_mode         -- 'manual', 'auto', 'polling', 'human'
 ```
@@ -198,6 +203,8 @@ execution_mode         -- 'manual', 'auto', 'polling', 'human'
 - `server/services/agentExecutor.js` - AI provider execution
 - `server/utils/crypto.js` - Encryption utilities
 - `server/services/taskDispatcher.js` - Background auto-execution service (polling, capacity, retry)
+- `server/utils/providerEndpoint.js` - Provider base URL validation + endpoint security
+- `server/utils/networkUtils.js` - Shared IP/hostname classification
 - `server/services/webhooks.js` - Webhook delivery with retry
 - `server/services/activityLogger.js` - Universal activity logging
 - `server/services/routeDispatcher.js` - Delivery route dispatch + logging

@@ -9,6 +9,7 @@ import db from '../db/connection.js';
 import { decrypt } from '../utils/crypto.js';
 import { dispatchEvent } from './routeDispatcher.js';
 import { insertDeliverableWithRetry } from '../utils/deliverableVersioning.js';
+import { resolveBaseUrl } from '../utils/providerEndpoint.js';
 
 const EXECUTION_TIMEOUT_MS = parseInt(process.env.EXECUTION_TIMEOUT_MS) || 120000;
 
@@ -86,18 +87,23 @@ function gatherTaskContext(task) {
  * @returns {Promise<Object>} Execution result
  */
 export async function executeTask(agent, task) {
-  // Decrypt API key
-  let apiKey;
-  try {
-    apiKey = decrypt(agent.provider_api_key_encrypted, agent.provider_api_key_iv, agent.encryption_key_version);
-  } catch (decryptErr) {
-    const err = new Error('Failed to decrypt provider API key — check ENCRYPTION_KEY and re-save the key in agent settings');
-    err.category = 'config_error';
-    err.retryable = true;
-    throw err;
-  }
-  if (!apiKey) {
-    const err = new Error('Failed to decrypt provider API key — check ENCRYPTION_KEY and re-save the key in agent settings');
+  // Decrypt API key (optional for openai_compatible)
+  let apiKey = null;
+  if (agent.provider_api_key_encrypted) {
+    try {
+      apiKey = decrypt(agent.provider_api_key_encrypted, agent.provider_api_key_iv, agent.encryption_key_version);
+    } catch (decryptErr) {
+      if (agent.provider !== 'openai_compatible') {
+        const err = new Error('Failed to decrypt provider API key — check ENCRYPTION_KEY and re-save the key in agent settings');
+        err.category = 'config_error';
+        err.retryable = true;
+        throw err;
+      }
+      // For openai_compatible, API key is optional — continue without it
+      console.warn('[AgentExecutor] Could not decrypt API key for openai_compatible agent, proceeding without key');
+    }
+  } else if (agent.provider !== 'openai_compatible') {
+    const err = new Error('Provider API key not configured');
     err.category = 'config_error';
     err.retryable = true;
     throw err;
@@ -121,8 +127,9 @@ export async function executeTask(agent, task) {
   try {
     if (agent.provider === 'anthropic') {
       result = await executeAnthropic(apiKey, agent.provider_model, systemPrompt, userPrompt, agent.max_tokens, agent.temperature);
-    } else if (agent.provider === 'openai') {
-      result = await executeOpenAI(apiKey, agent.provider_model, systemPrompt, userPrompt, agent.max_tokens, agent.temperature);
+    } else if (agent.provider === 'openai' || agent.provider === 'openai_compatible') {
+      const baseUrl = resolveBaseUrl(agent);
+      result = await executeOpenAI(apiKey, agent.provider_model, systemPrompt, userPrompt, agent.max_tokens, agent.temperature, baseUrl);
     } else {
       throw new Error(`Unsupported provider: ${agent.provider}`);
     }
@@ -170,7 +177,7 @@ export async function executeTask(agent, task) {
  * @param {string} model - Model ID
  * @returns {Promise<Object>} Test result
  */
-export async function testConnection(provider, apiKey, model) {
+export async function testConnection(provider, apiKey, model, baseUrl) {
   try {
     if (provider === 'anthropic') {
       const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -193,13 +200,14 @@ export async function testConnection(provider, apiKey, model) {
         const error = await response.json();
         return { success: false, message: error.error?.message || 'Connection failed' };
       }
-    } else if (provider === 'openai') {
-      const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    } else if (provider === 'openai' || provider === 'openai_compatible') {
+      const base = baseUrl || 'https://api.openai.com';
+      const headers = { 'Content-Type': 'application/json' };
+      if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+      const response = await fetch(`${base}/v1/chat/completions`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`
-        },
+        headers,
         body: JSON.stringify({
           model: model || 'gpt-4o',
           max_tokens: 10,
@@ -210,8 +218,8 @@ export async function testConnection(provider, apiKey, model) {
       if (response.ok) {
         return { success: true, message: 'Connection successful' };
       } else {
-        const error = await response.json();
-        return { success: false, message: error.error?.message || 'Connection failed' };
+        const error = await response.json().catch(() => ({}));
+        return { success: false, message: error.error?.message || `Connection failed (HTTP ${response.status})` };
       }
     } else {
       return { success: false, message: `Unsupported provider: ${provider}` };
@@ -295,17 +303,18 @@ async function executeAnthropic(apiKey, model, systemPrompt, userPrompt, maxToke
 /**
  * Execute using OpenAI API
  */
-async function executeOpenAI(apiKey, model, systemPrompt, userPrompt, maxTokens, temperature) {
+async function executeOpenAI(apiKey, model, systemPrompt, userPrompt, maxTokens, temperature, baseUrl) {
+  const base = baseUrl || 'https://api.openai.com';
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), EXECUTION_TIMEOUT_MS);
   try {
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    const headers = { 'Content-Type': 'application/json' };
+    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+    const response = await fetch(`${base}/v1/chat/completions`, {
       method: 'POST',
       signal: controller.signal,
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`
-      },
+      headers,
       body: JSON.stringify({
         model: model || 'gpt-4o',
         max_tokens: maxTokens || 4096,

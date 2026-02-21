@@ -80,7 +80,7 @@ function findEligibleTasks() {
       AND a.execution_mode = 'auto'
       AND a.status = 'active'
       AND a.provider IS NOT NULL
-      AND a.provider_api_key_encrypted IS NOT NULL
+      AND (a.provider_api_key_encrypted IS NOT NULL OR a.provider = 'openai_compatible')
       AND (a.max_concurrent_tasks IS NULL OR a.active_task_count < a.max_concurrent_tasks)
       -- due_date is a deadline, not a start schedule; do not gate auto-dispatch on it
     ORDER BY t.priority ASC, t.created_at ASC

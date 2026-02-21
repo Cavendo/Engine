@@ -2,6 +2,7 @@ import { URL } from 'url';
 import dns from 'dns/promises';
 import db from '../db/connection.js';
 import { generateWebhookSignature } from '../utils/crypto.js';
+import { isPrivateOrLocalIp, isLocalHostname, PRIVATE_IP_PATTERNS } from '../utils/networkUtils.js';
 
 function safeJsonParse(val, fallback) {
   if (val === null || val === undefined) return fallback;
@@ -16,20 +17,6 @@ const MAX_RETRIES = parseInt(process.env.WEBHOOK_MAX_RETRIES) || 3;
 const WEBHOOK_LOOP_WINDOW = 60000; // 1 minute
 const MAX_WEBHOOKS_PER_WINDOW = 100;
 const webhookCounts = new Map(); // agentId:event -> count
-
-// Private IP ranges to block for SSRF protection
-const PRIVATE_IP_PATTERNS = [
-  /^10\./,
-  /^172\.(1[6-9]|2[0-9]|3[01])\./,
-  /^192\.168\./,
-  /^127\./,
-  /^0\./,
-  /^169\.254\./,
-  /^::1$/,
-  /^fc00:/i,
-  /^fe80:/i,
-  /^localhost$/i,
-];
 
 /**
  * Validate webhook URL for SSRF protection
@@ -53,6 +40,9 @@ export async function validateWebhookUrl(urlString) {
 
     // Check hostname against private patterns
     const hostname = url.hostname.toLowerCase();
+    if (isLocalHostname(hostname) || isPrivateOrLocalIp(hostname)) {
+      return { valid: false, reason: 'Private/internal URLs are not allowed' };
+    }
     for (const pattern of PRIVATE_IP_PATTERNS) {
       if (pattern.test(hostname)) {
         return { valid: false, reason: 'Private/internal URLs are not allowed' };

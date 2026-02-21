@@ -38,6 +38,8 @@ export const createAgentSchema = z.preprocess((data) => {
     const d = { ...data };
     if ('provider_api_key' in d && !('providerApiKey' in d)) d.providerApiKey = d.provider_api_key;
     if ('provider_model' in d && !('providerModel' in d)) d.providerModel = d.provider_model;
+    if ('provider_base_url' in d && !('providerBaseUrl' in d)) d.providerBaseUrl = d.provider_base_url;
+    if ('provider_label' in d && !('providerLabel' in d)) d.providerLabel = d.provider_label;
     if ('execution_mode' in d && !('executionMode' in d)) d.executionMode = d.execution_mode;
     if ('system_prompt' in d && !('systemPrompt' in d)) d.systemPrompt = d.system_prompt;
     if ('max_tokens' in d && !('maxTokens' in d)) d.maxTokens = d.max_tokens;
@@ -46,6 +48,8 @@ export const createAgentSchema = z.preprocess((data) => {
     // Clean up snake_case keys so strict validation doesn't reject them
     delete d.provider_api_key;
     delete d.provider_model;
+    delete d.provider_base_url;
+    delete d.provider_label;
     delete d.execution_mode;
     delete d.system_prompt;
     delete d.max_tokens;
@@ -69,9 +73,11 @@ export const createAgentSchema = z.preprocess((data) => {
   projectAccess: z.array(z.string().max(100)).optional().default(['*']), // Project names/ids or '*' for all
   taskTypes: z.array(z.string().max(50)).optional().default(['*']), // Task types this agent handles
   // Optional execution fields (one-step create with provider config)
-  provider: z.enum(['anthropic', 'openai']).optional().nullable(),
+  provider: z.enum(['anthropic', 'openai', 'openai_compatible']).optional().nullable(),
   providerApiKey: z.string().optional(),
   providerModel: z.string().max(100).optional().nullable(),
+  providerBaseUrl: z.string().max(500).optional().nullable(),
+  providerLabel: z.string().max(100).optional().nullable(),
   systemPrompt: z.string().max(50000).optional().nullable(),
   executionMode: z.enum(['manual', 'auto', 'polling', 'human']).optional(),
   maxTokens: z.number().int().min(1).max(200000).optional(),
@@ -109,9 +115,11 @@ export const updateAgentOwnerSchema = z.object({
 });
 
 export const updateAgentExecutionSchema = z.object({
-  provider: z.enum(['anthropic', 'openai']).optional().nullable(),
+  provider: z.enum(['anthropic', 'openai', 'openai_compatible']).optional().nullable(),
   providerApiKey: z.string().optional(),
   providerModel: z.string().max(100).optional().nullable(),
+  providerBaseUrl: z.string().max(500).optional().nullable(),
+  providerLabel: z.string().max(100).optional().nullable(),
   systemPrompt: z.string().max(50000).optional().nullable(),
   executionMode: z.enum(['manual', 'auto', 'polling', 'human']).optional(),
   maxTokens: z.number().int().min(1).max(200000).optional(),

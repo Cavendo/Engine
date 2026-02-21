@@ -106,7 +106,7 @@ export default function Agents() {
               <div className="flex flex-wrap gap-1">
                 {agent.provider ? (
                   <span className="px-2 py-0.5 bg-purple-100 text-purple-700 text-xs rounded-full">
-                    Task Execution ({agent.provider === 'anthropic' ? 'Claude' : 'OpenAI'}{agent.providerModel ? ` / ${agent.providerModel}` : ''})
+                    Task Execution ({agent.provider === 'anthropic' ? 'Claude' : agent.provider === 'openai_compatible' ? (agent.provider_label || 'Local') : 'OpenAI'}{agent.providerModel ? ` / ${agent.providerModel}` : ''})
                   </span>
                 ) : (
                   <span className="px-2 py-0.5 bg-blue-100 text-blue-700 text-xs rounded-full">External / MCP</span>
@@ -165,7 +165,7 @@ export default function Agents() {
 function AgentSettingsModal({ agent, onClose, onSaved, modelsConfig }) {
   const [tab, setTab] = useState('general');
   const [general, setGeneral] = useState({ name: '', type: 'supervised', description: '', capabilities: '', status: 'active' });
-  const [exec, setExec] = useState({ provider: '', providerApiKey: '', providerModel: '', systemPrompt: '', executionMode: 'manual', maxTokens: 4096, temperature: 0.7 });
+  const [exec, setExec] = useState({ provider: '', providerApiKey: '', providerModel: '', providerBaseUrl: '', providerLabel: '', systemPrompt: '', executionMode: 'manual', maxTokens: 4096, temperature: 0.7 });
   const [agentDetail, setAgentDetail] = useState(null);
   const [metrics, setMetrics] = useState(null);
   const [metricsLoading, setMetricsLoading] = useState(false);
@@ -189,10 +189,12 @@ function AgentSettingsModal({ agent, onClose, onSaved, modelsConfig }) {
       setExec({
         provider: agent.provider || '',
         providerApiKey: '',
-        providerModel: agent.providerModel || '',
-        systemPrompt: agent.systemPrompt || '',
-        executionMode: agent.executionMode || 'manual',
-        maxTokens: agent.maxTokens || 4096,
+        providerModel: agent.providerModel || agent.provider_model || '',
+        providerBaseUrl: agent.providerBaseUrl || agent.provider_base_url || '',
+        providerLabel: agent.providerLabel || agent.provider_label || '',
+        systemPrompt: agent.systemPrompt || agent.system_prompt || '',
+        executionMode: agent.executionMode || agent.execution_mode || 'manual',
+        maxTokens: agent.maxTokens || agent.max_tokens || 4096,
         temperature: agent.temperature ?? 0.7
       });
       setError(null);
@@ -256,6 +258,8 @@ function AgentSettingsModal({ agent, onClose, onSaved, modelsConfig }) {
       const payload = {
         provider: exec.provider || null,
         providerModel: exec.providerModel || null,
+        providerBaseUrl: exec.providerBaseUrl || null,
+        providerLabel: exec.providerLabel || null,
         systemPrompt: exec.systemPrompt || null,
         executionMode: exec.executionMode,
         maxTokens: parseInt(exec.maxTokens) || 4096,
@@ -527,14 +531,39 @@ curl -X POST ${serverUrl}/api/deliverables \\
             options={[
               { value: '', label: 'None' },
               { value: 'anthropic', label: 'Anthropic (Claude)' },
-              { value: 'openai', label: 'OpenAI (GPT)' }
+              { value: 'openai', label: 'OpenAI (GPT)' },
+              { value: 'openai_compatible', label: 'OpenAI-Compatible (Local)' }
             ]}
           />
           {exec.provider && (
             <>
+              {exec.provider === 'openai_compatible' && (
+                <div>
+                  <Input label="Base URL" value={exec.providerBaseUrl || ''}
+                    onChange={(e) => setExec({ ...exec, providerBaseUrl: e.target.value })}
+                    placeholder="http://localhost:11434" />
+                  <div className="flex gap-2 mt-1">
+                    <button type="button" className="text-xs text-primary-600 hover:underline"
+                      onClick={() => setExec({ ...exec, providerBaseUrl: 'http://localhost:11434', providerLabel: 'Ollama' })}>
+                      Ollama
+                    </button>
+                    <button type="button" className="text-xs text-primary-600 hover:underline"
+                      onClick={() => setExec({ ...exec, providerBaseUrl: 'http://localhost:1234', providerLabel: 'LM Studio' })}>
+                      LM Studio
+                    </button>
+                    <button type="button" className="text-xs text-primary-600 hover:underline"
+                      onClick={() => setExec({ ...exec, providerBaseUrl: 'http://localhost:8000', providerLabel: 'vLLM' })}>
+                      vLLM
+                    </button>
+                  </div>
+                  <Input label="Label (optional)" value={exec.providerLabel || ''}
+                    onChange={(e) => setExec({ ...exec, providerLabel: e.target.value })}
+                    placeholder="e.g., Ollama, LM Studio" className="mt-3" />
+                </div>
+              )}
               <div>
                 <Input label="API Key" type="password" value={exec.providerApiKey} onChange={(e) => setExec({ ...exec, providerApiKey: e.target.value })}
-                  placeholder={agent.hasApiKey ? '••••••••  (saved — leave blank to keep)' : 'Enter provider API key'} />
+                  placeholder={agent.hasApiKey ? '••••••••  (saved — leave blank to keep)' : exec.provider === 'openai_compatible' ? 'Optional — most local models don\'t need a key' : 'Enter provider API key'} />
                 {agent.hasApiKey && <p className="text-xs text-gray-500 mt-1">A key is already configured. Leave blank to keep it.</p>}
               </div>
               <ModelSelect provider={exec.provider} value={exec.providerModel} onChange={(val) => setExec({ ...exec, providerModel: val })} modelsConfig={modelsConfig} />
@@ -667,6 +696,8 @@ function CreateAgentModal({ isOpen, onClose, onSubmit, modelsConfig }) {
     provider: 'anthropic',
     providerApiKey: '',
     providerModel: '',
+    providerBaseUrl: '',
+    providerLabel: '',
     executionMode: 'auto'
   });
   const [loading, setLoading] = useState(false);
@@ -681,7 +712,7 @@ function CreateAgentModal({ isOpen, onClose, onSubmit, modelsConfig }) {
 
   const resetForm = () => {
     setMode(null);
-    setFormData({ name: '', type: 'supervised', description: '', capabilities: '', provider: 'anthropic', providerApiKey: '', providerModel: '', executionMode: 'auto' });
+    setFormData({ name: '', type: 'supervised', description: '', capabilities: '', provider: 'anthropic', providerApiKey: '', providerModel: '', providerBaseUrl: '', providerLabel: '', executionMode: 'auto' });
     setError(null);
     setCreatedKey(null);
     setKeyCopied(false);
@@ -740,14 +771,17 @@ curl -X POST ${serverUrl}/api/deliverables \\
       });
 
       // Step 2: If task execution mode, configure the provider
-      if (mode === 'execution' && formData.provider && formData.providerApiKey) {
+      if (mode === 'execution' && formData.provider) {
         try {
-          await api.agents.updateExecution(agent.id, {
+          const execPayload = {
             provider: formData.provider,
-            providerApiKey: formData.providerApiKey,
             providerModel: formData.providerModel || null,
+            providerBaseUrl: formData.providerBaseUrl || null,
+            providerLabel: formData.providerLabel || null,
             executionMode: formData.executionMode
-          });
+          };
+          if (formData.providerApiKey) execPayload.providerApiKey = formData.providerApiKey;
+          await api.agents.updateExecution(agent.id, execPayload);
         } catch (err) {
           console.error('Agent created but execution config failed:', err);
           setError('Agent created, but provider setup failed. You can configure it in Manage > Task Execution.');
@@ -874,10 +908,11 @@ curl -X POST ${serverUrl}/api/deliverables \\
               your AI provider, and Cavendo handles the rest — sending tasks, project context, and
               knowledge base to the model and collecting the deliverable.
             </p>
-            <div className="mt-4 flex items-center gap-3 text-xs text-gray-400">
+            <div className="mt-4 flex items-center gap-3 text-xs text-gray-400 flex-wrap">
               <span className="font-medium text-gray-500">Works with:</span>
               <span className="px-2 py-1 bg-purple-50 text-purple-600 rounded">Anthropic (Claude)</span>
               <span className="px-2 py-1 bg-green-50 text-green-600 rounded">OpenAI (GPT)</span>
+              <span className="px-2 py-1 bg-orange-50 text-orange-600 rounded">Ollama / Local Models</span>
             </div>
           </button>
 
@@ -951,11 +986,37 @@ curl -X POST ${serverUrl}/api/deliverables \\
               <Select label="Provider" value={formData.provider} onChange={(e) => setFormData({ ...formData, provider: e.target.value })}
                 options={[
                   { value: 'anthropic', label: 'Anthropic (Claude)' },
-                  { value: 'openai', label: 'OpenAI (GPT)' }
+                  { value: 'openai', label: 'OpenAI (GPT)' },
+                  { value: 'openai_compatible', label: 'OpenAI-Compatible (Local)' }
                 ]}
               />
+              {formData.provider === 'openai_compatible' && (
+                <div>
+                  <Input label="Base URL" value={formData.providerBaseUrl || ''}
+                    onChange={(e) => setFormData({ ...formData, providerBaseUrl: e.target.value })}
+                    placeholder="http://localhost:11434" />
+                  <div className="flex gap-2 mt-1">
+                    <button type="button" className="text-xs text-primary-600 hover:underline"
+                      onClick={() => setFormData({ ...formData, providerBaseUrl: 'http://localhost:11434', providerLabel: 'Ollama' })}>
+                      Ollama
+                    </button>
+                    <button type="button" className="text-xs text-primary-600 hover:underline"
+                      onClick={() => setFormData({ ...formData, providerBaseUrl: 'http://localhost:1234', providerLabel: 'LM Studio' })}>
+                      LM Studio
+                    </button>
+                    <button type="button" className="text-xs text-primary-600 hover:underline"
+                      onClick={() => setFormData({ ...formData, providerBaseUrl: 'http://localhost:8000', providerLabel: 'vLLM' })}>
+                      vLLM
+                    </button>
+                  </div>
+                  <Input label="Label (optional)" value={formData.providerLabel || ''}
+                    onChange={(e) => setFormData({ ...formData, providerLabel: e.target.value })}
+                    placeholder="e.g., Ollama, LM Studio" className="mt-3" />
+                </div>
+              )}
               <Input label="API Key" type="password" value={formData.providerApiKey} onChange={(e) => setFormData({ ...formData, providerApiKey: e.target.value })}
-                placeholder={formData.provider === 'anthropic' ? 'sk-ant-api03-...' : 'sk-...'} required />
+                placeholder={formData.provider === 'anthropic' ? 'sk-ant-api03-...' : formData.provider === 'openai_compatible' ? 'Optional — most local models don\'t need a key' : 'sk-...'}
+                required={formData.provider !== 'openai_compatible'} />
               <ModelSelect provider={formData.provider} value={formData.providerModel} onChange={(val) => setFormData({ ...formData, providerModel: val })} modelsConfig={modelsConfig} />
               <Select label="Execution Mode" value={formData.executionMode} onChange={(e) => setFormData({ ...formData, executionMode: e.target.value })}
                 options={[
@@ -1050,6 +1111,42 @@ function ModelSelect({ provider, value, onChange, modelsConfig }) {
         onChange={(e) => onChange(e.target.value)}
         placeholder={provider === 'anthropic' ? 'claude-sonnet-4-5-20250929' : 'gpt-4o'}
       />
+    );
+  }
+
+  // For openai_compatible, show suggestions but allow free-text entry
+  if (provider === 'openai_compatible') {
+    return (
+      <div>
+        <Input
+          label="Model"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder="e.g., qwen2.5:latest, llama3.2:latest"
+          list="openai-compat-models"
+        />
+        <datalist id="openai-compat-models">
+          {providerModels.map(m => (
+            <option key={m.id} value={m.id}>{m.name}</option>
+          ))}
+        </datalist>
+        <div className="flex flex-wrap gap-1 mt-1.5">
+          {providerModels.map(m => (
+            <button
+              key={m.id}
+              type="button"
+              onClick={() => onChange(m.id)}
+              className={`px-2 py-0.5 text-xs rounded-full border transition-colors ${
+                value === m.id
+                  ? 'bg-primary-100 border-primary-300 text-primary-700 cursor-default'
+                  : 'bg-gray-50 border-gray-200 text-gray-500 hover:bg-gray-100 hover:border-gray-300'
+              }`}
+            >
+              {m.name}
+            </button>
+          ))}
+        </div>
+      </div>
     );
   }
 

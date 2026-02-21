@@ -5,6 +5,22 @@ All notable changes to Cavendo Engine will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-02-20
+
+### Added
+
+- **Local Model Support** — New `openai_compatible` provider for Ollama, LM Studio, vLLM, LocalAI, and any OpenAI-compatible endpoint
+  - Base URL configuration with UI presets (Ollama, LM Studio, vLLM)
+  - API key optional (most local models don't require auth)
+  - Free-text model input with starter suggestions
+  - Origin-only URL enforcement (`/v1/chat/completions` appended automatically)
+- **Endpoint Security** — Two-tier validation for provider base URLs
+  - Default: only local/allowlisted endpoints permitted
+  - Override mode (`ALLOW_CUSTOM_PROVIDER_BASE_URLS=true`): remote HTTPS endpoints allowed
+  - Allowlist support (`PROVIDER_BASE_URL_ALLOWLIST`)
+  - DNS-based locality checks with split-horizon prevention
+- **Shared Network Utilities** — Extracted IP classification into `server/utils/networkUtils.js` (shared by webhooks and provider endpoint validation)
+
 ## [0.1.0] - 2026-02-18
 
 ### Added
@@ -20,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Custom metadata for extensibility
   - Active task count tracking (maintained by engine)
   - Agent status management (active, paused, disabled)
-  - Agent execution via Anthropic and OpenAI providers
+  - Agent execution via Anthropic, OpenAI, and OpenAI-compatible providers
 
 - **Task Management**
   - Create, update, and delete tasks

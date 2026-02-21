@@ -162,10 +162,11 @@ Agents can automatically execute tasks using AI provider APIs.
 
 ### Supported Providers
 
-| Provider | Models |
-|----------|--------|
-| Anthropic | claude-opus-4-20250514, claude-sonnet-4-20250514, claude-haiku-4-20250514 |
-| OpenAI | gpt-4o, gpt-4-turbo, gpt-3.5-turbo |
+| Provider | Models | API Key |
+|----------|--------|---------|
+| Anthropic | claude-opus-4-20250514, claude-sonnet-4-20250514, claude-haiku-4-20250514 | Required |
+| OpenAI | gpt-4o, gpt-4-turbo, gpt-3.5-turbo | Required |
+| OpenAI-Compatible | Any model tag (e.g., llama3.2:latest, qwen2.5:latest, mistral:latest) | Optional |
 
 ### Configure Execution
 
@@ -187,6 +188,65 @@ curl -X PATCH \
   http://localhost:3001/api/agents/1/execution
 ```
 
+#### Local Model Example (Ollama)
+
+```bash
+curl -X PATCH \
+  -H "Content-Type: application/json" \
+  -H "X-CSRF-Token: YOUR_CSRF_TOKEN" \
+  -b cookies.txt \
+  -d '{
+    "provider": "openai_compatible",
+    "providerModel": "llama3.2:latest",
+    "providerBaseUrl": "http://localhost:11434",
+    "providerLabel": "Ollama",
+    "executionMode": "manual"
+  }' \
+  http://localhost:3001/api/agents/1/execution
+```
+
+No API key is needed — most local model servers don't require authentication.
+
+> **Known gotcha:** The model name must match the exact tag in your local runtime. Run `ollama list` (or the equivalent for your server) to see available tags. A mismatch like `llama3.2` vs `llama3.2:latest` will return a model-not-found error.
+
+> **Provider boundary:** `providerBaseUrl` is only accepted for `openai_compatible`. Sending it with `provider: "openai"` returns a 400 error — use `openai_compatible` instead.
+
+### Local Model Setup
+
+Common local model servers and their default ports:
+
+| Server | Default Base URL | Install |
+|--------|-----------------|---------|
+| Ollama | `http://localhost:11434` | [ollama.com](https://ollama.com) |
+| LM Studio | `http://localhost:1234` | [lmstudio.ai](https://lmstudio.ai) |
+| vLLM | `http://localhost:8000` | `pip install vllm` |
+| LocalAI | `http://localhost:8080` | [localai.io](https://localai.io) |
+
+The UI provides one-click presets for Ollama, LM Studio, and vLLM.
+
+#### Endpoint Security
+
+By default, only local and explicitly allowlisted endpoints are permitted. This prevents accidental SSRF through the provider base URL.
+
+**Environment variables** (`.env`):
+
+```bash
+# Allow remote HTTPS endpoints (default: false)
+ALLOW_CUSTOM_PROVIDER_BASE_URLS=true
+
+# Allowlist specific hosts (comma-separated, supports host:port and IPv6 bracket notation)
+PROVIDER_BASE_URL_ALLOWLIST=gpu-box.lan,myserver.local:11434,[fd12::1]:8080
+
+# Default base URL when agent has no base URL set (default: http://localhost:11434)
+OPENAI_COMPAT_DEFAULT_BASE_URL=http://localhost:11434
+```
+
+**Security rules:**
+- **Default mode**: Only `localhost`, `127.0.0.1`, private RFC1918 IPs, and allowlisted hosts are permitted (HTTP or HTTPS)
+- **Override mode** (`ALLOW_CUSTOM_PROVIDER_BASE_URLS=true`): Remote endpoints allowed but **must use HTTPS**
+- URLs must be origin-only (no path, query, or fragment) — `/v1/chat/completions` is appended automatically
+- DNS resolution checks all resolved IPs; mixed public/private results are treated as non-local
+
 ### Execution Modes
 
 | Mode | Description |
@@ -203,7 +263,7 @@ When an agent is set to `auto` execution mode, the built-in Task Dispatcher back
 1. **Poll** for eligible tasks every 30 seconds (configurable via `DISPATCHER_INTERVAL_MS`)
 2. **Check capacity** — only executes if `active_task_count < max_concurrent_tasks`
 3. **Gather context** — pulls project knowledge, previous deliverables/feedback, and related tasks
-4. **Execute** via the configured AI provider (Anthropic/OpenAI)
+4. **Execute** via the configured AI provider (Anthropic/OpenAI/OpenAI-compatible)
 5. **Create deliverable** — stores the response as a pending deliverable for review
 6. **Handle revisions** — when re-executing a task sent back for revision, automatically links the new deliverable to the previous version and marks the old one as `revised`
 
@@ -329,6 +389,8 @@ ALTER TABLE agents ADD COLUMN provider TEXT;
 ALTER TABLE agents ADD COLUMN provider_api_key_encrypted TEXT;
 ALTER TABLE agents ADD COLUMN provider_api_key_iv TEXT;
 ALTER TABLE agents ADD COLUMN provider_model TEXT;
+ALTER TABLE agents ADD COLUMN provider_base_url TEXT;
+ALTER TABLE agents ADD COLUMN provider_label TEXT;
 ALTER TABLE agents ADD COLUMN system_prompt TEXT;
 ALTER TABLE agents ADD COLUMN execution_mode TEXT DEFAULT 'manual';
 ALTER TABLE agents ADD COLUMN max_tokens INTEGER DEFAULT 4096;

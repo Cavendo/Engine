@@ -287,6 +287,15 @@ List supported AI providers and their models.
       {"id": "gpt-4-turbo", "name": "GPT-4 Turbo", "description": "Fast"},
       {"id": "gpt-3.5-turbo", "name": "GPT-3.5 Turbo", "description": "Affordable"}
     ]
+  },
+  "openai_compatible": {
+    "name": "OpenAI-Compatible (Local/Self-Hosted)",
+    "models": [
+      {"id": "qwen2.5:latest", "name": "Qwen 2.5", "description": "Fast local model"},
+      {"id": "llama3.2:latest", "name": "Llama 3.2", "description": "Meta open-source"},
+      {"id": "deepseek-r1:latest", "name": "DeepSeek R1", "description": "Reasoning model"},
+      {"id": "mistral:latest", "name": "Mistral", "description": "Efficient"}
+    ]
   }
 }
 ```
@@ -345,6 +354,22 @@ Update agent execution configuration.
   "temperature": 0.7
 }
 ```
+
+Additional fields for `openai_compatible`:
+```json
+{
+  "provider": "openai_compatible",
+  "providerModel": "llama3.2:latest",
+  "providerBaseUrl": "http://localhost:11434",
+  "providerLabel": "Ollama",
+  "executionMode": "manual"
+}
+```
+
+**Notes:**
+- `providerBaseUrl` is only valid for `openai_compatible` — sending it with `provider: "openai"` returns 400
+- `providerApiKey` is optional for `openai_compatible` (most local models don't need auth)
+- `providerBaseUrl` must be an origin only (no path) — `/v1/chat/completions` is appended automatically
 
 ### POST /api/agents/:id/test-connection
 

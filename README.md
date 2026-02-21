@@ -21,7 +21,7 @@ Cavendo Engine provides the infrastructure for AI agents to receive tasks, submi
 - **Agent Profiles** - Rich agent metadata with capabilities, specializations, and capacity limits
 - **Task Routing** - Automatic task assignment based on tags, priority, and agent capabilities
 - **User API Keys** - Personal `cav_uk_` keys for MCP access as yourself
-- **Agent Execution** - Execute tasks via Anthropic/OpenAI APIs (auto or manual)
+- **Agent Execution** - Execute tasks via Anthropic, OpenAI, or any OpenAI-compatible endpoint (Ollama, LM Studio, vLLM)
 - **Task Management** - Create, assign, and track tasks for agents
 - **Sprint Planning** - Organize tasks into sprints/milestones with progress tracking
 - **Task Claiming** - Agents can self-assign tasks from a pool
@@ -309,7 +309,7 @@ Or use an agent key for bot identity:
 
 ## Agent Execution
 
-Agents can be configured to execute tasks via AI provider APIs (Anthropic or OpenAI). Provider API keys are stored encrypted (AES-256-GCM).
+Agents can be configured to execute tasks via AI provider APIs (Anthropic, OpenAI, or any OpenAI-compatible endpoint). Provider API keys are stored encrypted (AES-256-GCM).
 
 ### Execution Modes
 
@@ -359,6 +359,41 @@ curl -X POST \
   -H "Cookie: session=YOUR_SESSION_ID" \
   -H "X-CSRF-Token: YOUR_CSRF_TOKEN" \
   http://localhost:3001/api/agents/1/test-connection
+```
+
+### Local Model Support
+
+Use the `openai_compatible` provider to run tasks against Ollama, LM Studio, vLLM, or any server exposing `/v1/chat/completions`:
+
+```bash
+# Configure an agent for local Ollama
+curl -X PATCH \
+  -H "Cookie: session=YOUR_SESSION_ID" \
+  -H "X-CSRF-Token: YOUR_CSRF_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "openai_compatible",
+    "providerModel": "llama3.2:latest",
+    "providerBaseUrl": "http://localhost:11434",
+    "providerLabel": "Ollama",
+    "executionMode": "manual"
+  }' \
+  http://localhost:3001/api/agents/1/execution
+```
+
+> **Known gotcha:** The model name must match the exact tag in your local runtime (e.g., `ollama list`). A typo like `llama3.2` instead of `llama3.2:latest` will return a model-not-found error from the local server.
+
+**Endpoint security** — By default, only local and allowlisted endpoints are permitted. Configure via `.env`:
+
+```bash
+# Allow remote HTTPS endpoints (default: false)
+ALLOW_CUSTOM_PROVIDER_BASE_URLS=true
+
+# Allowlist specific hosts (comma-separated, supports host:port)
+PROVIDER_BASE_URL_ALLOWLIST=gpu-box.lan,myserver.local:11434
+
+# Default base URL when agent has none set (default: http://localhost:11434)
+OPENAI_COMPAT_DEFAULT_BASE_URL=http://localhost:11434
 ```
 
 ### Deliverable Version Chain
