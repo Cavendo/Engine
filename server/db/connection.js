@@ -20,15 +20,4 @@ const db = new Database(DB_PATH);
 db.pragma('foreign_keys = ON');
 db.pragma('journal_mode = WAL');
 
-// Graceful shutdown
-process.on('SIGINT', () => {
-  db.close();
-  process.exit(0);
-});
-
-process.on('SIGTERM', () => {
-  db.close();
-  process.exit(0);
-});
-
 export default db;

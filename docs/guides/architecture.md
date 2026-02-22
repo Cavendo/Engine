@@ -377,6 +377,34 @@ API keys can have restricted scopes:
 - **Semi-autonomous**: Some actions allowed without approval
 - **Autonomous**: Full autonomy (use with caution)
 
+## Server Startup Architecture
+
+The server uses an app factory pattern for composability:
+
+```
+server/env.js          ← Env bootstrap (.env loading/generation, runs at import)
+server/app.js          ← createApp(options?) factory, returns { app, start, stop }
+server/index.js        ← Thin bootstrap: imports createApp, calls start(), signal handlers
+```
+
+`createApp()` assembles middleware and routes, then returns lifecycle methods:
+
+- **`start({ port, host })`** — Initializes the database, runs migrations, crypto health check, binds the HTTP server, and starts background workers (task dispatcher, retry sweep, session cleanup). Idempotent — calling twice returns the same server.
+- **`stop()`** — Gracefully shuts down the HTTP server, stops background workers, clears timers, and closes the database connection. Idempotent and safe to call without prior `start()`.
+
+Four async lifecycle hooks allow external code to extend the startup sequence:
+
+| Hook | When it runs | Use case |
+|------|-------------|----------|
+| `beforeRoutes(app)` | Before engine routes are mounted | Custom middleware |
+| `afterRoutes(app)` | After engine routes, before SPA fallback/error handlers | Additional API routes |
+| `beforeStart(app)` | After DB init, before HTTP listen | Extra data seeding |
+| `onStarted({ app, server })` | After server is listening | Post-startup tasks (fatal on throw) |
+
+This enables downstream projects (e.g., Cavendo Cloud) to import Engine as a subtree and layer additional routes via `afterRoutes` without forking the codebase.
+
+**Known limitation:** `stop()` closes the SQLite connection (`better-sqlite3` singleton), which is terminal. Restart requires a new process.
+
 ## Extension Points
 
 ### Custom Integrations

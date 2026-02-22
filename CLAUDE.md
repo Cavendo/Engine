@@ -46,7 +46,9 @@ npm test
 
 ```
 server/
-├── index.js              # Express app entry point
+├── env.js                # Env bootstrap (.env loading/generation, import-time side effect)
+├── app.js                # createApp(options?) factory, returns { app, start, stop }
+├── index.js              # Thin bootstrap: imports createApp, calls start(), signal handlers
 ├── db/
 │   ├── connection.js     # SQLite connection
 │   ├── schema.sql        # Canonical v0.1.0 baseline schema (fresh installs)
@@ -197,6 +199,8 @@ execution_mode         -- 'manual', 'auto', 'polling', 'human'
 
 ## Important Files
 
+- `server/app.js` - App factory (`createApp`) with lifecycle hooks and start/stop
+- `server/env.js` - Env bootstrap (`.env` loading/generation at import time)
 - `server/middleware/agentAuth.js` - Agent + user key authentication
 - `server/routes/users.js` - User CRUD + API keys (creating a user auto-creates a linked human agent)
 - `server/routes/agents.js` - Agent CRUD + execution endpoints

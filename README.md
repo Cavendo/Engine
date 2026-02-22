@@ -549,6 +549,51 @@ pip install setuptools
 
 Then retry `npm install`.
 
+## Programmatic Usage
+
+Cavendo Engine exports a `createApp()` factory from `server/app.js` for embedding the engine in a larger application (e.g., layering commercial routes on top).
+
+```js
+import { createApp } from './server/app.js';
+
+const { app, start, stop } = createApp({
+  // Runs before engine routes are mounted
+  async beforeRoutes(app) {
+    app.use(myCustomMiddleware());
+  },
+
+  // Runs after engine routes but before SPA fallback and error handlers
+  async afterRoutes(app) {
+    app.get('/api/custom-endpoint', (req, res) => res.json({ ok: true }));
+  },
+
+  // Runs after DB init/migrations but before HTTP listen
+  async beforeStart(app) {
+    await seedExtraData();
+  },
+
+  // Runs after server is listening — fatal if it throws
+  async onStarted({ app, server }) {
+    console.log('Custom startup complete');
+  },
+});
+
+await start({ port: 3002, host: '0.0.0.0' });
+
+// Graceful shutdown: closes server, stops dispatcher/retry workers, closes DB
+await stop();
+```
+
+All hooks are optional and support both sync and async functions.
+
+**Standalone mode** — `node server/index.js` (or `npm start`) uses the same factory internally with no hooks, preserving existing behavior.
+
+**Known limitation:** `stop()` closes the SQLite connection, which is terminal. Calling `start()` after `stop()` in the same process will throw. To restart, create a new process.
+
+### Environment Bootstrap
+
+`server/env.js` is imported at the top of `app.js` and runs at import time. It auto-generates `.env` from `.env.example` on first run (with random secrets) and loads existing `.env` values into `process.env`. This ensures env vars are available before any other module (DB, routes, services) resolves.
+
 ## Roadmap
 
 Future storage integrations planned:
