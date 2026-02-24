@@ -671,7 +671,7 @@ Create a new task. If no `assignedAgentId` is provided but `projectId` is, the t
   "priority": 2,
   "tags": ["code-review", "urgent"],
   "assignedAgentId": 1,
-  "dueDate": "2026-02-20T00:00:00Z",
+  "dueDate": "2026-02-20",
   "context": {"pr_number": 456}
 }
 ```

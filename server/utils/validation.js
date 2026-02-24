@@ -171,7 +171,7 @@ export const createTaskSchema = z.object({
   priority: z.number().int().min(1).max(4).optional().default(2),
   tags: z.array(z.string().max(50)).max(20).optional().default([]), // For routing rules matching
   context: z.record(z.any()).optional().default({}),
-  dueDate: z.string().datetime().optional().nullable(),
+  dueDate: z.union([z.string().date(), z.string().datetime()]).optional().nullable(),
   // New task routing fields
   taskType: z.string().max(50).optional().nullable(), // e.g., 'research', 'content', 'support'
   requiredCapabilities: z.array(z.string().max(50)).max(20).optional().default([]), // Capabilities needed
@@ -188,7 +188,7 @@ export const updateTaskSchema = z.object({
   priority: z.number().int().min(1).max(4).optional(),
   context: z.record(z.any()).optional(),
   tags: z.array(z.string().max(50)).max(20).optional(),
-  dueDate: z.string().datetime().optional().nullable(),
+  dueDate: z.union([z.string().date(), z.string().datetime()]).optional().nullable(),
   // New task routing fields
   taskType: z.string().max(50).optional().nullable(),
   requiredCapabilities: z.array(z.string().max(50)).max(20).optional(),
@@ -217,7 +217,7 @@ export const bulkUpdateTasksSchema = z.object({
     projectId: z.number().int().positive().optional().nullable(),
     sprintId: z.number().int().positive().optional().nullable(),
     assignedAgentId: z.number().int().positive().optional().nullable(),
-    dueDate: z.string().datetime().optional().nullable()
+    dueDate: z.union([z.string().date(), z.string().datetime()]).optional().nullable()
   }).refine(data => Object.keys(data).length > 0, {
     message: 'At least one update field must be provided'
   })

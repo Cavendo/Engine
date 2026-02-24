@@ -36,7 +36,7 @@ Manage tasks, assignments, and task context.
 | `sprint_id` | number | Associated sprint |
 | `assigned_agent_id` | number | Assigned agent |
 | `context` | object | Additional context data |
-| `due_date` | string | Due date (ISO 8601) |
+| `due_date` | string | Due date (`YYYY-MM-DD` or ISO 8601 datetime) |
 | `assigned_at` | string | Assignment timestamp |
 | `started_at` | string | Work start timestamp |
 | `completed_at` | string | Completion timestamp |
@@ -114,7 +114,7 @@ POST /api/tasks
 | `assignedAgentId` | number | No | Agent to assign |
 | `priority` | number | No | 1-4 (default: 2) |
 | `context` | object | No | Additional context |
-| `dueDate` | string | No | Due date (ISO 8601) |
+| `dueDate` | string | No | Due date (`YYYY-MM-DD` or ISO 8601 datetime) |
 
 **Example:**
 
@@ -292,7 +292,7 @@ curl -X PATCH http://localhost:3001/api/tasks/5 \
   -b cookies.txt \
   -d '{
     "priority": 1,
-    "dueDate": "2026-02-15T17:00:00.000Z"
+    "dueDate": "2026-02-15"
   }'
 ```
 

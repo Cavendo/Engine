@@ -575,8 +575,11 @@ components:
           default: {}
         dueDate:
           type: string
-          format: date-time
+          description: Accepts YYYY-MM-DD or full ISO 8601 datetime
           nullable: true
+          examples:
+            - "2026-02-15"
+            - "2026-02-15T17:00:00.000Z"
 
     UpdateTaskRequest:
       type: object
@@ -608,8 +611,11 @@ components:
           additionalProperties: true
         dueDate:
           type: string
-          format: date-time
+          description: Accepts YYYY-MM-DD or full ISO 8601 datetime
           nullable: true
+          examples:
+            - "2026-02-15"
+            - "2026-02-15T17:00:00.000Z"
 
     UpdateTaskStatusRequest:
       type: object
