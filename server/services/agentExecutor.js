@@ -9,6 +9,13 @@ import db from '../db/adapter.js';
 import { decrypt } from '../utils/crypto.js';
 import { dispatchEvent } from './routeDispatcher.js';
 import { resolveBaseUrl } from '../utils/providerEndpoint.js';
+import { detectDeliverableContentType } from '../utils/detectDeliverableContentType.js';
+import { parseAgentDeliverableEnvelope } from '../utils/agentDeliverableEnvelope.js';
+import {
+  getMimeType,
+  saveDeliverableFile,
+  ensureUploadsDir
+} from '../utils/deliverableFiles.js';
 
 const EXECUTION_TIMEOUT_MS = parseInt(process.env.EXECUTION_TIMEOUT_MS) || 120000;
 
@@ -134,15 +141,47 @@ export async function executeTask(agent, task) {
       throw new Error(`Unsupported provider: ${agent.provider}`);
     }
 
+    // Parse envelope or detect content type
+    const envelope = parseAgentDeliverableEnvelope(result.content);
+
+    let deliverableContent;
+    let contentType;
+    let artifacts = [];
+    let deliverableTitle;
+    let deliverableSummary;
+
+    if (envelope.isEnvelope) {
+      // Reject envelopes with validation errors (malformed artifacts, disallowed MIME, etc.)
+      if (envelope.errors.length > 0) {
+        return {
+          success: false,
+          error: `Envelope validation failed: ${envelope.errors.join('; ')}`,
+          category: 'bad_request'
+        };
+      }
+
+      deliverableContent = envelope.content || '';
+      contentType = envelope.contentTypeHint || detectDeliverableContentType(deliverableContent);
+      artifacts = envelope.artifacts;
+      deliverableTitle = envelope.title;
+      deliverableSummary = envelope.summary;
+    } else {
+      deliverableContent = result.content;
+      contentType = detectDeliverableContentType(result.content);
+    }
+
     // Create deliverable from result with token usage tracking
     const deliverable = await createDeliverable(
       task.id,
       agent.id,
-      result.content,
-      task.title,
+      deliverableContent,
+      deliverableTitle || task.title,
       result.usage,
       agent.provider,
-      agent.provider_model
+      agent.provider_model,
+      contentType,
+      artifacts,
+      deliverableSummary
     );
 
     // Update task status
@@ -358,9 +397,26 @@ When completing tasks:
 1. Analyze the task requirements carefully
 2. Use the provided project knowledge and context to inform your work
 3. If previous deliverables or feedback are included, address the feedback directly
-4. Produce a clear, well-structured deliverable in markdown format
+4. Produce a clear, well-structured deliverable (markdown by default)
 5. Include relevant details and explanations
-6. Be thorough but concise`;
+6. Be thorough but concise
+
+If your task requires producing binary artifacts (files like PDF, DOCX, images, CSV, etc.), return a JSON envelope:
+{
+  "title": "optional title",
+  "summary": "optional summary",
+  "content": "inline text content (markdown, html, etc.)",
+  "content_type": "markdown",
+  "artifacts": [
+    {
+      "filename": "report.pdf",
+      "mime_type": "application/pdf",
+      "encoding": "base64",
+      "content": "<base64-encoded file content>"
+    }
+  ]
+}
+Only use the envelope format when you need to include file artifacts. For text-only deliverables, respond with plain text.`;
 }
 
 /**
@@ -433,7 +489,7 @@ function buildTaskPrompt(task, context) {
     prompt += `## Additional Context\n${JSON.stringify(taskContext, null, 2)}\n\n`;
   }
 
-  prompt += `## Instructions\nPlease complete this task and provide your deliverable below. Format your response in markdown.`;
+  prompt += `## Instructions\nPlease complete this task and provide your deliverable below. Use markdown formatting for text content. If the task requires binary file outputs, use the JSON envelope format described in your system instructions.`;
 
   return prompt;
 }
@@ -443,7 +499,7 @@ function buildTaskPrompt(task, context) {
  * Handles revision linking: if previous deliverables exist for this task,
  * sets parent_id to the most recent one and updates its status to 'revised'.
  */
-async function createDeliverable(taskId, agentId, content, title, usage, provider, model) {
+async function createDeliverable(taskId, agentId, content, title, usage, provider, model, contentType = 'markdown', artifacts = [], summary = null) {
   // Get project_id from the task so route dispatch works on review
   const task = await db.one('SELECT project_id FROM tasks WHERE id = ?', [taskId]);
   const projectId = task?.project_id || null;
@@ -465,16 +521,18 @@ async function createDeliverable(taskId, agentId, content, title, usage, provide
 
         const result = await tx.insert(`
           INSERT INTO deliverables (
-            task_id, project_id, agent_id, title, content, content_type, status, version, parent_id,
+            task_id, project_id, agent_id, title, summary, content, content_type, status, version, parent_id,
             input_tokens, output_tokens, provider, model
           )
-          VALUES (?, ?, ?, ?, ?, 'markdown', 'pending', ?, ?, ?, ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
         `, [
           taskId,
           projectId,
           agentId,
           `Deliverable: ${title}`,
+          summary || null,
           content,
+          contentType,
           version,
           parentId,
           usage?.inputTokens || null,
@@ -504,6 +562,29 @@ async function createDeliverable(taskId, agentId, content, title, usage, provide
   const deliverableId = insertResult.id;
   const finalVersion = insertResult.version;
 
+  // Save artifact files if present (outside transaction — failures propagate)
+  let savedFiles = [];
+  if (artifacts && artifacts.length > 0) {
+    await ensureUploadsDir();
+    const usedNames = [];
+    for (const artifact of artifacts) {
+      const mimeType = artifact.mime_type || getMimeType(artifact.filename);
+      const savedFile = await saveDeliverableFile(
+        artifact.filename,
+        artifact.content,
+        deliverableId,
+        { isBase64: true, existingNames: usedNames }
+      );
+      usedNames.push(savedFile.filename);
+      savedFiles.push({ ...savedFile, mimeType });
+    }
+
+    // Update deliverable with file references
+    await db.exec(`
+      UPDATE deliverables SET files = ?, updated_at = datetime('now') WHERE id = ?
+    `, [JSON.stringify(savedFiles), deliverableId]);
+  }
+
   // Dispatch deliverable.submitted event for delivery routes (outside transaction)
   if (projectId) {
     const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [projectId]);
@@ -516,9 +597,10 @@ async function createDeliverable(taskId, agentId, content, title, usage, provide
         id: deliverableId,
         title: `Deliverable: ${title}`,
         content,
-        content_type: 'markdown',
+        content_type: contentType,
         status: 'pending',
         version: finalVersion,
+        files: savedFiles,
         submitted_by: agent ? { id: agent.id, name: agent.name } : null
       },
       taskId,

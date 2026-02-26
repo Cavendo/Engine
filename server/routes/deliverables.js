@@ -1,6 +1,4 @@
 import { Router } from 'express';
-import { promises as fs } from 'fs';
-import path from 'path';
 import { randomUUID } from 'crypto';
 import db from '../db/adapter.js';
 import * as response from '../utils/response.js';
@@ -17,6 +15,16 @@ import {
   reviewDeliverableSchema
 } from '../utils/validation.js';
 import { insertDeliverableWithRetry } from '../utils/deliverableVersioning.js';
+import { detectDeliverableContentType } from '../utils/detectDeliverableContentType.js';
+import {
+  getMimeType,
+  sanitizeFilename,
+  saveDeliverableFile,
+  ensureUploadsDir,
+  UPLOADS_DIR,
+  MAX_FILE_SIZE,
+  MAX_TOTAL_FILES_SIZE
+} from '../utils/deliverableFiles.js';
 
 const router = Router();
 
@@ -66,66 +74,8 @@ function normalizeTimestamps(d) {
   };
 }
 
-// Uploads directory for file attachments
-const UPLOADS_DIR = path.join(process.cwd(), 'data', 'uploads');
-
-// File size limits
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB per file
-const MAX_TOTAL_FILES_SIZE = 50 * 1024 * 1024; // 50MB total
-
 // Ensure uploads directory exists
-fs.mkdir(UPLOADS_DIR, { recursive: true }).catch(console.error);
-
-/**
- * Get MIME type from filename extension
- */
-function getMimeType(filename) {
-  const ext = path.extname(filename).toLowerCase();
-  const mimeTypes = {
-    '.html': 'text/html',
-    '.htm': 'text/html',
-    '.css': 'text/css',
-    '.js': 'application/javascript',
-    '.json': 'application/json',
-    '.md': 'text/markdown',
-    '.txt': 'text/plain',
-    '.pdf': 'application/pdf',
-    '.png': 'image/png',
-    '.jpg': 'image/jpeg',
-    '.jpeg': 'image/jpeg',
-    '.gif': 'image/gif',
-    '.svg': 'image/svg+xml',
-    '.xml': 'application/xml',
-    '.zip': 'application/zip',
-  };
-  return mimeTypes[ext] || 'application/octet-stream';
-}
-
-/**
- * Save file attachment to disk
- */
-async function saveFile(filename, content, deliverableId) {
-  const deliverableDir = path.join(UPLOADS_DIR, 'deliverables', String(deliverableId));
-  await fs.mkdir(deliverableDir, { recursive: true });
-
-  const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
-  const filePath = path.join(deliverableDir, safeName);
-
-  // Check if content is base64 encoded
-  if (content.startsWith('base64:')) {
-    const base64Data = content.slice(7);
-    await fs.writeFile(filePath, Buffer.from(base64Data, 'base64'));
-  } else {
-    await fs.writeFile(filePath, content, 'utf8');
-  }
-
-  const stats = await fs.stat(filePath);
-  return {
-    filename: safeName,
-    path: `/uploads/deliverables/${deliverableId}/${safeName}`,
-    size: stats.size
-  };
-}
+ensureUploadsDir().catch(console.error);
 
 // ============================================
 // Admin endpoints (require user authentication)
@@ -652,20 +602,7 @@ router.post('/', agentAuth, validateBody(submitDeliverableSchema), logAgentActiv
 
     // Determine content to store
     let finalContent = content || '';
-    let finalContentType = contentType || 'markdown';
-
-    // Auto-detect HTML content without explicit contentType
-    const trimmedContent = content ? content.trim() : '';
-    const looksLikeHtml = trimmedContent.startsWith('<!DOCTYPE') ||
-                          trimmedContent.startsWith('<html') ||
-                          trimmedContent.startsWith('<head') ||
-                          trimmedContent.startsWith('<body') ||
-                          trimmedContent.startsWith('<!--') ||
-                          /^<(div|section|article|header|footer|nav|main|aside|form|table|ul|ol|span|p|h[1-6])\b/i.test(trimmedContent);
-
-    if (!contentType && content && looksLikeHtml) {
-      finalContentType = 'html';
-    }
+    let finalContentType = contentType || detectDeliverableContentType(content);
 
     // Validate file sizes BEFORE inserting to prevent orphan rows
     if (files && files.length > 0) {
@@ -763,7 +700,7 @@ router.post('/', agentAuth, validateBody(submitDeliverableSchema), logAgentActiv
     if (files && files.length > 0) {
       for (const file of files) {
         const mimeType = file.mimeType || getMimeType(file.filename);
-        const savedFile = await saveFile(file.filename, file.content, deliverableId);
+        const savedFile = await saveDeliverableFile(file.filename, file.content, deliverableId);
         savedFiles.push({
           ...savedFile,
           mimeType
@@ -899,7 +836,7 @@ router.post('/:id/revision', agentAuth, validateBody(submitRevisionSchema), logA
           title || parent.title,
           finalSummary,
           finalContent,
-          contentType || parent.content_type,
+          contentType || (content ? detectDeliverableContentType(content) : parent.content_type) || detectDeliverableContentType(finalContent),
           txVersion,
           parent.id,
           '[]', // Placeholder for files, will update after saving
@@ -936,7 +873,7 @@ router.post('/:id/revision', agentAuth, validateBody(submitRevisionSchema), logA
     if (files && files.length > 0) {
       for (const file of files) {
         const mimeType = file.mimeType || getMimeType(file.filename);
-        const savedFile = await saveFile(file.filename, file.content, deliverableId);
+        const savedFile = await saveDeliverableFile(file.filename, file.content, deliverableId);
         savedFiles.push({
           ...savedFile,
           mimeType

@@ -257,7 +257,7 @@ export const submitDeliverableSchema = z.object({
   title: z.string().min(1, 'Title is required').max(500),
   summary: z.string().max(50000).optional(), // Text summary shown in Overview tab
   content: z.string().max(1000000).optional(), // Main content (optional if files provided)
-  contentType: z.enum(['markdown', 'html', 'json', 'text', 'code']).optional().default('markdown'),
+  contentType: z.enum(['markdown', 'html', 'json', 'text', 'code']).optional(),
   files: z.array(fileAttachmentSchema).optional(), // File attachments
   actions: z.array(actionItemSchema).optional(), // Follow-up action items
   metadata: z.record(z.any()).optional().default({}),
