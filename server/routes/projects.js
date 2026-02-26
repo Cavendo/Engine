@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import db from '../db/connection.js';
+import db from '../db/adapter.js';
 import * as response from '../utils/response.js';
 import { userAuth, requireRoles } from '../middleware/userAuth.js';
 import { dualAuth } from '../middleware/agentAuth.js';
@@ -49,7 +49,7 @@ function normalizeProjectTimestamps(project) {
  * GET /api/projects
  * List all projects (accessible by both users and agents)
  */
-router.get('/', dualAuth, (req, res) => {
+router.get('/', dualAuth, async (req, res) => {
   try {
     const { status } = req.query;
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
@@ -66,24 +66,25 @@ router.get('/', dualAuth, (req, res) => {
     query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
     params.push(limit, offset);
 
-    const projects = db.prepare(query).all(...params);
+    const projects = await db.many(query, params);
 
     // Get task counts for each project
-    const projectsWithCounts = projects.map(project => {
-      const counts = db.prepare(`
+    const projectsWithCounts = [];
+    for (const project of projects) {
+      const counts = await db.one(`
         SELECT
           COUNT(*) as total,
           SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
           SUM(CASE WHEN status IN ('in_progress', 'review') THEN 1 ELSE 0 END) as in_progress,
           SUM(CASE WHEN status IN ('pending', 'assigned') THEN 1 ELSE 0 END) as pending
         FROM tasks WHERE project_id = ?
-      `).get(project.id);
+      `, [project.id]);
 
-      return normalizeProjectTimestamps({
+      projectsWithCounts.push(normalizeProjectTimestamps({
         ...project,
         taskCounts: counts
-      });
-    });
+      }));
+    }
 
     response.success(res, projectsWithCounts);
   } catch (err) {
@@ -96,16 +97,16 @@ router.get('/', dualAuth, (req, res) => {
  * POST /api/projects
  * Create a new project
  */
-router.post('/', userAuth, requireRoles('admin'), validateBody(createProjectSchema), (req, res) => {
+router.post('/', userAuth, requireRoles('admin'), validateBody(createProjectSchema), async (req, res) => {
   try {
     const { name, description } = req.body;
 
-    const result = db.prepare(`
+    const { lastInsertRowid: id } = await db.insert(`
       INSERT INTO projects (name, description)
       VALUES (?, ?)
-    `).run(name, description || null);
+    `, [name, description || null]);
 
-    const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(result.lastInsertRowid);
+    const project = await db.one('SELECT * FROM projects WHERE id = ?', [id]);
 
     // Dispatch project.created event
     dispatchEvent('project.created', {
@@ -127,26 +128,27 @@ router.post('/', userAuth, requireRoles('admin'), validateBody(createProjectSche
  * GET /api/projects/:id
  * Get project details (accessible by both users and agents)
  */
-router.get('/:id', dualAuth, (req, res) => {
+router.get('/:id', dualAuth, async (req, res) => {
   try {
-    const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
+    const project = await db.one('SELECT * FROM projects WHERE id = ?', [req.params.id]);
 
     if (!project) {
       return response.notFound(res, 'Project');
     }
 
     // Get tasks
-    const tasks = db.prepare(`
+    const tasks = await db.many(`
       SELECT id, title, status, priority, assigned_agent_id
       FROM tasks
       WHERE project_id = ?
       ORDER BY priority ASC, created_at DESC
-    `).all(req.params.id);
+    `, [req.params.id]);
 
     // Get knowledge count
-    const knowledgeCount = db.prepare(`
+    const knowledgeCountRow = await db.one(`
       SELECT COUNT(*) as count FROM knowledge WHERE project_id = ?
-    `).get(req.params.id).count;
+    `, [req.params.id]);
+    const knowledgeCount = knowledgeCountRow.count;
 
     response.success(res, normalizeProjectTimestamps({
       ...project,
@@ -163,9 +165,9 @@ router.get('/:id', dualAuth, (req, res) => {
  * PATCH /api/projects/:id
  * Update project
  */
-router.patch('/:id', userAuth, requireRoles('admin'), validateBody(updateProjectSchema), (req, res) => {
+router.patch('/:id', userAuth, requireRoles('admin'), validateBody(updateProjectSchema), async (req, res) => {
   try {
-    const project = db.prepare('SELECT id FROM projects WHERE id = ?').get(req.params.id);
+    const project = await db.one('SELECT id FROM projects WHERE id = ?', [req.params.id]);
     if (!project) {
       return response.notFound(res, 'Project');
     }
@@ -199,9 +201,9 @@ router.patch('/:id', userAuth, requireRoles('admin'), validateBody(updateProject
     updates.push("updated_at = datetime('now')");
     values.push(req.params.id);
 
-    db.prepare(`UPDATE projects SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+    await db.exec(`UPDATE projects SET ${updates.join(', ')} WHERE id = ?`, values);
 
-    const updated = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
+    const updated = await db.one('SELECT * FROM projects WHERE id = ?', [req.params.id]);
 
     response.success(res, normalizeProjectTimestamps(updated));
   } catch (err) {
@@ -214,20 +216,21 @@ router.patch('/:id', userAuth, requireRoles('admin'), validateBody(updateProject
  * DELETE /api/projects/:id
  * Delete project
  */
-router.delete('/:id', userAuth, requireRoles('admin'), (req, res) => {
+router.delete('/:id', userAuth, requireRoles('admin'), async (req, res) => {
   try {
-    const project = db.prepare('SELECT id FROM projects WHERE id = ?').get(req.params.id);
+    const project = await db.one('SELECT id FROM projects WHERE id = ?', [req.params.id]);
     if (!project) {
       return response.notFound(res, 'Project');
     }
 
     // Check for associated tasks
-    const taskCount = db.prepare('SELECT COUNT(*) as count FROM tasks WHERE project_id = ?').get(req.params.id).count;
+    const taskCountRow = await db.one('SELECT COUNT(*) as count FROM tasks WHERE project_id = ?', [req.params.id]);
+    const taskCount = taskCountRow.count;
     if (taskCount > 0) {
       return response.validationError(res, `Cannot delete project with ${taskCount} associated tasks`);
     }
 
-    db.prepare('DELETE FROM projects WHERE id = ?').run(req.params.id);
+    await db.exec('DELETE FROM projects WHERE id = ?', [req.params.id]);
 
     response.success(res, { deleted: true });
   } catch (err) {
@@ -244,9 +247,9 @@ router.delete('/:id', userAuth, requireRoles('admin'), (req, res) => {
  * GET /api/projects/:id/knowledge
  * Get project knowledge base (accessible by agents)
  */
-router.get('/:id/knowledge', dualAuth, (req, res) => {
+router.get('/:id/knowledge', dualAuth, async (req, res) => {
   try {
-    const project = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(req.params.id);
+    const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [req.params.id]);
     if (!project) {
       return response.notFound(res, 'Project');
     }
@@ -275,7 +278,7 @@ router.get('/:id/knowledge', dualAuth, (req, res) => {
     query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
     params.push(limit, offset);
 
-    const knowledge = db.prepare(query).all(...params);
+    const knowledge = await db.many(query, params);
 
     const parsed = knowledge.map(k => ({
       ...k,
@@ -302,9 +305,9 @@ router.get('/:id/knowledge', dualAuth, (req, res) => {
  * GET /api/projects/:id/routing-rules
  * Get project routing rules configuration
  */
-router.get('/:id/routing-rules', userAuth, requireRoles('admin'), (req, res) => {
+router.get('/:id/routing-rules', userAuth, requireRoles('admin'), async (req, res) => {
   try {
-    const project = db.prepare('SELECT id, task_routing_rules, default_agent_id FROM projects WHERE id = ?').get(req.params.id);
+    const project = await db.one('SELECT id, task_routing_rules, default_agent_id FROM projects WHERE id = ?', [req.params.id]);
     if (!project) {
       return response.notFound(res, 'Project');
     }
@@ -323,7 +326,7 @@ router.get('/:id/routing-rules', userAuth, requireRoles('admin'), (req, res) => 
     // Get default agent name if set
     let defaultAgent = null;
     if (project.default_agent_id) {
-      defaultAgent = db.prepare('SELECT id, name, status FROM agents WHERE id = ?').get(project.default_agent_id);
+      defaultAgent = await db.one('SELECT id, name, status FROM agents WHERE id = ?', [project.default_agent_id]);
     }
 
     response.success(res, {
@@ -341,9 +344,9 @@ router.get('/:id/routing-rules', userAuth, requireRoles('admin'), (req, res) => 
  * PUT /api/projects/:id/routing-rules
  * Update project routing rules configuration
  */
-router.put('/:id/routing-rules', userAuth, requireRoles('admin'), validateBody(routingRulesSchema), (req, res) => {
+router.put('/:id/routing-rules', userAuth, requireRoles('admin'), validateBody(routingRulesSchema), async (req, res) => {
   try {
-    const project = db.prepare('SELECT id FROM projects WHERE id = ?').get(req.params.id);
+    const project = await db.one('SELECT id FROM projects WHERE id = ?', [req.params.id]);
     if (!project) {
       return response.notFound(res, 'Project');
     }
@@ -352,7 +355,7 @@ router.put('/:id/routing-rules', userAuth, requireRoles('admin'), validateBody(r
 
     // Validate default_agent_id exists if provided
     if (default_agent_id) {
-      const agent = db.prepare('SELECT id FROM agents WHERE id = ?').get(default_agent_id);
+      const agent = await db.one('SELECT id FROM agents WHERE id = ?', [default_agent_id]);
       if (!agent) {
         return response.validationError(res, `Agent with ID ${default_agent_id} not found`);
       }
@@ -363,14 +366,14 @@ router.put('/:id/routing-rules', userAuth, requireRoles('admin'), validateBody(r
       for (const rule of task_routing_rules) {
         // Validate assign_to agent exists if specified
         if (rule.assign_to) {
-          const agent = db.prepare('SELECT id FROM agents WHERE id = ?').get(rule.assign_to);
+          const agent = await db.one('SELECT id FROM agents WHERE id = ?', [rule.assign_to]);
           if (!agent) {
             return response.validationError(res, `Agent with ID ${rule.assign_to} in rule "${rule.name}" not found`);
           }
         }
         // Validate fallback_to agent exists if specified
         if (rule.fallback_to) {
-          const fallbackAgent = db.prepare('SELECT id FROM agents WHERE id = ?').get(rule.fallback_to);
+          const fallbackAgent = await db.one('SELECT id FROM agents WHERE id = ?', [rule.fallback_to]);
           if (!fallbackAgent) {
             return response.validationError(res, `Fallback agent with ID ${rule.fallback_to} in rule "${rule.name}" not found`);
           }
@@ -381,19 +384,19 @@ router.put('/:id/routing-rules', userAuth, requireRoles('admin'), validateBody(r
     // Store task_routing_rules as JSON string
     const rulesJson = task_routing_rules ? JSON.stringify(task_routing_rules) : null;
 
-    db.prepare(`
+    await db.exec(`
       UPDATE projects
       SET task_routing_rules = ?, default_agent_id = ?, updated_at = datetime('now')
       WHERE id = ?
-    `).run(rulesJson, default_agent_id || null, req.params.id);
+    `, [rulesJson, default_agent_id || null, req.params.id]);
 
     // Fetch updated project
-    const updated = db.prepare('SELECT id, task_routing_rules, default_agent_id FROM projects WHERE id = ?').get(req.params.id);
+    const updated = await db.one('SELECT id, task_routing_rules, default_agent_id FROM projects WHERE id = ?', [req.params.id]);
 
     // Get default agent info
     let defaultAgent = null;
     if (updated.default_agent_id) {
-      defaultAgent = db.prepare('SELECT id, name, status FROM agents WHERE id = ?').get(updated.default_agent_id);
+      defaultAgent = await db.one('SELECT id, name, status FROM agents WHERE id = ?', [updated.default_agent_id]);
     }
 
     response.success(res, {
@@ -411,9 +414,9 @@ router.put('/:id/routing-rules', userAuth, requireRoles('admin'), validateBody(r
  * POST /api/projects/:id/routing-rules/test
  * Test routing rules with a simulated task (dry run)
  */
-router.post('/:id/routing-rules/test', userAuth, requireRoles('admin'), validateBody(routingTestSchema), (req, res) => {
+router.post('/:id/routing-rules/test', userAuth, requireRoles('admin'), validateBody(routingTestSchema), async (req, res) => {
   try {
-    const project = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(req.params.id);
+    const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [req.params.id]);
     if (!project) {
       return response.notFound(res, 'Project');
     }
@@ -428,12 +431,12 @@ router.post('/:id/routing-rules/test', userAuth, requireRoles('admin'), validate
     };
 
     // Evaluate routing rules (function loads rules from project internally)
-    const routingResult = evaluateRoutingRules(parseInt(req.params.id), simulatedTask);
+    const routingResult = await evaluateRoutingRules(parseInt(req.params.id), simulatedTask);
 
     // Build response
     let agentInfo = null;
     if (routingResult.matched && routingResult.agentId) {
-      const agent = db.prepare('SELECT id, name, status, active_task_count, max_concurrent_tasks FROM agents WHERE id = ?').get(routingResult.agentId);
+      const agent = await db.one('SELECT id, name, status, active_task_count, max_concurrent_tasks FROM agents WHERE id = ?', [routingResult.agentId]);
       if (agent) {
         agentInfo = {
           id: agent.id,

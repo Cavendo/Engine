@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import db from '../db/connection.js';
+import db from '../db/adapter.js';
 import * as response from '../utils/response.js';
 import { userAuth, requireRoles } from '../middleware/userAuth.js';
 import { agentAuth } from '../middleware/agentAuth.js';
@@ -68,14 +68,14 @@ const WEBHOOK_EVENTS = TRIGGER_EVENTS;
  * GET /api/webhooks/mine
  * Get webhooks for current agent
  */
-router.get('/mine', agentAuth, (req, res) => {
+router.get('/mine', agentAuth, async (req, res) => {
   try {
-    const webhooks = db.prepare(`
+    const webhooks = await db.many(`
       SELECT id, url, events, status, created_at, updated_at
       FROM webhooks
       WHERE agent_id = ?
       ORDER BY created_at DESC
-    `).all(req.agent.id);
+    `, [req.agent.id]);
 
     const parsed = webhooks.map(w => normalizeWebhookTimestamps({
       ...w,
@@ -126,19 +126,19 @@ router.post('/mine', agentAuth, async (req, res) => {
 
     const secret = generateWebhookSecret();
 
-    const result = db.prepare(`
+    const { lastInsertRowid: id } = await db.insert(`
       INSERT INTO webhooks (agent_id, url, secret, events, status)
       VALUES (?, ?, ?, ?, ?)
-    `).run(
+    `, [
       req.agent.id,
       url,
       secret,
       JSON.stringify(events),
       webhookStatus
-    );
+    ]);
 
     response.created(res, {
-      id: result.lastInsertRowid,
+      id,
       url,
       events,
       secret,
@@ -163,9 +163,9 @@ router.patch('/mine/:id', agentAuth, async (req, res) => {
     }
 
     // Verify webhook belongs to this agent
-    const webhook = db.prepare(`
+    const webhook = await db.one(`
       SELECT id, agent_id FROM webhooks WHERE id = ? AND agent_id = ?
-    `).get(req.params.id, req.agent.id);
+    `, [req.params.id, req.agent.id]);
 
     if (!webhook) {
       return response.notFound(res, 'Webhook');
@@ -213,9 +213,9 @@ router.patch('/mine/:id', agentAuth, async (req, res) => {
     updates.push("updated_at = datetime('now')");
     values.push(req.params.id);
 
-    db.prepare(`UPDATE webhooks SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+    await db.exec(`UPDATE webhooks SET ${updates.join(', ')} WHERE id = ?`, values);
 
-    const updated = db.prepare('SELECT * FROM webhooks WHERE id = ?').get(req.params.id);
+    const updated = await db.one('SELECT * FROM webhooks WHERE id = ?', [req.params.id]);
 
     response.success(res, normalizeWebhookTimestamps({
       ...updated,
@@ -233,7 +233,7 @@ router.patch('/mine/:id', agentAuth, async (req, res) => {
  * DELETE /api/webhooks/mine/:id
  * Delete webhook for current agent
  */
-router.delete('/mine/:id', agentAuth, (req, res) => {
+router.delete('/mine/:id', agentAuth, async (req, res) => {
   try {
     // Check if agent has permission to manage webhooks
     if (!req.agent.scopes.includes('webhook:create') && !req.agent.scopes.includes('*')) {
@@ -241,15 +241,15 @@ router.delete('/mine/:id', agentAuth, (req, res) => {
     }
 
     // Verify webhook belongs to this agent
-    const webhook = db.prepare(`
+    const webhook = await db.one(`
       SELECT id, agent_id FROM webhooks WHERE id = ? AND agent_id = ?
-    `).get(req.params.id, req.agent.id);
+    `, [req.params.id, req.agent.id]);
 
     if (!webhook) {
       return response.notFound(res, 'Webhook');
     }
 
-    db.prepare('DELETE FROM webhooks WHERE id = ?').run(req.params.id);
+    await db.exec('DELETE FROM webhooks WHERE id = ?', [req.params.id]);
 
     response.success(res, { deleted: true });
   } catch (err) {
@@ -266,7 +266,7 @@ router.delete('/mine/:id', agentAuth, (req, res) => {
  * GET /api/webhooks
  * List all webhooks (admin only)
  */
-router.get('/', userAuth, requireRoles('admin'), (req, res) => {
+router.get('/', userAuth, requireRoles('admin'), async (req, res) => {
   try {
     const { agentId, status } = req.query;
 
@@ -291,7 +291,7 @@ router.get('/', userAuth, requireRoles('admin'), (req, res) => {
 
     query += ' ORDER BY w.created_at DESC';
 
-    const webhooks = db.prepare(query).all(...params);
+    const webhooks = await db.many(query, params);
 
     const parsed = webhooks.map(w => normalizeWebhookTimestamps({
       ...w,
@@ -317,7 +317,7 @@ router.post('/', userAuth, requireRoles('admin'), validateBody(createWebhookSche
     const { agentId, url, events } = req.body;
 
     // Validate agent exists
-    const agent = db.prepare('SELECT id FROM agents WHERE id = ?').get(agentId);
+    const agent = await db.one('SELECT id FROM agents WHERE id = ?', [agentId]);
     if (!agent) {
       return response.validationError(res, 'Invalid agent ID');
     }
@@ -330,19 +330,19 @@ router.post('/', userAuth, requireRoles('admin'), validateBody(createWebhookSche
 
     const secret = generateWebhookSecret();
 
-    const result = db.prepare(`
+    const { lastInsertRowid: id } = await db.insert(`
       INSERT INTO webhooks (agent_id, url, secret, events)
       VALUES (?, ?, ?, ?)
-    `).run(
+    `, [
       agentId,
       url,
       secret,
       JSON.stringify(events)
-    );
+    ]);
 
     // Return the secret once - it cannot be retrieved again
     response.created(res, {
-      id: result.lastInsertRowid,
+      id,
       agentId,
       url,
       events,
@@ -360,29 +360,29 @@ router.post('/', userAuth, requireRoles('admin'), validateBody(createWebhookSche
  * GET /api/webhooks/:id
  * Get webhook details
  */
-router.get('/:id', userAuth, requireRoles('admin'), (req, res) => {
+router.get('/:id', userAuth, requireRoles('admin'), async (req, res) => {
   try {
-    const webhook = db.prepare(`
+    const webhook = await db.one(`
       SELECT
         w.*,
         a.name as agent_name
       FROM webhooks w
       LEFT JOIN agents a ON a.id = w.agent_id
       WHERE w.id = ?
-    `).get(req.params.id);
+    `, [req.params.id]);
 
     if (!webhook) {
       return response.notFound(res, 'Webhook');
     }
 
     // Get recent deliveries
-    const deliveries = db.prepare(`
+    const deliveries = (await db.many(`
       SELECT id, event_type, status, attempts, response_status, created_at, last_attempt_at
       FROM webhook_deliveries
       WHERE webhook_id = ?
       ORDER BY created_at DESC
       LIMIT 20
-    `).all(req.params.id).map(normalizeDeliveryTimestamps);
+    `, [req.params.id])).map(normalizeDeliveryTimestamps);
 
     response.success(res, normalizeWebhookTimestamps({
       ...webhook,
@@ -403,7 +403,7 @@ router.get('/:id', userAuth, requireRoles('admin'), (req, res) => {
  */
 router.patch('/:id', userAuth, requireRoles('admin'), validateBody(updateWebhookSchema), async (req, res) => {
   try {
-    const webhook = db.prepare('SELECT id FROM webhooks WHERE id = ?').get(req.params.id);
+    const webhook = await db.one('SELECT id FROM webhooks WHERE id = ?', [req.params.id]);
     if (!webhook) {
       return response.notFound(res, 'Webhook');
     }
@@ -434,9 +434,9 @@ router.patch('/:id', userAuth, requireRoles('admin'), validateBody(updateWebhook
     updates.push("updated_at = datetime('now')");
     values.push(req.params.id);
 
-    db.prepare(`UPDATE webhooks SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+    await db.exec(`UPDATE webhooks SET ${updates.join(', ')} WHERE id = ?`, values);
 
-    const updated = db.prepare('SELECT * FROM webhooks WHERE id = ?').get(req.params.id);
+    const updated = await db.one('SELECT * FROM webhooks WHERE id = ?', [req.params.id]);
 
     response.success(res, normalizeWebhookTimestamps({
       ...updated,
@@ -454,14 +454,14 @@ router.patch('/:id', userAuth, requireRoles('admin'), validateBody(updateWebhook
  * DELETE /api/webhooks/:id
  * Delete webhook
  */
-router.delete('/:id', userAuth, requireRoles('admin'), (req, res) => {
+router.delete('/:id', userAuth, requireRoles('admin'), async (req, res) => {
   try {
-    const webhook = db.prepare('SELECT id FROM webhooks WHERE id = ?').get(req.params.id);
+    const webhook = await db.one('SELECT id FROM webhooks WHERE id = ?', [req.params.id]);
     if (!webhook) {
       return response.notFound(res, 'Webhook');
     }
 
-    db.prepare('DELETE FROM webhooks WHERE id = ?').run(req.params.id);
+    await db.exec('DELETE FROM webhooks WHERE id = ?', [req.params.id]);
 
     response.success(res, { deleted: true });
   } catch (err) {
@@ -474,18 +474,18 @@ router.delete('/:id', userAuth, requireRoles('admin'), (req, res) => {
  * POST /api/webhooks/:id/rotate-secret
  * Rotate webhook secret
  */
-router.post('/:id/rotate-secret', userAuth, requireRoles('admin'), (req, res) => {
+router.post('/:id/rotate-secret', userAuth, requireRoles('admin'), async (req, res) => {
   try {
-    const webhook = db.prepare('SELECT id FROM webhooks WHERE id = ?').get(req.params.id);
+    const webhook = await db.one('SELECT id FROM webhooks WHERE id = ?', [req.params.id]);
     if (!webhook) {
       return response.notFound(res, 'Webhook');
     }
 
     const secret = generateWebhookSecret();
 
-    db.prepare(`
+    await db.exec(`
       UPDATE webhooks SET secret = ?, updated_at = datetime('now') WHERE id = ?
-    `).run(secret, req.params.id);
+    `, [secret, req.params.id]);
 
     response.success(res, {
       secret,
@@ -501,9 +501,9 @@ router.post('/:id/rotate-secret', userAuth, requireRoles('admin'), (req, res) =>
  * GET /api/webhooks/:id/deliveries
  * Get webhook delivery history
  */
-router.get('/:id/deliveries', userAuth, requireRoles('admin'), (req, res) => {
+router.get('/:id/deliveries', userAuth, requireRoles('admin'), async (req, res) => {
   try {
-    const webhook = db.prepare('SELECT id FROM webhooks WHERE id = ?').get(req.params.id);
+    const webhook = await db.one('SELECT id FROM webhooks WHERE id = ?', [req.params.id]);
     if (!webhook) {
       return response.notFound(res, 'Webhook');
     }
@@ -523,7 +523,7 @@ router.get('/:id/deliveries', userAuth, requireRoles('admin'), (req, res) => {
     query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
     params.push(limit, offset);
 
-    const deliveries = db.prepare(query).all(...params);
+    const deliveries = await db.many(query, params);
 
     response.success(res, deliveries.map(normalizeDeliveryTimestamps));
   } catch (err) {
@@ -538,12 +538,12 @@ router.get('/:id/deliveries', userAuth, requireRoles('admin'), (req, res) => {
  */
 router.post('/:id/deliveries/:deliveryId/retry', userAuth, requireRoles('admin'), async (req, res) => {
   try {
-    const delivery = db.prepare(`
+    const delivery = await db.one(`
       SELECT d.*, w.url, w.secret
       FROM webhook_deliveries d
       JOIN webhooks w ON w.id = d.webhook_id
       WHERE d.id = ? AND d.webhook_id = ?
-    `).get(req.params.deliveryId, req.params.id);
+    `, [req.params.deliveryId, req.params.id]);
 
     if (!delivery) {
       return response.notFound(res, 'Delivery');

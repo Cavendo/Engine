@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import db from '../db/connection.js';
+import db from '../db/adapter.js';
 import * as response from '../utils/response.js';
 import { userAuth, requireRoles } from '../middleware/userAuth.js';
 import { agentAuth, dualAuth, logAgentActivity } from '../middleware/agentAuth.js';
@@ -30,13 +30,13 @@ const router = Router();
  * Build assignee info for task.assigned event dispatch.
  * Includes the agent's linked user email so email routes can use {{assignee.email}}.
  */
-function buildAssigneeInfo(agentId) {
+async function buildAssigneeInfo(agentId) {
   if (!agentId) return null;
-  const agent = db.prepare('SELECT id, name, execution_mode, owner_user_id FROM agents WHERE id = ?').get(agentId);
+  const agent = await db.one('SELECT id, name, execution_mode, owner_user_id FROM agents WHERE id = ?', [agentId]);
   if (!agent) return { id: agentId };
   const info = { id: agent.id, name: agent.name, executionMode: agent.execution_mode };
   if (agent.owner_user_id) {
-    const user = db.prepare('SELECT email, name FROM users WHERE id = ?').get(agent.owner_user_id);
+    const user = await db.one('SELECT email, name FROM users WHERE id = ?', [agent.owner_user_id]);
     if (user) {
       info.email = user.email;
       info.userName = user.name;
@@ -101,7 +101,7 @@ function normalizeTaskTimestamps(task) {
  * GET /api/tasks
  * List all tasks with filtering
  */
-router.get('/', userAuth, (req, res) => {
+router.get('/', userAuth, async (req, res) => {
   try {
     const { status, priority, projectId, agentId, sprintId } = req.query;
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
@@ -145,7 +145,7 @@ router.get('/', userAuth, (req, res) => {
     query += ' ORDER BY t.priority ASC, t.created_at DESC LIMIT ? OFFSET ?';
     params.push(limit, offset);
 
-    const tasks = db.prepare(query).all(...params);
+    const tasks = await db.many(query, params);
 
     const parsed = tasks.map(task => normalizeTaskTimestamps(task));
 
@@ -164,7 +164,7 @@ router.get('/', userAuth, (req, res) => {
  * If no assignedAgentId is provided but projectId is, the task router
  * will evaluate routing rules to automatically assign an agent.
  */
-router.post('/', dualAuth, validateBody(createTaskSchema), (req, res) => {
+router.post('/', dualAuth, validateBody(createTaskSchema), async (req, res) => {
   try {
     const {
       title, description, projectId, sprintId, assignedAgentId,
@@ -176,7 +176,7 @@ router.post('/', dualAuth, validateBody(createTaskSchema), (req, res) => {
 
     // Validate agent exists if directly assigned (not 'auto')
     if (assignedAgentId && !isAutoAssign) {
-      const agent = db.prepare('SELECT id FROM agents WHERE id = ?').get(assignedAgentId);
+      const agent = await db.one('SELECT id FROM agents WHERE id = ?', [assignedAgentId]);
       if (!agent) {
         return response.validationError(res, 'Invalid agent ID');
       }
@@ -184,7 +184,7 @@ router.post('/', dualAuth, validateBody(createTaskSchema), (req, res) => {
 
     // Validate project exists if provided
     if (projectId) {
-      const project = db.prepare('SELECT id FROM projects WHERE id = ?').get(projectId);
+      const project = await db.one('SELECT id FROM projects WHERE id = ?', [projectId]);
       if (!project) {
         return response.validationError(res, 'Invalid project ID');
       }
@@ -192,7 +192,7 @@ router.post('/', dualAuth, validateBody(createTaskSchema), (req, res) => {
 
     // Validate sprint exists if provided
     if (sprintId) {
-      const sprint = db.prepare('SELECT id FROM sprints WHERE id = ?').get(sprintId);
+      const sprint = await db.one('SELECT id FROM sprints WHERE id = ?', [sprintId]);
       if (!sprint) {
         return response.validationError(res, 'Invalid sprint ID');
       }
@@ -214,7 +214,7 @@ router.post('/', dualAuth, validateBody(createTaskSchema), (req, res) => {
         preferredAgentId: preferredAgentId || null
       };
 
-      const routingResult = evaluateRoutingRules(projectId, taskData);
+      const routingResult = await evaluateRoutingRules(projectId, taskData);
 
       if (routingResult.matched && routingResult.agentId) {
         candidateAgentId = routingResult.agentId;
@@ -228,8 +228,8 @@ router.post('/', dualAuth, validateBody(createTaskSchema), (req, res) => {
     // Reservation + task INSERT in same transaction (Issue #18)
     let result;
     if (candidateAgentId) {
-      db.transaction(() => {
-        const reservation = reserveAgentCapacity(candidateAgentId);
+      result = await db.tx(async (tx) => {
+        const reservation = await reserveAgentCapacity(candidateAgentId, tx);
         if (reservation.ok) {
           finalAgentId = candidateAgentId;
         } else {
@@ -239,7 +239,7 @@ router.post('/', dualAuth, validateBody(createTaskSchema), (req, res) => {
         }
 
         const status = finalAgentId ? 'assigned' : 'pending';
-        result = db.prepare(`
+        return await tx.insert(`
           INSERT INTO tasks (
             title, description, project_id, sprint_id, assigned_agent_id,
             status, priority, tags, context, due_date, assigned_at,
@@ -247,7 +247,7 @@ router.post('/', dualAuth, validateBody(createTaskSchema), (req, res) => {
             task_type, required_capabilities, preferred_agent_id
           )
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(
+        `, [
           title,
           description || null,
           projectId || null,
@@ -264,12 +264,12 @@ router.post('/', dualAuth, validateBody(createTaskSchema), (req, res) => {
           taskType || null,
           JSON.stringify(requiredCapabilities || []),
           preferredAgentId || null
-        );
-      })();
+        ]);
+      });
     } else {
       // No candidate (direct assignment or no routing match) — no reservation needed
       const status = finalAgentId ? 'assigned' : 'pending';
-      result = db.prepare(`
+      result = await db.insert(`
         INSERT INTO tasks (
           title, description, project_id, sprint_id, assigned_agent_id,
           status, priority, tags, context, due_date, assigned_at,
@@ -277,7 +277,7 @@ router.post('/', dualAuth, validateBody(createTaskSchema), (req, res) => {
           task_type, required_capabilities, preferred_agent_id
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
+      `, [
         title,
         description || null,
         projectId || null,
@@ -294,20 +294,20 @@ router.post('/', dualAuth, validateBody(createTaskSchema), (req, res) => {
         taskType || null,
         JSON.stringify(requiredCapabilities || []),
         preferredAgentId || null
-      );
+      ]);
       // Direct assignment bypasses capacity check (admin override)
       if (finalAgentId) {
-        incrementActiveTaskCount(finalAgentId);
+        await incrementActiveTaskCount(finalAgentId);
       }
     }
 
-    const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(result.lastInsertRowid);
+    const task = await db.one('SELECT * FROM tasks WHERE id = ?', [result.lastInsertRowid]);
 
     // Log activity
     const creatorName = req.user?.name || req.user?.email || req.agent?.name || 'system';
     logActivity('task', task.id, 'created', creatorName, { title });
     if (finalAgentId) {
-      const assignedAgent = db.prepare('SELECT name FROM agents WHERE id = ?').get(finalAgentId);
+      const assignedAgent = await db.one('SELECT name FROM agents WHERE id = ?', [finalAgentId]);
       logActivity('task', task.id, 'assigned', creatorName, { assigned_to: assignedAgent?.name || `agent:${finalAgentId}` });
     }
     if (!finalAgentId && routingDecision) {
@@ -326,7 +326,7 @@ router.post('/', dualAuth, validateBody(createTaskSchema), (req, res) => {
 
     // Dispatch delivery route events (if project-scoped)
     if (projectId) {
-      const project = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(projectId);
+      const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [projectId]);
       const taskPayload = {
         id: task.id,
         title: task.title,
@@ -346,7 +346,7 @@ router.post('/', dualAuth, validateBody(createTaskSchema), (req, res) => {
 
       // Dispatch task.assigned event for delivery routes (e.g., notify human agents)
       if (finalAgentId) {
-        const assignee = buildAssigneeInfo(finalAgentId);
+        const assignee = await buildAssigneeInfo(finalAgentId);
         dispatchEvent('task.assigned', {
           project: project ? { id: project.id, name: project.name } : { id: projectId },
           projectId,
@@ -360,7 +360,7 @@ router.post('/', dualAuth, validateBody(createTaskSchema), (req, res) => {
 
     // Dispatch task.routing_failed event if routing didn't find an agent
     if (!finalAgentId && projectId && routingDecision) {
-      const projectForRouting = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(projectId);
+      const projectForRouting = await db.one('SELECT id, name FROM projects WHERE id = ?', [projectId]);
       dispatchEvent('task.routing_failed', {
         project: projectForRouting ? { id: projectForRouting.id, name: projectForRouting.name } : { id: projectId },
         projectId,
@@ -410,161 +410,159 @@ router.post('/', dualAuth, validateBody(createTaskSchema), (req, res) => {
  * Bulk create tasks (max 50 per request)
  * Supports automatic routing when no assignedAgentId is provided
  */
-router.post('/bulk', userAuth, requireRoles('admin'), validateBody(bulkCreateTasksSchema), (req, res) => {
+router.post('/bulk', userAuth, requireRoles('admin'), validateBody(bulkCreateTasksSchema), async (req, res) => {
   const { tasks } = req.body;
   const results = [];
   const errors = [];
 
-  // Wrap in transaction for atomicity
-  const bulkCreate = db.transaction(() => {
-    for (let i = 0; i < tasks.length; i++) {
-      const taskData = tasks[i];
-      try {
-        const {
-          title, description, projectId, sprintId, assignedAgentId,
-          priority, tags, context, dueDate
-        } = taskData;
+  try {
+    // Wrap in transaction for atomicity
+    await db.tx(async (tx) => {
+      for (let i = 0; i < tasks.length; i++) {
+        const taskData = tasks[i];
+        try {
+          const {
+            title, description, projectId, sprintId, assignedAgentId,
+            priority, tags, context, dueDate
+          } = taskData;
 
-        const isBulkAutoAssign = assignedAgentId === 'auto';
+          const isBulkAutoAssign = assignedAgentId === 'auto';
 
-        // Validate agent exists if directly assigned (not 'auto')
-        if (assignedAgentId && !isBulkAutoAssign) {
-          const agent = db.prepare('SELECT id FROM agents WHERE id = ?').get(assignedAgentId);
-          if (!agent) {
-            errors.push({ index: i, title, error: 'Invalid agent ID' });
-            continue;
-          }
-        }
-
-        // Validate project exists if provided
-        if (projectId) {
-          const project = db.prepare('SELECT id FROM projects WHERE id = ?').get(projectId);
-          if (!project) {
-            errors.push({ index: i, title, error: 'Invalid project ID' });
-            continue;
-          }
-        }
-
-        // Validate sprint exists if provided
-        if (sprintId) {
-          const sprint = db.prepare('SELECT id FROM sprints WHERE id = ?').get(sprintId);
-          if (!sprint) {
-            errors.push({ index: i, title, error: 'Invalid sprint ID' });
-            continue;
-          }
-        }
-
-        // Determine assignment: use provided agent or run routing rules
-        let finalAgentId = (assignedAgentId && !isBulkAutoAssign) ? assignedAgentId : null;
-        let routingRuleId = null;
-        let routingDecision = null;
-
-        // Auto-assign: evaluate routing rules when 'auto' and project exists
-        if (isBulkAutoAssign && projectId) {
-          const routingTaskData = {
-            tags: tags || [],
-            priority: priority || 2,
-            context: context || {},
-            requiredCapabilities: taskData.requiredCapabilities || [],
-            preferredAgentId: taskData.preferredAgentId || null
-          };
-
-          const routingResult = evaluateRoutingRules(projectId, routingTaskData);
-
-          if (routingResult.matched && routingResult.agentId) {
-            // Atomic capacity reservation (Issue #18)
-            const reservation = reserveAgentCapacity(routingResult.agentId);
-            if (reservation.ok) {
-              finalAgentId = routingResult.agentId;
-              routingRuleId = routingResult.ruleId || null;
-              routingDecision = routingResult.decision;
-            } else {
-              // Capacity race — treat as routing miss for this task
-              routingDecision = reservation.reason;
+          // Validate agent exists if directly assigned (not 'auto')
+          if (assignedAgentId && !isBulkAutoAssign) {
+            const agent = await tx.one('SELECT id FROM agents WHERE id = ?', [assignedAgentId]);
+            if (!agent) {
+              errors.push({ index: i, title, error: 'Invalid agent ID' });
+              continue;
             }
-          } else {
-            routingDecision = routingResult.decision;
           }
-        } else if (finalAgentId) {
-          // Direct assignment bypasses capacity check (admin override)
-          incrementActiveTaskCount(finalAgentId);
-        }
 
-        const status = finalAgentId ? 'assigned' : 'pending';
+          // Validate project exists if provided
+          if (projectId) {
+            const project = await tx.one('SELECT id FROM projects WHERE id = ?', [projectId]);
+            if (!project) {
+              errors.push({ index: i, title, error: 'Invalid project ID' });
+              continue;
+            }
+          }
 
-        const result = db.prepare(`
-          INSERT INTO tasks (
-            title, description, project_id, sprint_id, assigned_agent_id,
-            status, priority, tags, context, due_date, assigned_at,
-            routing_rule_id, routing_decision
-          )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(
-          title,
-          description || null,
-          projectId || null,
-          sprintId || null,
-          finalAgentId,
-          status,
-          priority || 2,
-          JSON.stringify(tags || []),
-          JSON.stringify(context || {}),
-          dueDate || null,
-          finalAgentId ? new Date().toISOString() : null,
-          routingRuleId,
-          routingDecision
-        );
+          // Validate sprint exists if provided
+          if (sprintId) {
+            const sprint = await tx.one('SELECT id FROM sprints WHERE id = ?', [sprintId]);
+            if (!sprint) {
+              errors.push({ index: i, title, error: 'Invalid sprint ID' });
+              continue;
+            }
+          }
 
-        const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(result.lastInsertRowid);
-        results.push(normalizeTaskTimestamps(task));
+          // Determine assignment: use provided agent or run routing rules
+          let finalAgentId = (assignedAgentId && !isBulkAutoAssign) ? assignedAgentId : null;
+          let routingRuleId = null;
+          let routingDecision = null;
 
-        // Trigger webhook if assigned
-        if (finalAgentId) {
-          triggerWebhook(finalAgentId, 'task.assigned', {
-            task: { ...task, context: safeJsonParse(task.context, {}), tags: safeJsonParse(task.tags, []) }
-          });
-        }
+          // Auto-assign: evaluate routing rules when 'auto' and project exists
+          if (isBulkAutoAssign && projectId) {
+            const routingTaskData = {
+              tags: tags || [],
+              priority: priority || 2,
+              context: context || {},
+              requiredCapabilities: taskData.requiredCapabilities || [],
+              preferredAgentId: taskData.preferredAgentId || null
+            };
 
-        // Dispatch delivery route events (if project-scoped)
-        if (projectId) {
-          const projectForEvent = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(projectId);
-          const taskPayload = {
-            id: task.id,
-            title: task.title,
-            description: task.description,
-            status: task.status,
-            priority: task.priority,
-            tags: safeJsonParse(task.tags, []),
-            assigned_agent_id: task.assigned_agent_id,
-            due_date: task.due_date
-          };
-          dispatchEvent('task.created', {
-            project: projectForEvent ? { id: projectForEvent.id, name: projectForEvent.name } : { id: projectId },
-            projectId,
-            task: taskPayload,
-            timestamp: new Date().toISOString()
-          }).catch(err => console.error('[Tasks] Route dispatch error:', err));
+            const routingResult = await evaluateRoutingRules(projectId, routingTaskData);
 
+            if (routingResult.matched && routingResult.agentId) {
+              // Atomic capacity reservation (Issue #18)
+              const reservation = await reserveAgentCapacity(routingResult.agentId, tx);
+              if (reservation.ok) {
+                finalAgentId = routingResult.agentId;
+                routingRuleId = routingResult.ruleId || null;
+                routingDecision = routingResult.decision;
+              } else {
+                // Capacity race — treat as routing miss for this task
+                routingDecision = reservation.reason;
+              }
+            } else {
+              routingDecision = routingResult.decision;
+            }
+          } else if (finalAgentId) {
+            // Direct assignment bypasses capacity check (admin override)
+            await incrementActiveTaskCount(finalAgentId, tx);
+          }
+
+          const status = finalAgentId ? 'assigned' : 'pending';
+
+          const result = await tx.insert(`
+            INSERT INTO tasks (
+              title, description, project_id, sprint_id, assigned_agent_id,
+              status, priority, tags, context, due_date, assigned_at,
+              routing_rule_id, routing_decision
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `, [
+            title,
+            description || null,
+            projectId || null,
+            sprintId || null,
+            finalAgentId,
+            status,
+            priority || 2,
+            JSON.stringify(tags || []),
+            JSON.stringify(context || {}),
+            dueDate || null,
+            finalAgentId ? new Date().toISOString() : null,
+            routingRuleId,
+            routingDecision
+          ]);
+
+          const task = await tx.one('SELECT * FROM tasks WHERE id = ?', [result.lastInsertRowid]);
+          results.push(normalizeTaskTimestamps(task));
+
+          // Trigger webhook if assigned
           if (finalAgentId) {
-            const assignee = buildAssigneeInfo(finalAgentId);
-            dispatchEvent('task.assigned', {
+            triggerWebhook(finalAgentId, 'task.assigned', {
+              task: { ...task, context: safeJsonParse(task.context, {}), tags: safeJsonParse(task.tags, []) }
+            });
+          }
+
+          // Dispatch delivery route events (if project-scoped)
+          if (projectId) {
+            const projectForEvent = await tx.one('SELECT id, name FROM projects WHERE id = ?', [projectId]);
+            const taskPayload = {
+              id: task.id,
+              title: task.title,
+              description: task.description,
+              status: task.status,
+              priority: task.priority,
+              tags: safeJsonParse(task.tags, []),
+              assigned_agent_id: task.assigned_agent_id,
+              due_date: task.due_date
+            };
+            dispatchEvent('task.created', {
               project: projectForEvent ? { id: projectForEvent.id, name: projectForEvent.name } : { id: projectId },
               projectId,
               task: taskPayload,
-              agent: assignee,
-              assignee,
               timestamp: new Date().toISOString()
             }).catch(err => console.error('[Tasks] Route dispatch error:', err));
-          }
-        }
-      } catch (err) {
-        errors.push({ index: i, title: taskData.title, error: err.message });
-      }
-    }
-  });
 
-  try {
-    bulkCreate();
+            if (finalAgentId) {
+              const assignee = await buildAssigneeInfo(finalAgentId);
+              dispatchEvent('task.assigned', {
+                project: projectForEvent ? { id: projectForEvent.id, name: projectForEvent.name } : { id: projectId },
+                projectId,
+                task: taskPayload,
+                agent: assignee,
+                assignee,
+                timestamp: new Date().toISOString()
+              }).catch(err => console.error('[Tasks] Route dispatch error:', err));
+            }
+          }
+        } catch (err) {
+          errors.push({ index: i, title: taskData.title, error: err.message });
+        }
+      }
+    });
 
     response.created(res, {
       created: results,
@@ -586,7 +584,7 @@ router.post('/bulk', userAuth, requireRoles('admin'), validateBody(bulkCreateTas
  * Bulk update tasks (max 100 per request)
  * Handles agent task count management when reassigning or completing tasks
  */
-router.patch('/bulk', userAuth, requireRoles('admin'), validateBody(bulkUpdateTasksSchema), (req, res) => {
+router.patch('/bulk', userAuth, requireRoles('admin'), validateBody(bulkUpdateTasksSchema), async (req, res) => {
   const { taskIds, updates } = req.body;
   let updatedCount = 0;
   const errors = [];
@@ -638,133 +636,130 @@ router.patch('/bulk', userAuth, requireRoles('admin'), validateBody(bulkUpdateTa
   // Track tasks that were reassigned for task.assigned dispatch
   let reassignedTasks = [];
 
-  // Wrap in transaction for atomicity
-  const bulkUpdate = db.transaction(() => {
-    // Get existing tasks with their current agent assignments and status
-    const existingTasks = db.prepare(`
-      SELECT id, assigned_agent_id, status, project_id FROM tasks WHERE id IN (${taskIds.map(() => '?').join(',')})
-    `).all(...taskIds);
+  try {
+    // Wrap in transaction for atomicity
+    await db.tx(async (tx) => {
+      // Get existing tasks with their current agent assignments and status
+      const existingTasks = await tx.many(`
+        SELECT id, assigned_agent_id, status, project_id FROM tasks WHERE id IN (${taskIds.map(() => '?').join(',')})
+      `, taskIds);
 
-    const existingTaskMap = new Map(existingTasks.map(t => [t.id, t]));
+      const existingTaskMap = new Map(existingTasks.map(t => [t.id, t]));
 
-    for (const id of taskIds) {
-      if (!existingTaskMap.has(id)) {
-        errors.push({ taskId: id, error: 'Task not found' });
-      }
-    }
-
-    // Track agent task count changes
-    const agentCountChanges = new Map(); // agentId -> delta
-
-    // Calculate task count changes before update and track status changes
-    for (const task of existingTasks) {
-      const oldAgentId = task.assigned_agent_id;
-      const oldStatus = task.status;
-      const newAgentId = updates.assignedAgentId !== undefined ? updates.assignedAgentId : oldAgentId;
-      const newStatus = updates.status !== undefined ? updates.status : oldStatus;
-
-      // Track status changes for event dispatch (only if project-scoped)
-      if (updates.status !== undefined && updates.status !== oldStatus && task.project_id) {
-        statusChangedTasks.push({
-          taskId: task.id,
-          projectId: task.project_id,
-          oldStatus: oldStatus,
-          newStatus: updates.status
-        });
+      for (const id of taskIds) {
+        if (!existingTaskMap.has(id)) {
+          errors.push({ taskId: id, error: 'Task not found' });
+        }
       }
 
-      // Handle agent reassignment
-      if (updates.assignedAgentId !== undefined && newAgentId !== oldAgentId) {
-        // Track for task.assigned event dispatch
-        if (newAgentId && task.project_id) {
-          reassignedTasks.push({
+      // Track agent task count changes
+      const agentCountChanges = new Map(); // agentId -> delta
+
+      // Calculate task count changes before update and track status changes
+      for (const task of existingTasks) {
+        const oldAgentId = task.assigned_agent_id;
+        const oldStatus = task.status;
+        const newAgentId = updates.assignedAgentId !== undefined ? updates.assignedAgentId : oldAgentId;
+        const newStatus = updates.status !== undefined ? updates.status : oldStatus;
+
+        // Track status changes for event dispatch (only if project-scoped)
+        if (updates.status !== undefined && updates.status !== oldStatus && task.project_id) {
+          statusChangedTasks.push({
             taskId: task.id,
             projectId: task.project_id,
-            newAgentId: newAgentId,
-            title: task.title || `Task #${task.id}`
+            oldStatus: oldStatus,
+            newStatus: updates.status
           });
         }
-        // Decrement old agent count
-        if (oldAgentId && oldStatus !== 'completed' && oldStatus !== 'cancelled') {
-          agentCountChanges.set(oldAgentId, (agentCountChanges.get(oldAgentId) || 0) - 1);
-        }
-        // Increment new agent count (only if task is not completed/cancelled)
-        if (newAgentId && newStatus !== 'completed' && newStatus !== 'cancelled') {
-          agentCountChanges.set(newAgentId, (agentCountChanges.get(newAgentId) || 0) + 1);
-        }
-      }
 
-      // Handle status changes affecting active task count
-      if (updates.status !== undefined) {
-        const terminalStatuses = ['completed', 'cancelled'];
-        const activeStatuses = ['in_progress'];
-        const oldWasTerminal = terminalStatuses.includes(oldStatus);
-        const newIsTerminal = terminalStatuses.includes(newStatus);
-        const newIsActive = activeStatuses.includes(newStatus);
-
-        // If task moved FROM terminal TO active status, increment active count
-        if (oldWasTerminal && newIsActive) {
-          const agentId = newAgentId || oldAgentId;
-          if (agentId) {
-            agentCountChanges.set(agentId, (agentCountChanges.get(agentId) || 0) + 1);
+        // Handle agent reassignment
+        if (updates.assignedAgentId !== undefined && newAgentId !== oldAgentId) {
+          // Track for task.assigned event dispatch
+          if (newAgentId && task.project_id) {
+            reassignedTasks.push({
+              taskId: task.id,
+              projectId: task.project_id,
+              newAgentId: newAgentId,
+              title: task.title || `Task #${task.id}`
+            });
+          }
+          // Decrement old agent count
+          if (oldAgentId && oldStatus !== 'completed' && oldStatus !== 'cancelled') {
+            agentCountChanges.set(oldAgentId, (agentCountChanges.get(oldAgentId) || 0) - 1);
+          }
+          // Increment new agent count (only if task is not completed/cancelled)
+          if (newAgentId && newStatus !== 'completed' && newStatus !== 'cancelled') {
+            agentCountChanges.set(newAgentId, (agentCountChanges.get(newAgentId) || 0) + 1);
           }
         }
-        // If task moved FROM active TO terminal status, decrement active count
-        else if (!oldWasTerminal && newIsTerminal) {
-          const agentId = newAgentId || oldAgentId;
-          if (agentId) {
-            agentCountChanges.set(agentId, (agentCountChanges.get(agentId) || 0) - 1);
+
+        // Handle status changes affecting active task count
+        if (updates.status !== undefined) {
+          const terminalStatuses = ['completed', 'cancelled'];
+          const activeStatuses = ['in_progress'];
+          const oldWasTerminal = terminalStatuses.includes(oldStatus);
+          const newIsTerminal = terminalStatuses.includes(newStatus);
+          const newIsActive = activeStatuses.includes(newStatus);
+
+          // If task moved FROM terminal TO active status, increment active count
+          if (oldWasTerminal && newIsActive) {
+            const agentId = newAgentId || oldAgentId;
+            if (agentId) {
+              agentCountChanges.set(agentId, (agentCountChanges.get(agentId) || 0) + 1);
+            }
+          }
+          // If task moved FROM active TO terminal status, decrement active count
+          else if (!oldWasTerminal && newIsTerminal) {
+            const agentId = newAgentId || oldAgentId;
+            if (agentId) {
+              agentCountChanges.set(agentId, (agentCountChanges.get(agentId) || 0) - 1);
+            }
           }
         }
       }
-    }
 
-    // Only update existing tasks
-    const validIds = taskIds.filter(id => existingTaskMap.has(id));
+      // Only update existing tasks
+      const validIds = taskIds.filter(id => existingTaskMap.has(id));
 
-    if (validIds.length > 0) {
-      const placeholders = validIds.map(() => '?').join(',');
-      const stmt = db.prepare(`
-        UPDATE tasks
-        SET ${updateParts.join(', ')}
-        WHERE id IN (${placeholders})
-      `);
+      if (validIds.length > 0) {
+        const placeholders = validIds.map(() => '?').join(',');
+        const result = await tx.exec(`
+          UPDATE tasks
+          SET ${updateParts.join(', ')}
+          WHERE id IN (${placeholders})
+        `, [...updateValues, ...validIds]);
 
-      const result = stmt.run(...updateValues, ...validIds);
-      updatedCount = result.changes;
+        updatedCount = result.changes;
 
-      // Apply agent task count changes
-      for (const [agentId, delta] of agentCountChanges) {
-        if (delta > 0) {
-          // Increment
-          db.prepare(`
-            UPDATE agents
-            SET active_task_count = COALESCE(active_task_count, 0) + ?,
-                updated_at = datetime('now')
-            WHERE id = ?
-          `).run(delta, agentId);
-        } else if (delta < 0) {
-          // Decrement (ensure non-negative)
-          db.prepare(`
-            UPDATE agents
-            SET active_task_count = MAX(0, COALESCE(active_task_count, 0) + ?),
-                updated_at = datetime('now')
-            WHERE id = ?
-          `).run(delta, agentId);
+        // Apply agent task count changes
+        for (const [agentId, delta] of agentCountChanges) {
+          if (delta > 0) {
+            // Increment
+            await tx.exec(`
+              UPDATE agents
+              SET active_task_count = COALESCE(active_task_count, 0) + ?,
+                  updated_at = datetime('now')
+              WHERE id = ?
+            `, [delta, agentId]);
+          } else if (delta < 0) {
+            // Decrement (ensure non-negative)
+            await tx.exec(`
+              UPDATE agents
+              SET active_task_count = MAX(0, COALESCE(active_task_count, 0) + ?),
+                  updated_at = datetime('now')
+              WHERE id = ?
+            `, [delta, agentId]);
+          }
         }
       }
-    }
-  });
-
-  try {
-    bulkUpdate();
+    });
 
     // Dispatch task.status_changed events for tasks that had status changes
     for (const change of statusChangedTasks) {
-      const updatedTask = db.prepare('SELECT * FROM tasks WHERE id = ?').get(change.taskId);
+      const updatedTask = await db.one('SELECT * FROM tasks WHERE id = ?', [change.taskId]);
       if (updatedTask) {
-        const project = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(change.projectId);
-        const assignee = updatedTask.assigned_agent_id ? buildAssigneeInfo(updatedTask.assigned_agent_id) : null;
+        const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [change.projectId]);
+        const assignee = updatedTask.assigned_agent_id ? await buildAssigneeInfo(updatedTask.assigned_agent_id) : null;
         dispatchEvent('task.status_changed', {
           project: project ? { id: project.id, name: project.name } : { id: change.projectId },
           projectId: change.projectId,
@@ -805,10 +800,10 @@ router.patch('/bulk', userAuth, requireRoles('admin'), validateBody(bulkUpdateTa
 
     // Dispatch task.assigned events for reassigned tasks
     for (const reassign of reassignedTasks) {
-      const updatedTask = db.prepare('SELECT * FROM tasks WHERE id = ?').get(reassign.taskId);
+      const updatedTask = await db.one('SELECT * FROM tasks WHERE id = ?', [reassign.taskId]);
       if (updatedTask) {
-        const project = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(reassign.projectId);
-        const assignee = buildAssigneeInfo(reassign.newAgentId);
+        const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [reassign.projectId]);
+        const assignee = await buildAssigneeInfo(reassign.newAgentId);
         dispatchEvent('task.assigned', {
           project: project ? { id: project.id, name: project.name } : { id: reassign.projectId },
           projectId: reassign.projectId,
@@ -849,7 +844,7 @@ router.patch('/bulk', userAuth, requireRoles('admin'), validateBody(bulkUpdateTa
  * Bulk delete tasks (max 100 per request)
  * Decrements agent task counts for active assigned tasks
  */
-router.delete('/bulk', userAuth, requireRoles('admin'), validateBody(bulkDeleteTasksSchema), (req, res) => {
+router.delete('/bulk', userAuth, requireRoles('admin'), validateBody(bulkDeleteTasksSchema), async (req, res) => {
   const { taskIds } = req.body;
   let deletedCount = 0;
   const errors = [];
@@ -857,63 +852,61 @@ router.delete('/bulk', userAuth, requireRoles('admin'), validateBody(bulkDeleteT
   // Track deleted tasks for event dispatch
   let deletedTasksForDispatch = [];
 
-  // Wrap in transaction for atomicity
-  const bulkDelete = db.transaction(() => {
-    // Get existing tasks with agent assignments
-    const existingTasks = db.prepare(`
-      SELECT id, title, description, assigned_agent_id, status, priority, project_id, tags FROM tasks WHERE id IN (${taskIds.map(() => '?').join(',')})
-    `).all(...taskIds);
-
-    const existingIds = new Set(existingTasks.map(t => t.id));
-
-    for (const id of taskIds) {
-      if (!existingIds.has(id)) {
-        errors.push({ taskId: id, error: 'Task not found' });
-      }
-    }
-
-    // Calculate agent count decrements for active tasks being deleted
-    const agentDecrements = new Map();
-    for (const task of existingTasks) {
-      // Only decrement if task has an agent and is not already completed/cancelled
-      if (task.assigned_agent_id && task.status !== 'completed' && task.status !== 'cancelled') {
-        agentDecrements.set(
-          task.assigned_agent_id,
-          (agentDecrements.get(task.assigned_agent_id) || 0) + 1
-        );
-      }
-    }
-
-    // Only delete existing tasks
-    const validIds = taskIds.filter(id => existingIds.has(id));
-
-    // Capture task data for event dispatch before deletion
-    deletedTasksForDispatch = existingTasks.filter(t => t.project_id);
-
-    if (validIds.length > 0) {
-      const placeholders = validIds.map(() => '?').join(',');
-      const result = db.prepare(`DELETE FROM tasks WHERE id IN (${placeholders})`).run(...validIds);
-      deletedCount = result.changes;
-
-      // Apply agent task count decrements
-      for (const [agentId, count] of agentDecrements) {
-        db.prepare(`
-          UPDATE agents
-          SET active_task_count = MAX(0, COALESCE(active_task_count, 0) - ?),
-              updated_at = datetime('now')
-          WHERE id = ?
-        `).run(count, agentId);
-      }
-    }
-  });
-
   try {
-    bulkDelete();
+    // Wrap in transaction for atomicity
+    await db.tx(async (tx) => {
+      // Get existing tasks with agent assignments
+      const existingTasks = await tx.many(`
+        SELECT id, title, description, assigned_agent_id, status, priority, project_id, tags FROM tasks WHERE id IN (${taskIds.map(() => '?').join(',')})
+      `, taskIds);
+
+      const existingIds = new Set(existingTasks.map(t => t.id));
+
+      for (const id of taskIds) {
+        if (!existingIds.has(id)) {
+          errors.push({ taskId: id, error: 'Task not found' });
+        }
+      }
+
+      // Calculate agent count decrements for active tasks being deleted
+      const agentDecrements = new Map();
+      for (const task of existingTasks) {
+        // Only decrement if task has an agent and is not already completed/cancelled
+        if (task.assigned_agent_id && task.status !== 'completed' && task.status !== 'cancelled') {
+          agentDecrements.set(
+            task.assigned_agent_id,
+            (agentDecrements.get(task.assigned_agent_id) || 0) + 1
+          );
+        }
+      }
+
+      // Only delete existing tasks
+      const validIds = taskIds.filter(id => existingIds.has(id));
+
+      // Capture task data for event dispatch before deletion
+      deletedTasksForDispatch = existingTasks.filter(t => t.project_id);
+
+      if (validIds.length > 0) {
+        const placeholders = validIds.map(() => '?').join(',');
+        const result = await tx.exec(`DELETE FROM tasks WHERE id IN (${placeholders})`, validIds);
+        deletedCount = result.changes;
+
+        // Apply agent task count decrements
+        for (const [agentId, count] of agentDecrements) {
+          await tx.exec(`
+            UPDATE agents
+            SET active_task_count = MAX(0, COALESCE(active_task_count, 0) - ?),
+                updated_at = datetime('now')
+            WHERE id = ?
+          `, [count, agentId]);
+        }
+      }
+    });
 
     // Dispatch task.status_changed events for deleted tasks
     for (const task of deletedTasksForDispatch) {
-      const project = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(task.project_id);
-      const assignee = task.assigned_agent_id ? buildAssigneeInfo(task.assigned_agent_id) : null;
+      const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [task.project_id]);
+      const assignee = task.assigned_agent_id ? await buildAssigneeInfo(task.assigned_agent_id) : null;
       dispatchEvent('task.status_changed', {
         project: project ? { id: project.id, name: project.name } : { id: task.project_id },
         projectId: task.project_id,
@@ -954,7 +947,7 @@ router.delete('/bulk', userAuth, requireRoles('admin'), validateBody(bulkDeleteT
  * Get task details
  * Supports both user auth (session/user keys) and agent auth (agent keys)
  */
-router.get('/:id', dualAuth, (req, res) => {
+router.get('/:id', dualAuth, async (req, res) => {
   try {
     // Authorization check
     const access = canAccessTask(req, req.params.id);
@@ -964,7 +957,7 @@ router.get('/:id', dualAuth, (req, res) => {
         : response.forbidden(res, 'Access denied');
     }
 
-    const task = db.prepare(`
+    const task = await db.one(`
       SELECT
         t.*,
         p.name as project_name,
@@ -975,19 +968,19 @@ router.get('/:id', dualAuth, (req, res) => {
       LEFT JOIN agents a ON a.id = t.assigned_agent_id
       LEFT JOIN sprints s ON s.id = t.sprint_id
       WHERE t.id = ?
-    `).get(req.params.id);
+    `, [req.params.id]);
 
     if (!task) {
       return response.notFound(res, 'Task');
     }
 
     // Get deliverables for this task
-    const deliverables = db.prepare(`
+    const deliverables = (await db.many(`
       SELECT id, title, status, version, created_at
       FROM deliverables
       WHERE task_id = ?
       ORDER BY version DESC
-    `).all(req.params.id).map(d => ({
+    `, [req.params.id])).map(d => ({
       ...d,
       created_at: toISOTimestamp(d.created_at)
     }));
@@ -1007,15 +1000,15 @@ router.get('/:id', dualAuth, (req, res) => {
  * Get full context bundle for a task (for agent consumption)
  * Includes agent profile with system prompt and instructions
  */
-router.get('/:id/context', dualAuth, (req, res) => {
+router.get('/:id/context', dualAuth, async (req, res) => {
   try {
-    const task = db.prepare(`
+    const task = await db.one(`
       SELECT t.*, p.id as project_id, p.name as project_name, s.id as sprint_id, s.name as sprint_name
       FROM tasks t
       LEFT JOIN projects p ON p.id = t.project_id
       LEFT JOIN sprints s ON s.id = t.sprint_id
       WHERE t.id = ?
-    `).get(req.params.id);
+    `, [req.params.id]);
 
     if (!task) {
       return response.notFound(res, 'Task');
@@ -1033,7 +1026,7 @@ router.get('/:id/context', dualAuth, (req, res) => {
         if (task.assigned_agent_id !== req.agent.id) {
           // Check if agent owns the assigned agent (for delegated access)
           if (req.agent.ownerUserId && task.assigned_agent_id) {
-            const assignedAgent = db.prepare('SELECT owner_user_id FROM agents WHERE id = ?').get(task.assigned_agent_id);
+            const assignedAgent = await db.one('SELECT owner_user_id FROM agents WHERE id = ?', [task.assigned_agent_id]);
             if (!assignedAgent || assignedAgent.owner_user_id !== req.agent.ownerUserId) {
               return response.forbidden(res, 'Task not assigned to this agent');
             }
@@ -1052,11 +1045,11 @@ router.get('/:id/context', dualAuth, (req, res) => {
     // Get agent profile if task is assigned
     let agentProfile = null;
     if (task.assigned_agent_id) {
-      const agent = db.prepare(`
+      const agent = await db.one(`
         SELECT id, name, type, description, capabilities, specializations, system_prompt, metadata
         FROM agents
         WHERE id = ?
-      `).get(task.assigned_agent_id);
+      `, [task.assigned_agent_id]);
 
       if (agent) {
         agentProfile = {
@@ -1075,12 +1068,12 @@ router.get('/:id/context', dualAuth, (req, res) => {
     // Get project knowledge
     let knowledge = [];
     if (task.project_id) {
-      knowledge = db.prepare(`
+      knowledge = await db.many(`
         SELECT id, title, content, content_type, category, tags
         FROM knowledge
         WHERE project_id = ?
         ORDER BY created_at DESC
-      `).all(task.project_id);
+      `, [task.project_id]);
 
       knowledge = knowledge.map(k => ({
         ...k,
@@ -1089,12 +1082,12 @@ router.get('/:id/context', dualAuth, (req, res) => {
     }
 
     // Get previous deliverables and feedback
-    const deliverables = db.prepare(`
+    const deliverables = (await db.many(`
       SELECT id, title, content, content_type, status, version, feedback, created_at
       FROM deliverables
       WHERE task_id = ?
       ORDER BY version DESC
-    `).all(req.params.id).map(d => ({
+    `, [req.params.id])).map(d => ({
       ...d,
       created_at: toISOTimestamp(d.created_at)
     }));
@@ -1102,13 +1095,13 @@ router.get('/:id/context', dualAuth, (req, res) => {
     // Get related tasks (same project)
     let relatedTasks = [];
     if (task.project_id) {
-      relatedTasks = db.prepare(`
+      relatedTasks = await db.many(`
         SELECT id, title, status, priority
         FROM tasks
         WHERE project_id = ? AND id != ?
         ORDER BY priority ASC, created_at DESC
         LIMIT 10
-      `).all(task.project_id, req.params.id);
+      `, [task.project_id, req.params.id]);
     }
 
     response.success(res, {
@@ -1136,9 +1129,9 @@ router.get('/:id/context', dualAuth, (req, res) => {
  * PATCH /api/tasks/:id
  * Update task
  */
-router.patch('/:id', userAuth, validateBody(updateTaskSchema), (req, res) => {
+router.patch('/:id', userAuth, validateBody(updateTaskSchema), async (req, res) => {
   try {
-    const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(req.params.id);
+    const task = await db.one('SELECT * FROM tasks WHERE id = ?', [req.params.id]);
     if (!task) {
       return response.notFound(res, 'Task');
     }
@@ -1173,7 +1166,7 @@ router.patch('/:id', userAuth, validateBody(updateTaskSchema), (req, res) => {
     }
     if (sprintId !== undefined) {
       if (sprintId !== null) {
-        const sprint = db.prepare('SELECT id FROM sprints WHERE id = ?').get(sprintId);
+        const sprint = await db.one('SELECT id FROM sprints WHERE id = ?', [sprintId]);
         if (!sprint) {
           return response.validationError(res, 'Invalid sprint ID');
         }
@@ -1205,7 +1198,7 @@ router.patch('/:id', userAuth, validateBody(updateTaskSchema), (req, res) => {
             priority: priority || task.priority,
             tags: tags !== undefined ? tags : safeJsonParse(task.tags, [])
           };
-          const routingResult = evaluateRoutingRules(effectiveProjectId, routingTaskData);
+          const routingResult = await evaluateRoutingRules(effectiveProjectId, routingTaskData);
           patchRoutingDecision = routingResult.decision;
           if (routingResult.matched && routingResult.agentId) {
             resolvedAgentId = routingResult.agentId;
@@ -1225,7 +1218,7 @@ router.patch('/:id', userAuth, validateBody(updateTaskSchema), (req, res) => {
 
       // Check if this is a new assignment or reassignment
       if (resolvedAgentId && resolvedAgentId !== task.assigned_agent_id) {
-        const agent = db.prepare('SELECT id FROM agents WHERE id = ?').get(resolvedAgentId);
+        const agent = await db.one('SELECT id FROM agents WHERE id = ?', [resolvedAgentId]);
         if (!agent) {
           return response.validationError(res, 'Invalid agent ID');
         }
@@ -1288,12 +1281,12 @@ router.patch('/:id', userAuth, validateBody(updateTaskSchema), (req, res) => {
     values.push(req.params.id);
 
     // Wrap UPDATE + count changes in transaction so counts don't drift (Issue #18)
-    db.transaction(() => {
+    await db.tx(async (tx) => {
       // Handle deferred assignment count changes
       if (deferredCountChanges) {
         if (deferredCountChanges.type === 'auto_assign') {
           // Auto-assign: enforce capacity via reservation
-          const reservation = reserveAgentCapacity(deferredCountChanges.newAgentId);
+          const reservation = await reserveAgentCapacity(deferredCountChanges.newAgentId, tx);
           if (!reservation.ok) {
             // Capacity race — clear assignment, update routing decision
             // Use tracked index (not indexOf) to avoid corrupting unrelated params
@@ -1309,20 +1302,20 @@ router.patch('/:id', userAuth, validateBody(updateTaskSchema), (req, res) => {
           // Always release old agent — task is moving away regardless of
           // whether the new reservation succeeded or fell back to unassigned
           if (deferredCountChanges.oldAgentId) {
-            decrementActiveTaskCount(deferredCountChanges.oldAgentId);
+            await decrementActiveTaskCount(deferredCountChanges.oldAgentId, tx);
           }
         } else if (deferredCountChanges.type === 'reassign') {
           // Direct assignment bypasses capacity check (admin override)
-          incrementActiveTaskCount(deferredCountChanges.newAgentId);
+          await incrementActiveTaskCount(deferredCountChanges.newAgentId, tx);
           if (deferredCountChanges.oldAgentId) {
-            decrementActiveTaskCount(deferredCountChanges.oldAgentId);
+            await decrementActiveTaskCount(deferredCountChanges.oldAgentId, tx);
           }
         } else if (deferredCountChanges.type === 'unassign') {
-          decrementActiveTaskCount(deferredCountChanges.oldAgentId);
+          await decrementActiveTaskCount(deferredCountChanges.oldAgentId, tx);
         }
       }
 
-      db.prepare(`UPDATE tasks SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+      await tx.exec(`UPDATE tasks SET ${updates.join(', ')} WHERE id = ?`, values);
 
       // Handle active_task_count changes based on status transitions
       const terminalStatuses = ['completed', 'cancelled'];
@@ -1332,19 +1325,19 @@ router.patch('/:id', userAuth, validateBody(updateTaskSchema), (req, res) => {
       const newIsActive = activeStatuses.includes(status);
 
       // Need to read the updated task for agent ID
-      const updatedForCount = db.prepare('SELECT assigned_agent_id FROM tasks WHERE id = ?').get(req.params.id);
+      const updatedForCount = await tx.one('SELECT assigned_agent_id FROM tasks WHERE id = ?', [req.params.id]);
 
       // If task moved FROM terminal TO active status, increment active count
       if (oldWasTerminal && newIsActive && updatedForCount.assigned_agent_id) {
-        incrementActiveTaskCount(updatedForCount.assigned_agent_id);
+        await incrementActiveTaskCount(updatedForCount.assigned_agent_id, tx);
       }
       // If task moved FROM active TO terminal status, decrement active count
       else if (!oldWasTerminal && newIsTerminal && updatedForCount.assigned_agent_id) {
-        decrementActiveTaskCount(updatedForCount.assigned_agent_id);
+        await decrementActiveTaskCount(updatedForCount.assigned_agent_id, tx);
       }
-    })();
+    });
 
-    const updated = db.prepare('SELECT * FROM tasks WHERE id = ?').get(req.params.id);
+    const updated = await db.one('SELECT * FROM tasks WHERE id = ?', [req.params.id]);
     const parsedTask = normalizeTaskTimestamps(updated);
 
     // Trigger webhooks
@@ -1353,8 +1346,8 @@ router.patch('/:id', userAuth, validateBody(updateTaskSchema), (req, res) => {
 
       // Dispatch task.assigned to delivery routes (e.g., notify human agents)
       if (updated.project_id) {
-        const projectForAssign = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(updated.project_id);
-        const assignee = buildAssigneeInfo(updated.assigned_agent_id);
+        const projectForAssign = await db.one('SELECT id, name FROM projects WHERE id = ?', [updated.project_id]);
+        const assignee = await buildAssigneeInfo(updated.assigned_agent_id);
         dispatchEvent('task.assigned', {
           project: projectForAssign ? { id: projectForAssign.id, name: projectForAssign.name } : { id: updated.project_id },
           projectId: updated.project_id,
@@ -1370,8 +1363,8 @@ router.patch('/:id', userAuth, validateBody(updateTaskSchema), (req, res) => {
 
     // Dispatch task.status_changed event to delivery routes (if status changed and project-scoped)
     if (status !== undefined && status !== task.status && updated.project_id) {
-      const project = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(updated.project_id);
-      const statusAssignee = updated.assigned_agent_id ? buildAssigneeInfo(updated.assigned_agent_id) : null;
+      const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [updated.project_id]);
+      const statusAssignee = updated.assigned_agent_id ? await buildAssigneeInfo(updated.assigned_agent_id) : null;
       dispatchEvent('task.status_changed', {
         project: project ? { id: project.id, name: project.name } : { id: updated.project_id },
         projectId: updated.project_id,
@@ -1433,29 +1426,29 @@ router.patch('/:id', userAuth, validateBody(updateTaskSchema), (req, res) => {
  * DELETE /api/tasks/:id
  * Delete task
  */
-router.delete('/:id', userAuth, requireRoles('admin'), (req, res) => {
+router.delete('/:id', userAuth, requireRoles('admin'), async (req, res) => {
   try {
-    const task = db.prepare('SELECT id, title, description, assigned_agent_id, status, priority, project_id, tags FROM tasks WHERE id = ?').get(req.params.id);
+    const task = await db.one('SELECT id, title, description, assigned_agent_id, status, priority, project_id, tags FROM tasks WHERE id = ?', [req.params.id]);
     if (!task) {
       return response.notFound(res, 'Task');
     }
 
-    db.prepare('DELETE FROM tasks WHERE id = ?').run(req.params.id);
+    await db.exec('DELETE FROM tasks WHERE id = ?', [req.params.id]);
 
     // Decrement agent active_task_count if task was actively counting against capacity
     if (task.assigned_agent_id && task.status === 'in_progress') {
-      db.prepare(`
+      await db.exec(`
         UPDATE agents
         SET active_task_count = MAX(0, COALESCE(active_task_count, 0) - 1),
             updated_at = datetime('now')
         WHERE id = ?
-      `).run(task.assigned_agent_id);
+      `, [task.assigned_agent_id]);
     }
 
-    // Dispatch task.status_changed event (deleted → treated as cancelled)
+    // Dispatch task.status_changed event (deleted -> treated as cancelled)
     if (task.project_id) {
-      const project = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(task.project_id);
-      const delAssignee = task.assigned_agent_id ? buildAssigneeInfo(task.assigned_agent_id) : null;
+      const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [task.project_id]);
+      const delAssignee = task.assigned_agent_id ? await buildAssigneeInfo(task.assigned_agent_id) : null;
       dispatchEvent('task.status_changed', {
         project: project ? { id: project.id, name: project.name } : { id: task.project_id },
         projectId: task.project_id,
@@ -1495,9 +1488,9 @@ router.patch('/:id/status', agentAuth, validateBody(updateTaskStatusSchema), log
   type: 'task',
   id: parseInt(req.params.id),
   details: { status: req.body.status }
-})), (req, res) => {
+})), async (req, res) => {
   try {
-    const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(req.params.id);
+    const task = await db.one('SELECT * FROM tasks WHERE id = ?', [req.params.id]);
     if (!task) {
       return response.notFound(res, 'Task');
     }
@@ -1536,22 +1529,22 @@ router.patch('/:id/status', agentAuth, validateBody(updateTaskStatusSchema), log
 
     values.push(req.params.id);
 
-    db.prepare(`UPDATE tasks SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+    await db.exec(`UPDATE tasks SET ${updates.join(', ')} WHERE id = ?`, values);
 
     // Log activity
     if (status !== task.status) {
       const agentName = req.agent.id
-        ? (db.prepare('SELECT name FROM agents WHERE id = ?').get(req.agent.id)?.name || 'agent')
+        ? ((await db.one('SELECT name FROM agents WHERE id = ?', [req.agent.id]))?.name || 'agent')
         : 'agent';
       logActivity('task', parseInt(req.params.id), 'status_changed', agentName, { from: task.status, to: status });
     }
 
-    const updated = db.prepare('SELECT * FROM tasks WHERE id = ?').get(req.params.id);
+    const updated = await db.one('SELECT * FROM tasks WHERE id = ?', [req.params.id]);
 
     // Dispatch task.status_changed event to delivery routes (if project-scoped)
     if (status !== task.status && updated.project_id) {
-      const project = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(updated.project_id);
-      const scAssignee = updated.assigned_agent_id ? buildAssigneeInfo(updated.assigned_agent_id) : null;
+      const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [updated.project_id]);
+      const scAssignee = updated.assigned_agent_id ? await buildAssigneeInfo(updated.assigned_agent_id) : null;
       dispatchEvent('task.status_changed', {
         project: project ? { id: project.id, name: project.name } : { id: updated.project_id },
         projectId: updated.project_id,
@@ -1603,9 +1596,9 @@ router.post('/:id/progress', agentAuth, validateBody(logTaskProgressSchema), log
   type: 'task',
   id: parseInt(req.params.id),
   details: { message: req.body.message, percentComplete: req.body.percentComplete }
-})), (req, res) => {
+})), async (req, res) => {
   try {
-    const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(req.params.id);
+    const task = await db.one('SELECT * FROM tasks WHERE id = ?', [req.params.id]);
     if (!task) {
       return response.notFound(res, 'Task');
     }
@@ -1625,18 +1618,18 @@ router.post('/:id/progress', agentAuth, validateBody(logTaskProgressSchema), log
     const { message, percentComplete, details } = req.body;
 
     // Insert progress record
-    const result = db.prepare(`
+    const result = await db.insert(`
       INSERT INTO task_progress (task_id, agent_id, message, percent_complete, details)
       VALUES (?, ?, ?, ?, ?)
-    `).run(
+    `, [
       req.params.id,
       effectiveAgentId,
       message,
       percentComplete ?? null,
       JSON.stringify(details || {})
-    );
+    ]);
 
-    const progress = db.prepare('SELECT * FROM task_progress WHERE id = ?').get(result.lastInsertRowid);
+    const progress = await db.one('SELECT * FROM task_progress WHERE id = ?', [result.lastInsertRowid]);
 
     // Update task context with latest progress if percentComplete is provided
     if (percentComplete !== undefined && percentComplete !== null) {
@@ -1646,9 +1639,9 @@ router.post('/:id/progress', agentAuth, validateBody(logTaskProgressSchema), log
         message,
         timestamp: new Date().toISOString()
       };
-      db.prepare(`
+      await db.exec(`
         UPDATE tasks SET context = ?, updated_at = datetime('now') WHERE id = ?
-      `).run(JSON.stringify(context), req.params.id);
+      `, [JSON.stringify(context), req.params.id]);
     }
 
     // Trigger webhook with the effective agent (not null for user keys)
@@ -1687,11 +1680,11 @@ router.post('/:id/claim', agentAuth, logAgentActivity('task.claimed', (req, data
   type: 'task',
   id: parseInt(req.params.id),
   details: {}
-})), (req, res) => {
+})), async (req, res) => {
   try {
     // Use a transaction with conditional update to prevent race conditions
-    const claimTask = db.transaction(() => {
-      const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(req.params.id);
+    const result = await db.tx(async (tx) => {
+      const task = await tx.one('SELECT * FROM tasks WHERE id = ?', [req.params.id]);
       if (!task) {
         return { error: 'not_found' };
       }
@@ -1715,7 +1708,7 @@ router.post('/:id/claim', agentAuth, logAgentActivity('task.claimed', (req, data
 
       // Verify task is not already assigned to another agent
       if (task.assigned_agent_id && task.assigned_agent_id !== claimAgentId) {
-        const assignedAgent = db.prepare('SELECT name FROM agents WHERE id = ?').get(task.assigned_agent_id);
+        const assignedAgent = await tx.one('SELECT name FROM agents WHERE id = ?', [task.assigned_agent_id]);
         return { error: 'already_assigned', agentName: assignedAgent?.name || task.assigned_agent_id };
       }
 
@@ -1726,25 +1719,23 @@ router.post('/:id/claim', agentAuth, logAgentActivity('task.claimed', (req, data
 
       // Atomic conditional update - only update if status and assignment haven't changed
       const newStatus = task.status === 'pending' ? 'assigned' : task.status;
-      const result = db.prepare(`
+      const updateResult = await tx.exec(`
         UPDATE tasks
         SET assigned_agent_id = ?, status = ?, assigned_at = datetime('now'), updated_at = datetime('now')
         WHERE id = ?
           AND status IN ('pending', 'assigned')
           AND (assigned_agent_id IS NULL OR assigned_agent_id = ?)
-      `).run(claimAgentId, newStatus, req.params.id, claimAgentId);
+      `, [claimAgentId, newStatus, req.params.id, claimAgentId]);
 
       // Check if update was successful (row was actually modified)
-      if (result.changes === 0) {
+      if (updateResult.changes === 0) {
         // Task was claimed by another agent between our read and write
         return { error: 'race_condition' };
       }
 
-      const updated = db.prepare('SELECT * FROM tasks WHERE id = ?').get(req.params.id);
+      const updated = await tx.one('SELECT * FROM tasks WHERE id = ?', [req.params.id]);
       return { task: updated, claimed: true };
     });
-
-    const result = claimTask();
 
     // Handle errors
     if (result.error === 'not_found') {
@@ -1767,16 +1758,16 @@ router.post('/:id/claim', agentAuth, logAgentActivity('task.claimed', (req, data
 
     // Increment agent's active task count if we actually claimed it
     if (result.claimed) {
-      incrementActiveTaskCount(req.agent.id);
-      const claimAgentName = db.prepare('SELECT name FROM agents WHERE id = ?').get(req.agent.id)?.name || 'agent';
+      await incrementActiveTaskCount(req.agent.id);
+      const claimAgentName = (await db.one('SELECT name FROM agents WHERE id = ?', [req.agent.id]))?.name || 'agent';
       logActivity('task', parseInt(req.params.id), 'assigned', claimAgentName, { assigned_to: claimAgentName });
       triggerWebhook(req.agent.id, 'task.claimed', { task: parsedTask });
 
       // Dispatch task.assigned event for delivery routes
       if (parsedTask.projectId || parsedTask.project_id) {
         const projectId = parsedTask.projectId || parsedTask.project_id;
-        const project = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(projectId);
-        const assignee = buildAssigneeInfo(req.agent.id);
+        const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [projectId]);
+        const assignee = await buildAssigneeInfo(req.agent.id);
         dispatchEvent('task.assigned', {
           project: project ? { id: project.id, name: project.name } : { id: projectId },
           projectId,
@@ -1812,7 +1803,7 @@ router.post('/:id/claim', agentAuth, logAgentActivity('task.claimed', (req, data
  * GET /api/tasks/:id/activity
  * Get activity log for a task
  */
-router.get('/:id/activity', dualAuth, (req, res) => {
+router.get('/:id/activity', dualAuth, async (req, res) => {
   try {
     // Authorization check
     const access = canAccessTask(req, req.params.id);
@@ -1822,17 +1813,17 @@ router.get('/:id/activity', dualAuth, (req, res) => {
         : response.forbidden(res, 'Access denied');
     }
 
-    const task = db.prepare('SELECT id FROM tasks WHERE id = ?').get(req.params.id);
+    const task = await db.one('SELECT id FROM tasks WHERE id = ?', [req.params.id]);
     if (!task) {
       return response.notFound(res, 'Task');
     }
 
-    const activities = db.prepare(`
+    const activities = await db.many(`
       SELECT id, event_type, actor_name, detail, created_at
       FROM activity_log
       WHERE entity_type = 'task' AND entity_id = ?
       ORDER BY created_at DESC
-    `).all(req.params.id);
+    `, [req.params.id]);
 
     const parsed = activities.map(a => ({
       ...a,
@@ -1873,9 +1864,9 @@ router.post('/:id/execute', userAuth, requireRoles('admin'), async (req, res) =>
  * Clear execution error from a task so the dispatcher will pick it up again.
  * Also allows resetting status to 'assigned' if currently stuck.
  */
-router.post('/:id/retry', userAuth, requireRoles('admin'), (req, res) => {
+router.post('/:id/retry', userAuth, requireRoles('admin'), async (req, res) => {
   try {
-    const task = db.prepare('SELECT id, context, status, assigned_agent_id FROM tasks WHERE id = ?').get(req.params.id);
+    const task = await db.one('SELECT id, context, status, assigned_agent_id FROM tasks WHERE id = ?', [req.params.id]);
     if (!task) return response.notFound(res, 'Task');
     if (!task.assigned_agent_id) return response.badRequest(res, 'Task is not assigned to an agent');
 
@@ -1888,9 +1879,9 @@ router.post('/:id/retry', userAuth, requireRoles('admin'), (req, res) => {
     // Reset to 'assigned' if stuck in a failed state
     const newStatus = ['pending', 'assigned'].includes(task.status) ? task.status : 'assigned';
 
-    db.prepare(`
+    await db.exec(`
       UPDATE tasks SET context = ?, status = ?, updated_at = datetime('now') WHERE id = ?
-    `).run(JSON.stringify(context), newStatus, task.id);
+    `, [JSON.stringify(context), newStatus, task.id]);
 
     logActivity('task', task.id, 'retry_requested', req.user?.name || 'admin', {
       previousStatus: task.status,

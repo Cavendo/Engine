@@ -1,0 +1,2 @@
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS provider_base_url TEXT;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS provider_label TEXT;

@@ -9,7 +9,7 @@ Cavendo Engine is an open-source agent workflow platform that enables AI agents 
 ## Tech Stack
 
 - **Backend**: Node.js 18+ / Express 4.x
-- **Database**: SQLite (better-sqlite3)
+- **Database**: SQLite (better-sqlite3, default) or PostgreSQL (pg, optional)
 - **Frontend**: React 18 / Vite / Tailwind CSS 3
 - **Auth**: Session-based (users) + API keys (agents)
 - **Package Manager**: npm
@@ -50,10 +50,18 @@ server/
 ├── app.js                # createApp(options?) factory, returns { app, start, stop }
 ├── index.js              # Thin bootstrap: imports createApp, calls start(), signal handlers
 ├── db/
-│   ├── connection.js     # SQLite connection
-│   ├── schema.sql        # Canonical v0.1.0 baseline schema (fresh installs)
-│   ├── init.js           # Database initialization (runs schema.sql)
-│   └── migrations/       # Future post-v0.1.0 upgrade scripts
+│   ├── adapter.js        # Database adapter factory (SQLite or PostgreSQL based on DB_DRIVER)
+│   ├── sqliteAdapter.js  # SQLite adapter (wraps better-sqlite3 in async flat API)
+│   ├── pgAdapter.js      # PostgreSQL adapter (pg Pool with SQL rewriting)
+│   ├── sqlRewriter.js    # SQL dialect rewriter (? → $N, datetime → NOW(), INSERT OR IGNORE)
+│   ├── errors.js         # Cross-dialect error helpers (isUniqueViolation, etc.)
+│   ├── connection.js     # Raw SQLite connection (used by adapter.js)
+│   ├── schema.sql        # SQLite baseline schema
+│   ├── schema.pg.sql     # PostgreSQL baseline schema
+│   ├── init.js           # Database initialization (dialect-aware schema loading)
+│   ├── migrator.js       # Migration runner (dual-dialect: migrations/ and migrations/pg/)
+│   └── migrations/       # SQLite migrations
+│       └── pg/           # PostgreSQL-specific migrations
 ├── routes/
 │   ├── agents.js         # Agent CRUD + API keys + execution
 │   ├── users.js          # User CRUD + personal API keys (create auto-links human agent)
@@ -153,7 +161,7 @@ Background service that auto-executes tasks assigned to agents with `execution_m
 
 ## Database
 
-SQLite database at `data/cavendo.db`. Key tables:
+SQLite (default) at `data/cavendo.db`, or PostgreSQL via `DB_DRIVER=postgres`. All database access goes through the adapter (`server/db/adapter.js`) which provides a unified async API: `db.one()`, `db.many()`, `db.exec()`, `db.insert()`, `db.tx()`. Key tables:
 
 - `agents` - Registered AI agents (includes execution config, capacity, specializations)
 - `agent_keys` - Agent API keys (hashed)
@@ -199,6 +207,10 @@ execution_mode         -- 'manual', 'auto', 'polling', 'human'
 
 ## Important Files
 
+- `server/db/adapter.js` - Database adapter factory (SQLite or PostgreSQL)
+- `server/db/sqliteAdapter.js` - SQLite adapter (async flat API over better-sqlite3)
+- `server/db/pgAdapter.js` - PostgreSQL adapter (pg Pool with SQL rewriting)
+- `server/db/errors.js` - Cross-dialect error helpers
 - `server/app.js` - App factory (`createApp`) with lifecycle hooks and start/stop
 - `server/env.js` - Env bootstrap (`.env` loading/generation at import time)
 - `server/middleware/agentAuth.js` - Agent + user key authentication
@@ -221,7 +233,7 @@ execution_mode         -- 'manual', 'auto', 'polling', 'human'
 - `docs/api.md` - Full API reference
 - `docs/api/` - Endpoint-specific docs (agents, tasks, deliverables, routes, sprints, comments)
 - `docs/api/openapi.yaml` - OpenAPI 3.0 specification
-- `docs/guides/` - Architecture, quickstart, task routing, webhooks, knowledge base
+- `docs/guides/` - Architecture, quickstart, task routing, webhooks, knowledge base, PostgreSQL setup
 - `docs/integrations/` - MCP Server, Python SDK
 - `docs/agent-management.md` - Agent setup guide
 

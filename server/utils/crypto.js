@@ -367,10 +367,10 @@ export function canDecrypt(encryptedData, ivBase64, keyVersion) {
 /**
  * Run a health check on all encrypted rows in the database.
  * Scans agents and storage_connections tables.
- * @param {import('better-sqlite3').Database} db
- * @returns {{ ok: boolean, total: number, failed: number, details: Array, truncated: boolean, keyVersions: Object, currentVersion: number }}
+ * @param {object} db - Database adapter with .many() and .one() methods
+ * @returns {Promise<{ ok: boolean, total: number, failed: number, details: Array, truncated: boolean, keyVersions: Object, currentVersion: number }>}
  */
-export function runCryptoHealthCheck(db) {
+export async function runCryptoHealthCheck(db) {
   const details = [];
   const MAX_DETAILS = 500;
   let total = 0;
@@ -381,11 +381,11 @@ export function runCryptoHealthCheck(db) {
 
   // Check agents with encrypted provider keys
   try {
-    const agents = db.prepare(`
+    const agents = await db.many(`
       SELECT id, provider_api_key_encrypted, provider_api_key_iv, encryption_key_version
       FROM agents
       WHERE provider_api_key_encrypted IS NOT NULL
-    `).all();
+    `);
 
     for (const agent of agents) {
       total++;
@@ -413,11 +413,11 @@ export function runCryptoHealthCheck(db) {
       throw err;
     }
     // Fall back to checking without version column
-    const agents = db.prepare(`
+    const agents = await db.many(`
       SELECT id, provider_api_key_encrypted, provider_api_key_iv
       FROM agents
       WHERE provider_api_key_encrypted IS NOT NULL
-    `).all();
+    `);
 
     for (const agent of agents) {
       total++;
@@ -443,13 +443,13 @@ export function runCryptoHealthCheck(db) {
 
   // Check storage connections
   try {
-    const conns = db.prepare(`
+    const conns = await db.many(`
       SELECT id,
         access_key_id_encrypted, access_key_id_iv, access_key_id_key_version,
         secret_access_key_encrypted, secret_access_key_iv, secret_access_key_key_version
       FROM storage_connections
       WHERE access_key_id_encrypted IS NOT NULL OR secret_access_key_encrypted IS NOT NULL
-    `).all();
+    `);
 
     for (const conn of conns) {
       // Check access key
@@ -501,12 +501,12 @@ export function runCryptoHealthCheck(db) {
       throw err;
     }
     // Fall back to checking without version columns
-    const conns = db.prepare(`
+    const conns = await db.many(`
       SELECT id, access_key_id_encrypted, access_key_id_iv,
         secret_access_key_encrypted, secret_access_key_iv
       FROM storage_connections
       WHERE access_key_id_encrypted IS NOT NULL OR secret_access_key_encrypted IS NOT NULL
-    `).all();
+    `);
 
     for (const conn of conns) {
       if (conn.access_key_id_encrypted) {

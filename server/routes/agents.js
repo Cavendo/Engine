@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import db from '../db/connection.js';
+import db from '../db/adapter.js';
 import { generateApiKey, generateWebhookSecret, encrypt, decrypt } from '../utils/crypto.js';
 import * as response from '../utils/response.js';
 import { userAuth, requireRoles } from '../middleware/userAuth.js';
@@ -189,7 +189,7 @@ const PROVIDERS = {
  * Get current agent's details (agent auth)
  * For user keys, returns user info as a virtual agent
  */
-router.get('/me', agentAuth, (req, res) => {
+router.get('/me', agentAuth, async (req, res) => {
   try {
     // Handle user keys (virtual agent representing the user)
     if (req.agent.isUserKey) {
@@ -210,10 +210,10 @@ router.get('/me', agentAuth, (req, res) => {
     }
 
     // Handle agent keys
-    const agent = db.prepare(`
+    const agent = await db.one(`
       SELECT id, name, type, description, capabilities, status, max_concurrent_tasks, created_at
       FROM agents WHERE id = ?
-    `).get(req.agent.id);
+    `, [req.agent.id]);
 
     if (!agent) {
       return response.notFound(res, 'Agent');
@@ -235,7 +235,7 @@ router.get('/me', agentAuth, (req, res) => {
  * For user keys, returns tasks assigned to agents owned by this user
  * Supports optional userName query param to filter by assignee name
  */
-router.get('/me/tasks', agentAuth, (req, res) => {
+router.get('/me/tasks', agentAuth, async (req, res) => {
   try {
     const { status, userName } = req.query;
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 50));
@@ -283,7 +283,7 @@ router.get('/me/tasks', agentAuth, (req, res) => {
     query += ' ORDER BY t.priority ASC, t.created_at ASC LIMIT ? OFFSET ?';
     params.push(limit, offset);
 
-    const tasks = db.prepare(query).all(...params);
+    const tasks = await db.many(query, params);
 
     // Parse JSON fields and normalize timestamps
     const parsed = tasks.map(task => normalizeTaskTimestamps(task));
@@ -301,7 +301,7 @@ router.get('/me/tasks', agentAuth, (req, res) => {
  * For user keys, returns next task from agents owned by this user
  * Supports optional userName query param to filter by agent name
  */
-router.get('/me/tasks/next', agentAuth, (req, res) => {
+router.get('/me/tasks/next', agentAuth, async (req, res) => {
   try {
     const { userName } = req.query;
     let inProgressCount;
@@ -315,10 +315,11 @@ router.get('/me/tasks/next', agentAuth, (req, res) => {
       }
       const placeholders = ownedIds.map(() => '?').join(',');
 
-      inProgressCount = db.prepare(`
+      const inProgressRow = await db.one(`
         SELECT COUNT(*) as count FROM tasks
         WHERE assigned_agent_id IN (${placeholders}) AND status = 'in_progress'
-      `).get(...ownedIds).count;
+      `, ownedIds);
+      inProgressCount = inProgressRow.count;
 
       if (inProgressCount >= req.agent.maxConcurrentTasks) {
         return response.success(res, {
@@ -328,7 +329,7 @@ router.get('/me/tasks/next', agentAuth, (req, res) => {
         });
       }
 
-      task = db.prepare(`
+      task = await db.one(`
         SELECT
           t.*,
           p.name as project_name,
@@ -340,18 +341,19 @@ router.get('/me/tasks/next', agentAuth, (req, res) => {
           AND t.status IN ('pending', 'assigned')
         ORDER BY t.priority ASC, t.created_at ASC
         LIMIT 1
-      `).get(...ownedIds);
+      `, ownedIds);
     } else {
       // Agent key: standard agent behavior with capability-based routing
-      const agent = db.prepare(`
+      const agent = await db.one(`
         SELECT id, capabilities, project_access, task_types, max_concurrent_tasks, active_task_count
         FROM agents WHERE id = ?
-      `).get(req.agent.id);
+      `, [req.agent.id]);
 
-      inProgressCount = db.prepare(`
+      const inProgressRow2 = await db.one(`
         SELECT COUNT(*) as count FROM tasks
         WHERE assigned_agent_id = ? AND status = 'in_progress'
-      `).get(req.agent.id).count;
+      `, [req.agent.id]);
+      inProgressCount = inProgressRow2.count;
 
       if (inProgressCount >= (agent?.max_concurrent_tasks || 1)) {
         return response.success(res, {
@@ -362,7 +364,7 @@ router.get('/me/tasks/next', agentAuth, (req, res) => {
       }
 
       // First, check for tasks already assigned to this agent
-      task = db.prepare(`
+      task = await db.one(`
         SELECT
           t.*,
           p.name as project_name,
@@ -373,12 +375,12 @@ router.get('/me/tasks/next', agentAuth, (req, res) => {
           AND t.status IN ('pending', 'assigned')
         ORDER BY t.priority ASC, t.created_at ASC
         LIMIT 1
-      `).get(req.agent.id);
+      `, [req.agent.id]);
 
       // If no assigned task, look for unassigned tasks matching agent's capabilities
       if (!task) {
         // Get all unassigned pending tasks
-        const unassignedTasks = db.prepare(`
+        const unassignedTasks = await db.many(`
           SELECT
             t.*,
             p.name as project_name,
@@ -392,7 +394,7 @@ router.get('/me/tasks/next', agentAuth, (req, res) => {
             t.priority ASC,
             t.created_at ASC
           LIMIT 50
-        `).all(req.agent.id);
+        `, [req.agent.id]);
 
         // Filter tasks based on agent capabilities
         for (const candidateTask of unassignedTasks) {
@@ -445,18 +447,18 @@ router.get('/providers', userAuth, (req, res) => {
  * Advisory matching endpoint - returns list of matching agents with scores
  * Does not assign tasks, just provides recommendations
  */
-router.post('/match', userAuth, validateBody(matchAgentsSchema), (req, res) => {
+router.post('/match', userAuth, validateBody(matchAgentsSchema), async (req, res) => {
   try {
     const { tags = [], priority, metadata = {} } = req.body;
 
     // Get all active agents with their details
-    const agents = db.prepare(`
+    const agents = await db.many(`
       SELECT
         id, name, type, description, capabilities, specializations, metadata, status,
         max_concurrent_tasks, active_task_count
       FROM agents
       WHERE status = 'active'
-    `).all();
+    `, []);
 
     // Calculate match scores for each agent
     const matches = agents.map(agent => {
@@ -546,7 +548,7 @@ router.post('/match', userAuth, validateBody(matchAgentsSchema), (req, res) => {
  *   - available: Only agents with capacity ('true')
  *   - business_line: Search in specializations.business_lines
  */
-router.get('/', userAuth, (req, res) => {
+router.get('/', userAuth, async (req, res) => {
   try {
     const { capability, status, available, business_line } = req.query;
 
@@ -578,7 +580,7 @@ router.get('/', userAuth, (req, res) => {
 
     query += ' ORDER BY created_at DESC';
 
-    let agents = db.prepare(query).all(...params);
+    let agents = await db.many(query, params);
 
     // Parse JSON fields and normalize timestamps
     agents = agents.map(agent => normalizeAgentTimestamps(agent));
@@ -647,7 +649,7 @@ router.post('/', userAuth, requireRoles('admin'), validateBody(createAgentSchema
       keyVersion = encResult.keyVersion;
     }
 
-    const result = db.prepare(`
+    const result = await db.insert(`
       INSERT INTO agents (
         name, type, description, capabilities, specializations, metadata, max_concurrent_tasks,
         agent_type, specialization, project_access, task_types,
@@ -656,7 +658,7 @@ router.post('/', userAuth, requireRoles('admin'), validateBody(createAgentSchema
         system_prompt, execution_mode, max_tokens, temperature
       )
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
+    `, [
       name,
       type,
       description || null,
@@ -679,18 +681,18 @@ router.post('/', userAuth, requireRoles('admin'), validateBody(createAgentSchema
       executionMode || (provider ? 'manual' : 'manual'),
       maxTokens || 4096,
       temperature ?? 0.7
-    );
+    ]);
 
-    const agent = db.prepare('SELECT * FROM agents WHERE id = ?').get(result.lastInsertRowid);
+    const agent = await db.one('SELECT * FROM agents WHERE id = ?', [result.lastInsertRowid]);
 
     // Note: agent.registered is a global event (not project-scoped)
     // Dispatch to all projects that have routes listening for this event
-    const projectsWithAgentRoutes = db.prepare(`
+    const projectsWithAgentRoutes = await db.many(`
       SELECT DISTINCT project_id FROM routes WHERE trigger_event = 'agent.registered' AND enabled = 1
-    `).all();
+    `, []);
 
     for (const { project_id } of projectsWithAgentRoutes) {
-      const project = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(project_id);
+      const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [project_id]);
       dispatchEvent('agent.registered', {
         project: project ? { id: project.id, name: project.name } : { id: project_id },
         projectId: project_id,
@@ -718,23 +720,23 @@ router.post('/', userAuth, requireRoles('admin'), validateBody(createAgentSchema
  * GET /api/agents/:id
  * Get agent details
  */
-router.get('/:id', userAuth, (req, res) => {
+router.get('/:id', userAuth, async (req, res) => {
   try {
-    const agent = db.prepare(`
+    const agent = await db.one(`
       SELECT * FROM agents WHERE id = ?
-    `).get(req.params.id);
+    `, [req.params.id]);
 
     if (!agent) {
       return response.notFound(res, 'Agent');
     }
 
     // Get API keys (without hash)
-    const keys = db.prepare(`
+    const keys = await db.many(`
       SELECT id, key_prefix, name, scopes, last_used_at, expires_at, revoked_at, created_at
       FROM agent_keys
       WHERE agent_id = ?
       ORDER BY created_at DESC
-    `).all(req.params.id);
+    `, [req.params.id]);
 
     response.success(res, normalizeAgentTimestamps({
       ...agent,
@@ -755,11 +757,11 @@ router.get('/:id', userAuth, (req, res) => {
  * Query params:
  *   - period: '7d', '30d', '90d', 'all' (default: '30d')
  */
-router.get('/:id/metrics', userAuth, (req, res) => {
+router.get('/:id/metrics', userAuth, async (req, res) => {
   try {
-    const agent = db.prepare(`
+    const agent = await db.one(`
       SELECT id, name FROM agents WHERE id = ?
-    `).get(req.params.id);
+    `, [req.params.id]);
 
     if (!agent) {
       return response.notFound(res, 'Agent');
@@ -781,7 +783,7 @@ router.get('/:id/metrics', userAuth, (req, res) => {
     }
 
     // Task metrics
-    const taskStats = db.prepare(`
+    const taskStats = await db.one(`
       SELECT
         COUNT(CASE WHEN status = 'completed' THEN 1 END) as tasks_completed,
         COUNT(CASE WHEN status = 'in_progress' THEN 1 END) as tasks_in_progress,
@@ -789,23 +791,24 @@ router.get('/:id/metrics', userAuth, (req, res) => {
       FROM tasks t
       WHERE t.assigned_agent_id = ?
       ${dateFilter}
-    `).get(req.params.id);
+    `, [req.params.id]);
 
     // Average completion time (only for tasks with both started_at and completed_at)
-    const avgCompletionTime = db.prepare(`
-      SELECT AVG(
-        (julianday(completed_at) - julianday(started_at)) * 24 * 60
-      ) as avg_minutes
+    const avgExpr = db.dialect === 'postgres'
+      ? 'AVG(EXTRACT(EPOCH FROM (completed_at - started_at)) / 60)'
+      : 'AVG((julianday(completed_at) - julianday(started_at)) * 24 * 60)';
+    const avgCompletionTime = await db.one(`
+      SELECT ${avgExpr} as avg_minutes
       FROM tasks t
       WHERE t.assigned_agent_id = ?
         AND t.status = 'completed'
         AND t.started_at IS NOT NULL
         AND t.completed_at IS NOT NULL
         ${dateFilter}
-    `).get(req.params.id);
+    `, [req.params.id]);
 
     // Deliverable metrics
-    const deliverableStats = db.prepare(`
+    const deliverableStats = await db.one(`
       SELECT
         COUNT(*) as deliverables_submitted,
         COUNT(CASE WHEN status = 'approved' THEN 1 END) as deliverables_approved,
@@ -814,30 +817,30 @@ router.get('/:id/metrics', userAuth, (req, res) => {
       FROM deliverables d
       WHERE d.agent_id = ?
       ${dateFilterDeliverables}
-    `).get(req.params.id);
+    `, [req.params.id]);
 
     // Token usage stats
-    const tokenStats = db.prepare(`
+    const tokenStats = await db.one(`
       SELECT
         COALESCE(SUM(input_tokens), 0) as total_input_tokens,
         COALESCE(SUM(output_tokens), 0) as total_output_tokens
       FROM deliverables d
       WHERE d.agent_id = ?
       ${dateFilterDeliverables}
-    `).get(req.params.id);
+    `, [req.params.id]);
 
     // First-time approval rate (version = 1 and approved)
-    const firstTimeApproval = db.prepare(`
+    const firstTimeApproval = await db.one(`
       SELECT
         COUNT(CASE WHEN status = 'approved' AND version = 1 THEN 1 END) as first_time_approved,
         COUNT(CASE WHEN status = 'approved' THEN 1 END) as total_approved
       FROM deliverables d
       WHERE d.agent_id = ?
       ${dateFilterDeliverables}
-    `).get(req.params.id);
+    `, [req.params.id]);
 
     // Recent activity (last 7 days regardless of period filter)
-    const recentActivity = db.prepare(`
+    const recentActivity = await db.many(`
       SELECT
         date(t.completed_at) as date,
         COUNT(t.id) as tasks_completed,
@@ -847,9 +850,9 @@ router.get('/:id/metrics', userAuth, (req, res) => {
         AND t.status = 'completed'
         AND t.completed_at >= datetime('now', '-7 days')
       GROUP BY date(t.completed_at)
-    `).all(req.params.id);
+    `, [req.params.id]);
 
-    const recentDeliverables = db.prepare(`
+    const recentDeliverables = await db.many(`
       SELECT
         date(d.created_at) as date,
         COUNT(d.id) as deliverables_submitted
@@ -857,7 +860,7 @@ router.get('/:id/metrics', userAuth, (req, res) => {
       WHERE d.agent_id = ?
         AND d.created_at >= datetime('now', '-7 days')
       GROUP BY date(d.created_at)
-    `).all(req.params.id);
+    `, [req.params.id]);
 
     // Merge recent activity data
     const activityMap = new Map();
@@ -934,9 +937,9 @@ router.get('/:id/metrics', userAuth, (req, res) => {
  * PATCH /api/agents/:id
  * Update agent
  */
-router.patch('/:id', userAuth, requireRoles('admin'), validateBody(updateAgentSchema), (req, res) => {
+router.patch('/:id', userAuth, requireRoles('admin'), validateBody(updateAgentSchema), async (req, res) => {
   try {
-    const agent = db.prepare('SELECT id, status FROM agents WHERE id = ?').get(req.params.id);
+    const agent = await db.one('SELECT id, status FROM agents WHERE id = ?', [req.params.id]);
     if (!agent) {
       return response.notFound(res, 'Agent');
     }
@@ -1012,11 +1015,11 @@ router.patch('/:id', userAuth, requireRoles('admin'), validateBody(updateAgentSc
     updates.push("updated_at = datetime('now')");
     values.push(req.params.id);
 
-    db.prepare(`
+    await db.exec(`
       UPDATE agents SET ${updates.join(', ')} WHERE id = ?
-    `).run(...values);
+    `, values);
 
-    const updated = db.prepare('SELECT * FROM agents WHERE id = ?').get(req.params.id);
+    const updated = await db.one('SELECT * FROM agents WHERE id = ?', [req.params.id]);
 
     // Dispatch agent.status_changed if status was updated
     if (status !== undefined) {
@@ -1046,18 +1049,19 @@ router.patch('/:id', userAuth, requireRoles('admin'), validateBody(updateAgentSc
  * DELETE /api/agents/:id
  * Delete agent
  */
-router.delete('/:id', userAuth, requireRoles('admin'), (req, res) => {
+router.delete('/:id', userAuth, requireRoles('admin'), async (req, res) => {
   try {
-    const agent = db.prepare('SELECT id, name FROM agents WHERE id = ?').get(req.params.id);
+    const agent = await db.one('SELECT id, name FROM agents WHERE id = ?', [req.params.id]);
     if (!agent) {
       return response.notFound(res, 'Agent');
     }
 
     // Block deletion if agent has active (non-terminal) tasks
-    const activeTaskCount = db.prepare(`
+    const activeTaskRow = await db.one(`
       SELECT COUNT(*) as count FROM tasks
       WHERE assigned_agent_id = ? AND status NOT IN ('completed', 'cancelled')
-    `).get(req.params.id).count;
+    `, [req.params.id]);
+    const activeTaskCount = activeTaskRow.count;
 
     if (activeTaskCount > 0) {
       return response.validationError(res,
@@ -1065,7 +1069,7 @@ router.delete('/:id', userAuth, requireRoles('admin'), (req, res) => {
       );
     }
 
-    db.prepare('DELETE FROM agents WHERE id = ?').run(req.params.id);
+    await db.exec('DELETE FROM agents WHERE id = ?', [req.params.id]);
 
     response.success(res, { deleted: true });
   } catch (err) {
@@ -1078,9 +1082,9 @@ router.delete('/:id', userAuth, requireRoles('admin'), (req, res) => {
  * POST /api/agents/:id/keys
  * Generate a new API key for an agent
  */
-router.post('/:id/keys', userAuth, requireRoles('admin'), keyGenLimiter, validateBody(generateKeySchema), (req, res) => {
+router.post('/:id/keys', userAuth, requireRoles('admin'), keyGenLimiter, validateBody(generateKeySchema), async (req, res) => {
   try {
-    const agent = db.prepare('SELECT id FROM agents WHERE id = ?').get(req.params.id);
+    const agent = await db.one('SELECT id FROM agents WHERE id = ?', [req.params.id]);
     if (!agent) {
       return response.notFound(res, 'Agent');
     }
@@ -1088,17 +1092,17 @@ router.post('/:id/keys', userAuth, requireRoles('admin'), keyGenLimiter, validat
     const { name, scopes, expiresAt } = req.body;
     const { key, hash, prefix } = generateApiKey();
 
-    const result = db.prepare(`
+    const result = await db.insert(`
       INSERT INTO agent_keys (agent_id, key_hash, key_prefix, name, scopes, expires_at)
       VALUES (?, ?, ?, ?, ?, ?)
-    `).run(
+    `, [
       req.params.id,
       hash,
       prefix,
       name || null,
       JSON.stringify(scopes),
       expiresAt || null
-    );
+    ]);
 
     // Return the key once - it cannot be retrieved again
     response.created(res, {
@@ -1120,19 +1124,19 @@ router.post('/:id/keys', userAuth, requireRoles('admin'), keyGenLimiter, validat
  * DELETE /api/agents/:id/keys/:keyId
  * Revoke an API key
  */
-router.delete('/:id/keys/:keyId', userAuth, requireRoles('admin'), (req, res) => {
+router.delete('/:id/keys/:keyId', userAuth, requireRoles('admin'), async (req, res) => {
   try {
-    const key = db.prepare(`
+    const key = await db.one(`
       SELECT id FROM agent_keys WHERE id = ? AND agent_id = ?
-    `).get(req.params.keyId, req.params.id);
+    `, [req.params.keyId, req.params.id]);
 
     if (!key) {
       return response.notFound(res, 'API key');
     }
 
-    db.prepare(`
+    await db.exec(`
       UPDATE agent_keys SET revoked_at = datetime('now') WHERE id = ?
-    `).run(req.params.keyId);
+    `, [req.params.keyId]);
 
     response.success(res, { revoked: true });
   } catch (err) {
@@ -1145,18 +1149,18 @@ router.delete('/:id/keys/:keyId', userAuth, requireRoles('admin'), (req, res) =>
  * POST /api/agents/:id/webhook-secret
  * Generate a new webhook secret for an agent
  */
-router.post('/:id/webhook-secret', userAuth, requireRoles('admin'), (req, res) => {
+router.post('/:id/webhook-secret', userAuth, requireRoles('admin'), async (req, res) => {
   try {
-    const agent = db.prepare('SELECT id FROM agents WHERE id = ?').get(req.params.id);
+    const agent = await db.one('SELECT id FROM agents WHERE id = ?', [req.params.id]);
     if (!agent) {
       return response.notFound(res, 'Agent');
     }
 
     const secret = generateWebhookSecret();
 
-    db.prepare(`
+    await db.exec(`
       UPDATE agents SET webhook_secret = ?, updated_at = datetime('now') WHERE id = ?
-    `).run(secret, req.params.id);
+    `, [secret, req.params.id]);
 
     // Return secret once - should be stored by agent
     response.success(res, {
@@ -1177,9 +1181,9 @@ router.post('/:id/webhook-secret', userAuth, requireRoles('admin'), (req, res) =
  * PUT /api/agents/:id/owner
  * Link or unlink an agent to a user
  */
-router.put('/:id/owner', userAuth, requireRoles('admin'), validateBody(updateAgentOwnerSchema), (req, res) => {
+router.put('/:id/owner', userAuth, requireRoles('admin'), validateBody(updateAgentOwnerSchema), async (req, res) => {
   try {
-    const agent = db.prepare('SELECT id FROM agents WHERE id = ?').get(req.params.id);
+    const agent = await db.one('SELECT id FROM agents WHERE id = ?', [req.params.id]);
     if (!agent) {
       return response.notFound(res, 'Agent');
     }
@@ -1188,15 +1192,15 @@ router.put('/:id/owner', userAuth, requireRoles('admin'), validateBody(updateAge
 
     // Validate user exists if linking
     if (userId !== null && userId !== undefined) {
-      const user = db.prepare('SELECT id, name FROM users WHERE id = ?').get(userId);
+      const user = await db.one('SELECT id, name FROM users WHERE id = ?', [userId]);
       if (!user) {
         return response.notFound(res, 'User');
       }
     }
 
-    db.prepare(`
+    await db.exec(`
       UPDATE agents SET owner_user_id = ?, updated_at = datetime('now') WHERE id = ?
-    `).run(userId || null, req.params.id);
+    `, [userId || null, req.params.id]);
 
     response.success(res, { linked: userId !== null });
   } catch (err) {
@@ -1211,10 +1215,10 @@ router.put('/:id/owner', userAuth, requireRoles('admin'), validateBody(updateAge
  */
 router.post('/:id/test-connection', userAuth, requireRoles('admin'), async (req, res) => {
   try {
-    const agent = db.prepare(`
+    const agent = await db.one(`
       SELECT id, provider, provider_api_key_encrypted, provider_api_key_iv, encryption_key_version, provider_model, provider_base_url
       FROM agents WHERE id = ?
-    `).get(req.params.id);
+    `, [req.params.id]);
 
     if (!agent) {
       return response.notFound(res, 'Agent');
@@ -1281,9 +1285,9 @@ router.post('/:id/test-connection', userAuth, requireRoles('admin'), async (req,
  */
 router.post('/:id/execute', userAuth, requireRoles('admin'), async (req, res) => {
   try {
-    const agent = db.prepare(`
+    const agent = await db.one(`
       SELECT * FROM agents WHERE id = ?
-    `).get(req.params.id);
+    `, [req.params.id]);
 
     if (!agent) {
       return response.notFound(res, 'Agent');
@@ -1301,9 +1305,9 @@ router.post('/:id/execute', userAuth, requireRoles('admin'), async (req, res) =>
       return response.badRequest(res, 'taskId is required');
     }
 
-    const task = db.prepare(`
+    const task = await db.one(`
       SELECT * FROM tasks WHERE id = ? AND assigned_agent_id = ?
-    `).get(taskId, req.params.id);
+    `, [taskId, req.params.id]);
 
     if (!task) {
       return response.notFound(res, 'Task not assigned to this agent');
@@ -1326,7 +1330,7 @@ router.post('/:id/execute', userAuth, requireRoles('admin'), async (req, res) =>
  */
 router.patch('/:id/execution', userAuth, requireRoles('admin'), validateBody(updateAgentExecutionSchema), async (req, res) => {
   try {
-    const agent = db.prepare('SELECT id, provider FROM agents WHERE id = ?').get(req.params.id);
+    const agent = await db.one('SELECT id, provider FROM agents WHERE id = ?', [req.params.id]);
     if (!agent) {
       return response.notFound(res, 'Agent');
     }
@@ -1424,17 +1428,17 @@ router.patch('/:id/execution', userAuth, requireRoles('admin'), validateBody(upd
     updates.push("updated_at = datetime('now')");
     values.push(req.params.id);
 
-    db.prepare(`
+    await db.exec(`
       UPDATE agents SET ${updates.join(', ')} WHERE id = ?
-    `).run(...values);
+    `, values);
 
     // When API key or provider is updated, clear execution errors on stuck tasks
     // so the dispatcher will retry them with the new credentials
     if (providerApiKey !== undefined || provider !== undefined) {
-      const stuckTasks = db.prepare(`
+      const stuckTasks = await db.many(`
         SELECT id, context FROM tasks
         WHERE assigned_agent_id = ? AND status = 'assigned' AND context IS NOT NULL
-      `).all(req.params.id);
+      `, [req.params.id]);
 
       let cleared = 0;
       for (const task of stuckTasks) {
@@ -1442,8 +1446,8 @@ router.patch('/:id/execution', userAuth, requireRoles('admin'), validateBody(upd
           const ctx = JSON.parse(task.context || '{}');
           if (ctx.lastExecutionError) {
             delete ctx.lastExecutionError;
-            db.prepare('UPDATE tasks SET context = ?, updated_at = datetime(\'now\') WHERE id = ?')
-              .run(JSON.stringify(ctx), task.id);
+            await db.exec('UPDATE tasks SET context = ?, updated_at = datetime(\'now\') WHERE id = ?',
+              [JSON.stringify(ctx), task.id]);
             cleared++;
           }
         } catch { /* skip malformed context */ }

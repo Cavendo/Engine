@@ -3,7 +3,7 @@
  * Handles route matching, payload building, and delivery dispatch
  */
 
-import db from '../db/connection.js';
+import db from '../db/adapter.js';
 import crypto from 'crypto';
 import { sendEmail, isConfigured as isEmailConfigured } from './emailProvider.js';
 import { uploadToS3, testS3Connection } from './s3Provider.js';
@@ -35,20 +35,20 @@ import path from 'path';
  * @param {Object} eventData - Event data for condition matching
  * @returns {Array} Matching routes
  */
-export function findMatchingRoutes(projectId, eventType, eventData = {}) {
+export async function findMatchingRoutes(projectId, eventType, eventData = {}) {
   let routes;
   if (projectId) {
     // Project-scoped: match project routes + global routes for this event
-    routes = db.prepare(`
+    routes = await db.many(`
       SELECT * FROM routes
       WHERE (project_id = ? OR project_id IS NULL) AND trigger_event = ? AND enabled = 1
-    `).all(projectId, eventType);
+    `, [projectId, eventType]);
   } else {
     // System-level event (no project): only match global routes
-    routes = db.prepare(`
+    routes = await db.many(`
       SELECT * FROM routes
       WHERE project_id IS NULL AND trigger_event = ? AND enabled = 1
-    `).all(eventType);
+    `, [eventType]);
   }
 
   return routes.filter(route => {
@@ -103,7 +103,7 @@ export async function dispatchEvent(eventType, eventData) {
   // Inject event type so email templates and payloads can reference it
   const enrichedData = { ...eventData, event: eventType };
 
-  const routes = findMatchingRoutes(projectId, eventType, enrichedData);
+  const routes = await findMatchingRoutes(projectId, eventType, enrichedData);
 
   if (routes.length === 0) {
     return;
@@ -143,18 +143,18 @@ export async function dispatchRoute(route, eventData, existingLogId = null) {
   // Create or update delivery log
   let logId = existingLogId;
   if (!logId) {
-    const logResult = db.prepare(`
+    const { lastInsertRowid } = await db.insert(`
       INSERT INTO delivery_logs (route_id, event_type, event_payload, status, deliverable_id)
       VALUES (?, ?, ?, 'pending', ?)
-    `).run(route.id, route.trigger_event, JSON.stringify(eventData), deliverableId);
-    logId = logResult.lastInsertRowid;
+    `, [route.id, route.trigger_event, JSON.stringify(eventData), deliverableId]);
+    logId = lastInsertRowid;
   } else {
     // Update attempt number for retry
-    db.prepare(`
+    await db.exec(`
       UPDATE delivery_logs
       SET attempt_number = attempt_number + 1, status = 'retrying'
       WHERE id = ?
-    `).run(logId);
+    `, [logId]);
   }
 
   try {
@@ -175,7 +175,7 @@ export async function dispatchRoute(route, eventData, existingLogId = null) {
     const duration = Date.now() - startTime;
 
     // Update log with success
-    db.prepare(`
+    await db.exec(`
       UPDATE delivery_logs
       SET status = 'delivered',
           response_status = ?,
@@ -183,7 +183,7 @@ export async function dispatchRoute(route, eventData, existingLogId = null) {
           completed_at = datetime('now'),
           duration_ms = ?
       WHERE id = ?
-    `).run(result.status || 200, truncate(result.body, 50000), duration, logId);
+    `, [result.status || 200, truncate(result.body, 50000), duration, logId]);
 
     // Log activity for deliverable route dispatch
     if (deliverableId) {
@@ -197,7 +197,7 @@ export async function dispatchRoute(route, eventData, existingLogId = null) {
     const duration = Date.now() - startTime;
 
     // Check retry policy
-    const log = db.prepare('SELECT attempt_number FROM delivery_logs WHERE id = ?').get(logId);
+    const log = await db.one('SELECT attempt_number FROM delivery_logs WHERE id = ?', [logId]);
     const retryPolicy = route.retry_policy || { max_retries: 3, backoff_type: 'exponential', initial_delay_ms: 1000 };
 
     if (log.attempt_number < retryPolicy.max_retries) {
@@ -206,26 +206,26 @@ export async function dispatchRoute(route, eventData, existingLogId = null) {
       const delay = calculateBackoff(retryPolicy, log.attempt_number);
       const retryDate = new Date(Date.now() + delay);
       const nextRetryAt = retryDate.toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
-      db.prepare(`
+      await db.exec(`
         UPDATE delivery_logs
         SET status = 'retrying',
             error_message = ?,
             duration_ms = ?,
             next_retry_at = ?
         WHERE id = ?
-      `).run(error.message, duration, nextRetryAt, logId);
+      `, [error.message, duration, nextRetryAt, logId]);
 
       return { success: false, error: error.message, retrying: true };
     } else {
       // Final failure
-      db.prepare(`
+      await db.exec(`
         UPDATE delivery_logs
         SET status = 'failed',
             error_message = ?,
             completed_at = datetime('now'),
             duration_ms = ?
         WHERE id = ?
-      `).run(error.message, duration, logId);
+      `, [error.message, duration, logId]);
 
       // Log failed dispatch activity
       if (deliverableId) {
@@ -253,7 +253,7 @@ export async function testRoute(route, testPayload) {
       result = await deliverEmail(route.destination_config, testPayload, route.field_mapping);
     } else if (route.destination_type === 'storage') {
       // For storage test, just verify the connection
-      const storageConfig = resolveStorageConfig(route.destination_config);
+      const storageConfig = await resolveStorageConfig(route.destination_config);
       const connResult = await testS3Connection(storageConfig);
       if (!connResult.success) {
         return { success: false, error: connResult.message, detail: connResult.detail };
@@ -426,10 +426,10 @@ const CONTENT_TYPE_MAP = {
 /**
  * Resolve storage config — if connection_id is set, look up stored connection credentials
  */
-function resolveStorageConfig(config) {
+async function resolveStorageConfig(config) {
   if (!config.connection_id) return config;
 
-  const conn = db.prepare('SELECT * FROM storage_connections WHERE id = ?').get(config.connection_id);
+  const conn = await db.one('SELECT * FROM storage_connections WHERE id = ?', [config.connection_id]);
   if (!conn) throw new Error(`Storage connection #${config.connection_id} not found`);
 
   return {
@@ -444,7 +444,7 @@ function resolveStorageConfig(config) {
 }
 
 async function deliverStorage(config, eventData) {
-  config = resolveStorageConfig(config);
+  config = await resolveStorageConfig(config);
   const deliverable = eventData.deliverable || {};
   const projectName = (eventData.project?.name || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '_');
   const deliverableId = deliverable.id || 'unknown';
@@ -809,7 +809,7 @@ let retrySweepHandle = null;
  */
 async function retrySweep() {
   try {
-    const due = db.prepare(`
+    const due = await db.many(`
       SELECT dl.*, r.trigger_event, r.destination_type, r.destination_config,
              r.field_mapping, r.retry_policy, r.name as route_name, r.enabled,
              r.trigger_conditions, r.project_id as route_project_id
@@ -819,7 +819,7 @@ async function retrySweep() {
         AND dl.next_retry_at <= datetime('now')
       ORDER BY dl.next_retry_at ASC
       LIMIT 10
-    `).all();
+    `, []);
 
     if (due.length === 0) return;
 
@@ -843,11 +843,11 @@ async function retrySweep() {
       // Reconstruct event data from stored payload, enriching assignee if missing
       const eventData = safeJsonParse(log.event_payload, {});
       if (!eventData.assignee && eventData.task?.assigned_agent_id) {
-        const agent = db.prepare('SELECT id, name, execution_mode, owner_user_id FROM agents WHERE id = ?').get(eventData.task.assigned_agent_id);
+        const agent = await db.one('SELECT id, name, execution_mode, owner_user_id FROM agents WHERE id = ?', [eventData.task.assigned_agent_id]);
         if (agent) {
           const assignee = { id: agent.id, name: agent.name, executionMode: agent.execution_mode };
           if (agent.owner_user_id) {
-            const user = db.prepare('SELECT email, name FROM users WHERE id = ?').get(agent.owner_user_id);
+            const user = await db.one('SELECT email, name FROM users WHERE id = ?', [agent.owner_user_id]);
             if (user) { assignee.email = user.email; assignee.userName = user.name; }
           }
           eventData.assignee = assignee;
@@ -856,7 +856,7 @@ async function retrySweep() {
       }
 
       // Clear next_retry_at before dispatching (prevent double-pickup)
-      db.prepare('UPDATE delivery_logs SET next_retry_at = NULL WHERE id = ?').run(log.id);
+      await db.exec('UPDATE delivery_logs SET next_retry_at = NULL WHERE id = ?', [log.id]);
 
       try {
         await dispatchRoute(route, eventData, log.id);

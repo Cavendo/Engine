@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import db from '../db/connection.js';
+import db from '../db/adapter.js';
 import { hashPassword, verifyPassword, generateSessionToken } from '../utils/crypto.js';
 import * as response from '../utils/response.js';
 import { userAuth } from '../middleware/userAuth.js';
@@ -18,11 +18,11 @@ router.post('/login', authLimiter, validateBody(loginSchema), async (req, res) =
   try {
     const { email, password } = req.body;
 
-    const user = db.prepare(`
+    const user = await db.one(`
       SELECT id, email, password_hash, name, role, status, force_password_change
       FROM users
       WHERE email = ?
-    `).get(email.toLowerCase());
+    `, [email.toLowerCase()]);
 
     if (!user) {
       return response.unauthorized(res, 'Invalid email or password');
@@ -40,23 +40,23 @@ router.post('/login', authLimiter, validateBody(loginSchema), async (req, res) =
 
     // Session regeneration: Delete any existing sessions for this user
     // This prevents session fixation and ensures fresh session on login
-    db.prepare(`
+    await db.exec(`
       DELETE FROM sessions WHERE user_id = ?
-    `).run(user.id);
+    `, [user.id]);
 
     // Create new session with cryptographically random ID
     const sessionId = generateSessionToken();
     const expiresAt = new Date(Date.now() + SESSION_DURATION_HOURS * 60 * 60 * 1000).toISOString();
 
-    db.prepare(`
+    await db.exec(`
       INSERT INTO sessions (id, user_id, expires_at)
       VALUES (?, ?, ?)
-    `).run(sessionId, user.id, expiresAt);
+    `, [sessionId, user.id, expiresAt]);
 
     // Update last login
-    db.prepare(`
+    await db.exec(`
       UPDATE users SET last_login_at = datetime('now') WHERE id = ?
-    `).run(user.id);
+    `, [user.id]);
 
     // Set session cookie
     res.cookie('session', sessionId, {
@@ -90,11 +90,11 @@ router.post('/login', authLimiter, validateBody(loginSchema), async (req, res) =
  * POST /api/auth/logout
  * Logout current session
  */
-router.post('/logout', (req, res) => {
+router.post('/logout', async (req, res) => {
   const sessionId = req.cookies?.session;
 
   if (sessionId) {
-    db.prepare('DELETE FROM sessions WHERE id = ?').run(sessionId);
+    await db.exec('DELETE FROM sessions WHERE id = ?', [sessionId]);
     res.clearCookie('session');
   }
 
@@ -131,7 +131,7 @@ router.post('/change-password', userAuth, validateBody(changePasswordSchema), as
   try {
     const { currentPassword, newPassword } = req.body;
 
-    const user = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(req.user.id);
+    const user = await db.one('SELECT password_hash FROM users WHERE id = ?', [req.user.id]);
 
     // Verify current password (async)
     const passwordValid = await verifyPassword(currentPassword, user.password_hash);
@@ -142,19 +142,19 @@ router.post('/change-password', userAuth, validateBody(changePasswordSchema), as
     // Hash new password (async)
     const newHash = await hashPassword(newPassword);
 
-    db.prepare(`
+    await db.exec(`
       UPDATE users
       SET password_hash = ?, force_password_change = 0, updated_at = datetime('now')
       WHERE id = ?
-    `).run(newHash, req.user.id);
+    `, [newHash, req.user.id]);
 
     // Invalidate all other sessions
-    db.prepare(`
+    await db.exec(`
       DELETE FROM sessions WHERE user_id = ? AND id != ?
-    `).run(req.user.id, req.cookies?.session);
+    `, [req.user.id, req.cookies?.session]);
 
     // Return updated user so frontend can refresh auth state
-    const updated = db.prepare('SELECT id, email, name, role, force_password_change FROM users WHERE id = ?').get(req.user.id);
+    const updated = await db.one('SELECT id, email, name, role, force_password_change FROM users WHERE id = ?', [req.user.id]);
     response.success(res, {
       passwordChanged: true,
       user: {

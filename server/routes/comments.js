@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import db from '../db/connection.js';
+import db from '../db/adapter.js';
 import * as response from '../utils/response.js';
 import { dualAuth } from '../middleware/agentAuth.js';
 import { canAccessTask, canAccessDeliverable } from '../utils/authorization.js';
@@ -93,7 +93,7 @@ function canDeleteComment(req, comment) {
  * GET /api/tasks/:id/comments
  * List comments for a task
  */
-router.get('/tasks/:id/comments', dualAuth, (req, res) => {
+router.get('/tasks/:id/comments', dualAuth, async (req, res) => {
   try {
     const taskId = parseInt(req.params.id);
 
@@ -106,16 +106,16 @@ router.get('/tasks/:id/comments', dualAuth, (req, res) => {
     }
 
     // Verify task exists
-    const task = db.prepare('SELECT id FROM tasks WHERE id = ?').get(taskId);
+    const task = await db.one('SELECT id FROM tasks WHERE id = ?', [taskId]);
     if (!task) {
       return response.notFound(res, 'Task');
     }
 
-    const comments = db.prepare(`
+    const comments = await db.many(`
       SELECT * FROM comments
       WHERE commentable_type = 'task' AND commentable_id = ?
       ORDER BY created_at ASC
-    `).all(taskId);
+    `, [taskId]);
 
     response.success(res, comments.map(formatComment));
   } catch (err) {
@@ -128,7 +128,7 @@ router.get('/tasks/:id/comments', dualAuth, (req, res) => {
  * POST /api/tasks/:id/comments
  * Add a comment to a task
  */
-router.post('/tasks/:id/comments', dualAuth, (req, res) => {
+router.post('/tasks/:id/comments', dualAuth, async (req, res) => {
   try {
     const taskId = parseInt(req.params.id);
     const { content } = req.body;
@@ -141,7 +141,7 @@ router.post('/tasks/:id/comments', dualAuth, (req, res) => {
     }
 
     // Verify task exists
-    const task = db.prepare('SELECT id FROM tasks WHERE id = ?').get(taskId);
+    const task = await db.one('SELECT id FROM tasks WHERE id = ?', [taskId]);
     if (!task) {
       return response.notFound(res, 'Task');
     }
@@ -151,18 +151,18 @@ router.post('/tasks/:id/comments', dualAuth, (req, res) => {
       return response.unauthorized(res, 'Could not determine author');
     }
 
-    const result = db.prepare(`
+    const { lastInsertRowid: commentId } = await db.insert(`
       INSERT INTO comments (content, commentable_type, commentable_id, author_type, author_id, author_name)
       VALUES (?, 'task', ?, ?, ?, ?)
-    `).run(
+    `, [
       content.trim(),
       taskId,
       author.authorType,
       author.authorId,
       author.authorName
-    );
+    ]);
 
-    const comment = db.prepare('SELECT * FROM comments WHERE id = ?').get(result.lastInsertRowid);
+    const comment = await db.one('SELECT * FROM comments WHERE id = ?', [commentId]);
 
     response.created(res, formatComment(comment));
   } catch (err) {
@@ -175,16 +175,16 @@ router.post('/tasks/:id/comments', dualAuth, (req, res) => {
  * DELETE /api/tasks/:taskId/comments/:commentId
  * Delete a comment from a task (only own comments, or admin)
  */
-router.delete('/tasks/:taskId/comments/:commentId', dualAuth, (req, res) => {
+router.delete('/tasks/:taskId/comments/:commentId', dualAuth, async (req, res) => {
   try {
     const taskId = parseInt(req.params.taskId);
     const commentId = parseInt(req.params.commentId);
 
     // Verify comment exists and belongs to this task
-    const comment = db.prepare(`
+    const comment = await db.one(`
       SELECT * FROM comments
       WHERE id = ? AND commentable_type = 'task' AND commentable_id = ?
-    `).get(commentId, taskId);
+    `, [commentId, taskId]);
 
     if (!comment) {
       return response.notFound(res, 'Comment');
@@ -195,7 +195,7 @@ router.delete('/tasks/:taskId/comments/:commentId', dualAuth, (req, res) => {
       return response.forbidden(res, 'You can only delete your own comments');
     }
 
-    db.prepare('DELETE FROM comments WHERE id = ?').run(commentId);
+    await db.exec('DELETE FROM comments WHERE id = ?', [commentId]);
 
     response.success(res, { deleted: true });
   } catch (err) {
@@ -212,7 +212,7 @@ router.delete('/tasks/:taskId/comments/:commentId', dualAuth, (req, res) => {
  * GET /api/deliverables/:id/comments
  * List comments for a deliverable
  */
-router.get('/deliverables/:id/comments', dualAuth, (req, res) => {
+router.get('/deliverables/:id/comments', dualAuth, async (req, res) => {
   try {
     const deliverableId = parseInt(req.params.id);
 
@@ -225,16 +225,16 @@ router.get('/deliverables/:id/comments', dualAuth, (req, res) => {
     }
 
     // Verify deliverable exists
-    const deliverable = db.prepare('SELECT id FROM deliverables WHERE id = ?').get(deliverableId);
+    const deliverable = await db.one('SELECT id FROM deliverables WHERE id = ?', [deliverableId]);
     if (!deliverable) {
       return response.notFound(res, 'Deliverable');
     }
 
-    const comments = db.prepare(`
+    const comments = await db.many(`
       SELECT * FROM comments
       WHERE commentable_type = 'deliverable' AND commentable_id = ?
       ORDER BY created_at ASC
-    `).all(deliverableId);
+    `, [deliverableId]);
 
     response.success(res, comments.map(formatComment));
   } catch (err) {
@@ -247,7 +247,7 @@ router.get('/deliverables/:id/comments', dualAuth, (req, res) => {
  * POST /api/deliverables/:id/comments
  * Add a comment to a deliverable
  */
-router.post('/deliverables/:id/comments', dualAuth, (req, res) => {
+router.post('/deliverables/:id/comments', dualAuth, async (req, res) => {
   try {
     const deliverableId = parseInt(req.params.id);
     const { content } = req.body;
@@ -260,7 +260,7 @@ router.post('/deliverables/:id/comments', dualAuth, (req, res) => {
     }
 
     // Verify deliverable exists
-    const deliverable = db.prepare('SELECT id FROM deliverables WHERE id = ?').get(deliverableId);
+    const deliverable = await db.one('SELECT id FROM deliverables WHERE id = ?', [deliverableId]);
     if (!deliverable) {
       return response.notFound(res, 'Deliverable');
     }
@@ -270,18 +270,18 @@ router.post('/deliverables/:id/comments', dualAuth, (req, res) => {
       return response.unauthorized(res, 'Could not determine author');
     }
 
-    const result = db.prepare(`
+    const { lastInsertRowid: commentId } = await db.insert(`
       INSERT INTO comments (content, commentable_type, commentable_id, author_type, author_id, author_name)
       VALUES (?, 'deliverable', ?, ?, ?, ?)
-    `).run(
+    `, [
       content.trim(),
       deliverableId,
       author.authorType,
       author.authorId,
       author.authorName
-    );
+    ]);
 
-    const comment = db.prepare('SELECT * FROM comments WHERE id = ?').get(result.lastInsertRowid);
+    const comment = await db.one('SELECT * FROM comments WHERE id = ?', [commentId]);
 
     response.created(res, formatComment(comment));
   } catch (err) {
@@ -294,16 +294,16 @@ router.post('/deliverables/:id/comments', dualAuth, (req, res) => {
  * DELETE /api/deliverables/:deliverableId/comments/:commentId
  * Delete a comment from a deliverable (only own comments, or admin)
  */
-router.delete('/deliverables/:deliverableId/comments/:commentId', dualAuth, (req, res) => {
+router.delete('/deliverables/:deliverableId/comments/:commentId', dualAuth, async (req, res) => {
   try {
     const deliverableId = parseInt(req.params.deliverableId);
     const commentId = parseInt(req.params.commentId);
 
     // Verify comment exists and belongs to this deliverable
-    const comment = db.prepare(`
+    const comment = await db.one(`
       SELECT * FROM comments
       WHERE id = ? AND commentable_type = 'deliverable' AND commentable_id = ?
-    `).get(commentId, deliverableId);
+    `, [commentId, deliverableId]);
 
     if (!comment) {
       return response.notFound(res, 'Comment');
@@ -314,7 +314,7 @@ router.delete('/deliverables/:deliverableId/comments/:commentId', dualAuth, (req
       return response.forbidden(res, 'You can only delete your own comments');
     }
 
-    db.prepare('DELETE FROM comments WHERE id = ?').run(commentId);
+    await db.exec('DELETE FROM comments WHERE id = ?', [commentId]);
 
     response.success(res, { deleted: true });
   } catch (err) {

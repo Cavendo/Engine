@@ -5,10 +5,9 @@
  * to match the same context available to MCP/external agents.
  */
 
-import db from '../db/connection.js';
+import db from '../db/adapter.js';
 import { decrypt } from '../utils/crypto.js';
 import { dispatchEvent } from './routeDispatcher.js';
-import { insertDeliverableWithRetry } from '../utils/deliverableVersioning.js';
 import { resolveBaseUrl } from '../utils/providerEndpoint.js';
 
 const EXECUTION_TIMEOUT_MS = parseInt(process.env.EXECUTION_TIMEOUT_MS) || 120000;
@@ -32,49 +31,50 @@ function parseTags(raw) {
  * This mirrors what GET /api/tasks/:id/context returns,
  * so server-executed agents get the same information as MCP agents.
  */
-function gatherTaskContext(task) {
+async function gatherTaskContext(task) {
   // Get project knowledge
   let knowledge = [];
   if (task.project_id) {
-    knowledge = db.prepare(`
+    const rows = await db.many(`
       SELECT id, title, content, content_type, category, tags
       FROM knowledge
       WHERE project_id = ?
       ORDER BY created_at DESC
-    `).all(task.project_id).map(k => ({
+    `, [task.project_id]);
+    knowledge = rows.map(k => ({
       ...k,
       tags: parseTags(k.tags)
     }));
   }
 
   // Get previous deliverables and feedback (critical for revision tasks)
-  const deliverables = db.prepare(`
+  const deliverables = await db.many(`
     SELECT id, title, content, content_type, status, version, feedback, created_at
     FROM deliverables
     WHERE task_id = ?
     ORDER BY version DESC
-  `).all(task.id);
+  `, [task.id]);
 
   // Get related tasks in the same project
   let relatedTasks = [];
   if (task.project_id) {
-    relatedTasks = db.prepare(`
+    relatedTasks = await db.many(`
       SELECT id, title, status, priority, description
       FROM tasks
       WHERE project_id = ? AND id != ?
       ORDER BY priority ASC, created_at DESC
       LIMIT 10
-    `).all(task.project_id, task.id);
+    `, [task.project_id, task.id]);
   }
 
   // Get project details
   let project = null;
   if (task.project_id) {
-    project = db.prepare(`
+    project = await db.one(`
       SELECT id, name, description
       FROM projects
       WHERE id = ?
-    `).get(task.project_id);
+    `, [task.project_id]);
   }
 
   return { knowledge, deliverables, relatedTasks, project };
@@ -110,14 +110,14 @@ export async function executeTask(agent, task) {
   }
 
   // Update task status to in_progress
-  db.prepare(`
+  await db.exec(`
     UPDATE tasks
     SET status = 'in_progress', started_at = datetime('now'), updated_at = datetime('now')
     WHERE id = ?
-  `).run(task.id);
+  `, [task.id]);
 
   // Gather full context — same data MCP agents get via cavendo_get_task_context
-  const context = gatherTaskContext(task);
+  const context = await gatherTaskContext(task);
 
   // Build the prompt with full context
   const systemPrompt = agent.system_prompt || getDefaultSystemPrompt(agent);
@@ -135,7 +135,7 @@ export async function executeTask(agent, task) {
     }
 
     // Create deliverable from result with token usage tracking
-    const deliverable = createDeliverable(
+    const deliverable = await createDeliverable(
       task.id,
       agent.id,
       result.content,
@@ -146,11 +146,11 @@ export async function executeTask(agent, task) {
     );
 
     // Update task status
-    db.prepare(`
+    await db.exec(`
       UPDATE tasks
       SET status = 'review', updated_at = datetime('now')
       WHERE id = ?
-    `).run(task.id);
+    `, [task.id]);
 
     return {
       success: true,
@@ -443,61 +443,71 @@ function buildTaskPrompt(task, context) {
  * Handles revision linking: if previous deliverables exist for this task,
  * sets parent_id to the most recent one and updates its status to 'revised'.
  */
-function createDeliverable(taskId, agentId, content, title, usage, provider, model) {
+async function createDeliverable(taskId, agentId, content, title, usage, provider, model) {
   // Get project_id from the task so route dispatch works on review
-  const task = db.prepare('SELECT project_id FROM tasks WHERE id = ?').get(taskId);
+  const task = await db.one('SELECT project_id FROM tasks WHERE id = ?', [taskId]);
   const projectId = task?.project_id || null;
 
   // Insert with version retry (Issue #15: prevents duplicate versions)
-  let deliverableId;
-  let finalVersion;
+  const MAX_VERSION_RETRIES = 3;
+  let insertResult;
 
-  const insertResult = insertDeliverableWithRetry(db, () => {
-    // Re-read version inside transaction for atomicity
-    const existing = db.prepare(`
-      SELECT id, version FROM deliverables WHERE task_id = ? ORDER BY version DESC LIMIT 1
-    `).get(taskId);
+  for (let attempt = 1; attempt <= MAX_VERSION_RETRIES; attempt++) {
+    try {
+      insertResult = await db.tx(async (tx) => {
+        // Re-read version inside transaction for atomicity
+        const existing = await tx.one(`
+          SELECT id, version FROM deliverables WHERE task_id = ? ORDER BY version DESC LIMIT 1
+        `, [taskId]);
 
-    const version = (existing?.version || 0) + 1;
-    const parentId = existing?.id || null;
+        const version = (existing?.version || 0) + 1;
+        const parentId = existing?.id || null;
 
-    const result = db.prepare(`
-      INSERT INTO deliverables (
-        task_id, project_id, agent_id, title, content, content_type, status, version, parent_id,
-        input_tokens, output_tokens, provider, model
-      )
-      VALUES (?, ?, ?, ?, ?, 'markdown', 'pending', ?, ?, ?, ?, ?, ?)
-    `).run(
-      taskId,
-      projectId,
-      agentId,
-      `Deliverable: ${title}`,
-      content,
-      version,
-      parentId,
-      usage?.inputTokens || null,
-      usage?.outputTokens || null,
-      provider || null,
-      model || null
-    );
+        const result = await tx.insert(`
+          INSERT INTO deliverables (
+            task_id, project_id, agent_id, title, content, content_type, status, version, parent_id,
+            input_tokens, output_tokens, provider, model
+          )
+          VALUES (?, ?, ?, ?, ?, 'markdown', 'pending', ?, ?, ?, ?, ?, ?)
+        `, [
+          taskId,
+          projectId,
+          agentId,
+          `Deliverable: ${title}`,
+          content,
+          version,
+          parentId,
+          usage?.inputTokens || null,
+          usage?.outputTokens || null,
+          provider || null,
+          model || null
+        ]);
 
-    // If this is a revision, update the parent deliverable status to 'revised'
-    if (parentId) {
-      db.prepare(`
-        UPDATE deliverables SET status = 'revised', updated_at = datetime('now') WHERE id = ?
-      `).run(parentId);
+        // If this is a revision, update the parent deliverable status to 'revised'
+        if (parentId) {
+          await tx.exec(`
+            UPDATE deliverables SET status = 'revised', updated_at = datetime('now') WHERE id = ?
+          `, [parentId]);
+        }
+
+        return { id: result.lastInsertRowid, version };
+      });
+      break; // success — exit retry loop
+    } catch (err) {
+      if (err.code === 'SQLITE_CONSTRAINT_UNIQUE' && attempt < MAX_VERSION_RETRIES) {
+        continue; // retry — transaction rolled back, re-read version
+      }
+      throw err;
     }
+  }
 
-    return { id: result.lastInsertRowid, version };
-  });
-
-  deliverableId = insertResult.id;
-  finalVersion = insertResult.version;
+  const deliverableId = insertResult.id;
+  const finalVersion = insertResult.version;
 
   // Dispatch deliverable.submitted event for delivery routes (outside transaction)
   if (projectId) {
-    const project = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(projectId);
-    const agent = db.prepare('SELECT id, name FROM agents WHERE id = ?').get(agentId);
+    const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [projectId]);
+    const agent = await db.one('SELECT id, name FROM agents WHERE id = ?', [agentId]);
 
     dispatchEvent('deliverable.submitted', {
       project: project ? { id: project.id, name: project.name } : { id: projectId },

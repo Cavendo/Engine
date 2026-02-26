@@ -1,5 +1,5 @@
 import { timingSafeEqual } from 'crypto';
-import db from '../db/connection.js';
+import db from '../db/adapter.js';
 import { hashApiKey } from '../utils/crypto.js';
 import * as response from '../utils/response.js';
 import { userAuth } from './userAuth.js';
@@ -15,7 +15,7 @@ function safeJsonParse(val, fallback) {
  * Supports both agent keys (cav_ak_...) and user keys (cav_uk_...)
  * Attaches agent object to req.agent if authenticated
  */
-export function agentAuth(req, res, next) {
+export async function agentAuth(req, res, next) {
   const apiKey = req.headers['x-agent-key'];
 
   if (!apiKey) {
@@ -38,8 +38,8 @@ export function agentAuth(req, res, next) {
  * Authenticate using a user key (cav_uk_...)
  * The user becomes the "agent" for MCP purposes
  */
-function authenticateUserKey(keyHash, req, res, next) {
-  const userKey = db.prepare(`
+async function authenticateUserKey(keyHash, req, res, next) {
+  const userKey = await db.one(`
     SELECT
       uk.id as key_id,
       uk.key_hash,
@@ -51,7 +51,7 @@ function authenticateUserKey(keyHash, req, res, next) {
     FROM user_keys uk
     JOIN users u ON u.id = uk.user_id
     WHERE uk.key_hash = ?
-  `).get(keyHash);
+  `, [keyHash]);
 
   if (!userKey) {
     return response.unauthorized(res, 'Invalid API key');
@@ -70,14 +70,16 @@ function authenticateUserKey(keyHash, req, res, next) {
   }
 
   // Update last used timestamp
-  db.prepare(`
+  await db.exec(`
     UPDATE user_keys SET last_used_at = datetime('now') WHERE id = ?
-  `).run(userKey.key_id);
+  `, [userKey.key_id]);
 
   // Find agents owned by this user (for scoping "my tasks" queries)
-  const ownedAgentIds = db.prepare(
-    'SELECT id FROM agents WHERE owner_user_id = ? AND status = \'active\''
-  ).all(userKey.user_id).map(a => a.id);
+  const ownedAgents = await db.many(
+    'SELECT id FROM agents WHERE owner_user_id = ? AND status = \'active\'',
+    [userKey.user_id]
+  );
+  const ownedAgentIds = ownedAgents.map(a => a.id);
 
   // VULN-005: Scope user keys to actual user role instead of granting wildcard
   const ROLE_SCOPES = {
@@ -120,8 +122,8 @@ function authenticateUserKey(keyHash, req, res, next) {
  * Authenticate using an agent key (cav_ak_...)
  * Also resolves owner user if agent is linked to a user
  */
-function authenticateAgentKey(keyHash, req, res, next) {
-  const agentKey = db.prepare(`
+async function authenticateAgentKey(keyHash, req, res, next) {
+  const agentKey = await db.one(`
     SELECT
       ak.id as key_id,
       ak.key_hash,
@@ -142,7 +144,7 @@ function authenticateAgentKey(keyHash, req, res, next) {
     JOIN agents a ON a.id = ak.agent_id
     LEFT JOIN users u ON u.id = a.owner_user_id
     WHERE ak.key_hash = ?
-  `).get(keyHash);
+  `, [keyHash]);
 
   if (!agentKey) {
     return response.unauthorized(res, 'Invalid API key');
@@ -172,9 +174,9 @@ function authenticateAgentKey(keyHash, req, res, next) {
   }
 
   // Update last used timestamp
-  db.prepare(`
+  await db.exec(`
     UPDATE agent_keys SET last_used_at = datetime('now') WHERE id = ?
-  `).run(agentKey.key_id);
+  `, [agentKey.key_id]);
 
   // Parse JSON fields
   const scopes = safeJsonParse(agentKey.scopes, []);
@@ -237,22 +239,20 @@ export function logAgentActivity(action, getResourceInfo) {
         // and agent_activity.agent_id is NOT NULL in the schema.
         // User activity is already tracked via user_keys.last_used_at.
         if (req.agent && req.agent.id && res.statusCode < 400) {
-          try {
-            const resourceInfo = getResourceInfo ? getResourceInfo(req, data) : {};
-            db.prepare(`
-              INSERT INTO agent_activity (agent_id, action, resource_type, resource_id, details, ip_address)
-              VALUES (?, ?, ?, ?, ?, ?)
-            `).run(
-              req.agent.id,
-              action,
-              resourceInfo.type || null,
-              resourceInfo.id || null,
-              JSON.stringify(resourceInfo.details || {}),
-              req.ip
-            );
-          } catch (err) {
+          const resourceInfo = getResourceInfo ? getResourceInfo(req, data) : {};
+          db.exec(`
+            INSERT INTO agent_activity (agent_id, action, resource_type, resource_id, details, ip_address)
+            VALUES (?, ?, ?, ?, ?, ?)
+          `, [
+            req.agent.id,
+            action,
+            resourceInfo.type || null,
+            resourceInfo.id || null,
+            JSON.stringify(resourceInfo.details || {}),
+            req.ip
+          ]).catch(err => {
             console.error('Failed to log agent activity:', err);
-          }
+          });
         }
       });
 

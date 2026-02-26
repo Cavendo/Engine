@@ -9,7 +9,7 @@
  * - Agent keys (cav_ak_): only tasks assigned to them and related resources
  */
 
-import db from '../db/connection.js';
+import db from '../db/adapter.js';
 
 /**
  * Check if the current request has access to a task.
@@ -17,7 +17,7 @@ import db from '../db/connection.js';
  * @param {number} taskId - The task ID to check
  * @returns {{ allowed: boolean, reason?: string }}
  */
-export function canAccessTask(req, taskId) {
+export async function canAccessTask(req, taskId) {
   // Session users always have read access
   if (req.user) return { allowed: true };
 
@@ -26,14 +26,14 @@ export function canAccessTask(req, taskId) {
 
   // Agent keys: must be assigned to this task
   if (req.agent?.id) {
-    const task = db.prepare('SELECT assigned_agent_id FROM tasks WHERE id = ?').get(taskId);
+    const task = await db.one('SELECT assigned_agent_id FROM tasks WHERE id = ?', [taskId]);
     if (!task) return { allowed: false, reason: 'not_found' };
 
     if (task.assigned_agent_id === req.agent.id) return { allowed: true };
 
     // Check delegated access (agent owned by same user)
     if (req.agent.ownerUserId && task.assigned_agent_id) {
-      const assignedAgent = db.prepare('SELECT owner_user_id FROM agents WHERE id = ?').get(task.assigned_agent_id);
+      const assignedAgent = await db.one('SELECT owner_user_id FROM agents WHERE id = ?', [task.assigned_agent_id]);
       if (assignedAgent && assignedAgent.owner_user_id === req.agent.ownerUserId) {
         return { allowed: true };
       }
@@ -51,7 +51,7 @@ export function canAccessTask(req, taskId) {
  * @param {number} deliverableId - The deliverable ID to check
  * @returns {{ allowed: boolean, reason?: string }}
  */
-export function canAccessDeliverable(req, deliverableId) {
+export async function canAccessDeliverable(req, deliverableId) {
   // Session users always have read access
   if (req.user) return { allowed: true };
 
@@ -60,12 +60,12 @@ export function canAccessDeliverable(req, deliverableId) {
 
   // Agent keys: must have submitted it OR it must be for a task assigned to them
   if (req.agent?.id) {
-    const deliverable = db.prepare(`
+    const deliverable = await db.one(`
       SELECT d.agent_id, d.task_id, t.assigned_agent_id
       FROM deliverables d
       LEFT JOIN tasks t ON t.id = d.task_id
       WHERE d.id = ?
-    `).get(deliverableId);
+    `, [deliverableId]);
 
     if (!deliverable) return { allowed: false, reason: 'not_found' };
 
@@ -82,7 +82,7 @@ export function canAccessDeliverable(req, deliverableId) {
       if (deliverable.assigned_agent_id) agentIds.push(deliverable.assigned_agent_id);
 
       for (const agentId of agentIds) {
-        const agent = db.prepare('SELECT owner_user_id FROM agents WHERE id = ?').get(agentId);
+        const agent = await db.one('SELECT owner_user_id FROM agents WHERE id = ?', [agentId]);
         if (agent && agent.owner_user_id === req.agent.ownerUserId) {
           return { allowed: true };
         }

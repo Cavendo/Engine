@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { randomUUID } from 'crypto';
-import db from '../db/connection.js';
+import db from '../db/adapter.js';
 import * as response from '../utils/response.js';
 import { userAuth, requireRoles } from '../middleware/userAuth.js';
 import { agentAuth, dualAuth, logAgentActivity } from '../middleware/agentAuth.js';
@@ -135,7 +135,7 @@ async function saveFile(filename, content, deliverableId) {
  * GET /api/deliverables
  * List all deliverables with filtering
  */
-router.get('/', userAuth, (req, res) => {
+router.get('/', userAuth, async (req, res) => {
   try {
     const { status, taskId, agentId, projectId } = req.query;
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
@@ -173,7 +173,7 @@ router.get('/', userAuth, (req, res) => {
     query += ' ORDER BY d.created_at DESC LIMIT ? OFFSET ?';
     params.push(limit, offset);
 
-    const deliverables = db.prepare(query).all(...params);
+    const deliverables = await db.many(query, params);
 
     const parsed = deliverables.map(d => ({
       ...normalizeTimestamps(d),
@@ -193,9 +193,9 @@ router.get('/', userAuth, (req, res) => {
  * GET /api/deliverables/pending
  * List deliverables pending review
  */
-router.get('/pending', userAuth, (req, res) => {
+router.get('/pending', userAuth, async (req, res) => {
   try {
-    const deliverables = db.prepare(`
+    const deliverables = await db.many(`
       SELECT
         d.*,
         t.title as task_title,
@@ -209,7 +209,7 @@ router.get('/pending', userAuth, (req, res) => {
       LEFT JOIN agents a ON a.id = d.agent_id
       WHERE d.status = 'pending'
       ORDER BY d.created_at ASC
-    `).all();
+    `);
 
     const parsed = deliverables.map(d => ({
       ...normalizeTimestamps(d),
@@ -232,7 +232,7 @@ router.get('/pending', userAuth, (req, res) => {
  * - For agent keys: returns deliverables where agent_id matches
  * - For user keys: returns deliverables from agents owned by this user
  */
-router.get('/mine', agentAuth, (req, res) => {
+router.get('/mine', agentAuth, async (req, res) => {
   try {
     const { status } = req.query;
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 50));
@@ -285,7 +285,7 @@ router.get('/mine', agentAuth, (req, res) => {
     query += ' ORDER BY d.created_at DESC LIMIT ? OFFSET ?';
     params.push(limit, offset);
 
-    const deliverables = db.prepare(query).all(...params);
+    const deliverables = await db.many(query, params);
 
     const parsed = deliverables.map(d => ({
       ...normalizeTimestamps(d),
@@ -306,17 +306,17 @@ router.get('/mine', agentAuth, (req, res) => {
  * Get deliverable details
  * Supports both user auth (session/user keys) and agent auth (agent keys)
  */
-router.get('/:id', dualAuth, (req, res) => {
+router.get('/:id', dualAuth, async (req, res) => {
   try {
     // Authorization check
-    const access = canAccessDeliverable(req, req.params.id);
+    const access = await canAccessDeliverable(req, req.params.id);
     if (!access.allowed) {
       return access.reason === 'not_found'
         ? response.notFound(res, 'Deliverable')
         : response.forbidden(res, 'Access denied');
     }
 
-    const deliverable = db.prepare(`
+    const deliverable = await db.one(`
       SELECT
         d.*,
         t.title as task_title,
@@ -330,7 +330,7 @@ router.get('/:id', dualAuth, (req, res) => {
       LEFT JOIN projects p2 ON p2.id = t.project_id
       LEFT JOIN agents a ON a.id = d.agent_id
       WHERE d.id = ?
-    `).get(req.params.id);
+    `, [req.params.id]);
 
     if (!deliverable) {
       return response.notFound(res, 'Deliverable');
@@ -339,12 +339,13 @@ router.get('/:id', dualAuth, (req, res) => {
     // Get version history (for task-linked deliverables)
     let versions = [];
     if (deliverable.task_id) {
-      versions = db.prepare(`
+      const rawVersions = await db.many(`
         SELECT id, version, status, created_at, reviewed_at
         FROM deliverables
         WHERE task_id = ?
         ORDER BY version DESC
-      `).all(deliverable.task_id).map(v => ({
+      `, [deliverable.task_id]);
+      versions = rawVersions.map(v => ({
         ...v,
         created_at: toISOTimestamp(v.created_at),
         reviewed_at: toISOTimestamp(v.reviewed_at)
@@ -369,13 +370,13 @@ router.get('/:id', dualAuth, (req, res) => {
  * GET /api/deliverables/:id/feedback
  * Get feedback for a deliverable (for revisions)
  */
-router.get('/:id/feedback', dualAuth, (req, res) => {
+router.get('/:id/feedback', dualAuth, async (req, res) => {
   try {
-    const deliverable = db.prepare(`
+    const deliverable = await db.one(`
       SELECT id, task_id, agent_id, status, feedback, reviewed_by, reviewed_at
       FROM deliverables
       WHERE id = ?
-    `).get(req.params.id);
+    `, [req.params.id]);
 
     if (!deliverable) {
       return response.notFound(res, 'Deliverable');
@@ -416,14 +417,14 @@ router.get('/:id/feedback', dualAuth, (req, res) => {
  * Review a deliverable (approve/revise/reject)
  * Works for both task-linked and standalone deliverables
  */
-router.patch('/:id/review', userAuth, requireRoles('admin', 'reviewer'), validateBody(reviewDeliverableSchema), (req, res) => {
+router.patch('/:id/review', userAuth, requireRoles('admin', 'reviewer'), validateBody(reviewDeliverableSchema), async (req, res) => {
   try {
-    const deliverable = db.prepare(`
+    const deliverable = await db.one(`
       SELECT d.*, t.assigned_agent_id
       FROM deliverables d
       LEFT JOIN tasks t ON t.id = d.task_id
       WHERE d.id = ?
-    `).get(req.params.id);
+    `, [req.params.id]);
 
     if (!deliverable) {
       return response.notFound(res, 'Deliverable');
@@ -435,11 +436,11 @@ router.patch('/:id/review', userAuth, requireRoles('admin', 'reviewer'), validat
 
     const { decision, feedback } = req.body;
 
-    db.prepare(`
+    await db.exec(`
       UPDATE deliverables
       SET status = ?, feedback = ?, reviewed_by = ?, reviewed_at = datetime('now'), updated_at = datetime('now')
       WHERE id = ?
-    `).run(decision, feedback || null, req.user.email, req.params.id);
+    `, [decision, feedback || null, req.user.email, req.params.id]);
 
     // Log activity
     logActivity('deliverable', parseInt(req.params.id), 'status_changed', req.user.name || req.user.email, { from: 'pending', to: decision });
@@ -450,11 +451,11 @@ router.patch('/:id/review', userAuth, requireRoles('admin', 'reviewer'), validat
     // Update task status based on review decision
     if (deliverable.task_id) {
       if (decision === 'approved') {
-        db.prepare(`
+        await db.exec(`
           UPDATE tasks
           SET status = 'completed', completed_at = datetime('now'), updated_at = datetime('now')
           WHERE id = ?
-        `).run(deliverable.task_id);
+        `, [deliverable.task_id]);
 
         // Log task completion in activity trail
         logActivity('task', deliverable.task_id, 'completed', req.user.name || req.user.email, {
@@ -463,21 +464,21 @@ router.patch('/:id/review', userAuth, requireRoles('admin', 'reviewer'), validat
         });
       } else if (decision === 'revision_requested') {
         // Reset task to assigned so agent/dispatcher can re-execute
-        db.prepare(`
+        await db.exec(`
           UPDATE tasks
           SET status = 'assigned', updated_at = datetime('now')
           WHERE id = ?
-        `).run(deliverable.task_id);
+        `, [deliverable.task_id]);
       } else if (decision === 'rejected') {
-        db.prepare(`
+        await db.exec(`
           UPDATE tasks
           SET status = 'assigned', updated_at = datetime('now')
           WHERE id = ?
-        `).run(deliverable.task_id);
+        `, [deliverable.task_id]);
       }
     }
 
-    const updated = db.prepare('SELECT * FROM deliverables WHERE id = ?').get(req.params.id);
+    const updated = await db.one('SELECT * FROM deliverables WHERE id = ?', [req.params.id]);
 
     // Trigger webhook (use agent_id from deliverable if no task assignment)
     const webhookAgentId = deliverable.assigned_agent_id || deliverable.agent_id;
@@ -498,13 +499,13 @@ router.patch('/:id/review', userAuth, requireRoles('admin', 'reviewer'), validat
     // Resolve project_id: check deliverable first, then fall back to task's project_id
     let projectId = updated.project_id || deliverable.project_id;
     if (!projectId && deliverable.task_id) {
-      const linkedTask = db.prepare('SELECT project_id FROM tasks WHERE id = ?').get(deliverable.task_id);
+      const linkedTask = await db.one('SELECT project_id FROM tasks WHERE id = ?', [deliverable.task_id]);
       projectId = linkedTask?.project_id || null;
     }
     if (projectId) {
-      const project = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(projectId);
+      const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [projectId]);
       const agent = deliverable.agent_id
-        ? db.prepare('SELECT id, name FROM agents WHERE id = ?').get(deliverable.agent_id)
+        ? await db.one('SELECT id, name FROM agents WHERE id = ?', [deliverable.agent_id])
         : null;
 
       const eventData = {
@@ -538,7 +539,7 @@ router.patch('/:id/review', userAuth, requireRoles('admin', 'reviewer'), validat
 
       // Fire task.completed and task.status_changed events when approval completes a task
       if (decision === 'approved' && deliverable.task_id) {
-        const completedTask = db.prepare('SELECT * FROM tasks WHERE id = ?').get(deliverable.task_id);
+        const completedTask = await db.one('SELECT * FROM tasks WHERE id = ?', [deliverable.task_id]);
         if (completedTask) {
           const taskPayload = {
             id: completedTask.id,
@@ -602,7 +603,7 @@ router.post('/', agentAuth, validateBody(submitDeliverableSchema), logAgentActiv
 
     // If taskId provided, verify task exists and agent is assigned
     if (taskId) {
-      task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(taskId);
+      task = await db.one('SELECT * FROM tasks WHERE id = ?', [taskId]);
       if (!task) {
         return response.notFound(res, 'Task');
       }
@@ -615,7 +616,7 @@ router.post('/', agentAuth, validateBody(submitDeliverableSchema), logAgentActiv
         }
       } else if (req.agent.isUserKey && task.assigned_agent_id) {
         // User key: check if task is assigned to an agent linked to this user
-        const assignedAgent = db.prepare('SELECT owner_user_id FROM agents WHERE id = ?').get(task.assigned_agent_id);
+        const assignedAgent = await db.one('SELECT owner_user_id FROM agents WHERE id = ?', [task.assigned_agent_id]);
         if (assignedAgent && assignedAgent.owner_user_id !== req.agent.userId) {
           return response.forbidden(res, 'Task not assigned to your agent');
         }
@@ -624,25 +625,25 @@ router.post('/', agentAuth, validateBody(submitDeliverableSchema), logAgentActiv
       resolvedProjectId = task.project_id;
 
       // Get current version number for this task
-      const lastVersion = db.prepare(`
+      const lastVersion = await db.one(`
         SELECT MAX(version) as max_version FROM deliverables WHERE task_id = ?
-      `).get(taskId);
+      `, [taskId]);
       version = (lastVersion?.max_version || 0) + 1;
 
       // Find parent deliverable if this is a revision
       if (version > 1) {
-        const parent = db.prepare(`
+        const parent = await db.one(`
           SELECT id FROM deliverables WHERE task_id = ? AND version = ?
-        `).get(taskId, version - 1);
+        `, [taskId, version - 1]);
         parentId = parent?.id;
       }
     } else if (projectId) {
       // Standalone deliverable - resolve project
       let project;
       if (typeof projectId === 'number' || /^\d+$/.test(projectId)) {
-        project = db.prepare('SELECT id FROM projects WHERE id = ?').get(parseInt(projectId));
+        project = await db.one('SELECT id FROM projects WHERE id = ?', [parseInt(projectId)]);
       } else {
-        project = db.prepare('SELECT id FROM projects WHERE name = ? COLLATE NOCASE').get(projectId);
+        project = await db.one('SELECT id FROM projects WHERE LOWER(name) = LOWER(?)', [projectId]);
       }
       if (project) {
         resolvedProjectId = project.id;
@@ -687,31 +688,31 @@ router.post('/', agentAuth, validateBody(submitDeliverableSchema), logAgentActiv
     // Insert deliverable with version retry (Issue #15: prevents duplicate versions)
     let deliverableId;
     try {
-      const insertResult = insertDeliverableWithRetry(db, () => {
+      const insertResult = await insertDeliverableWithRetry(db, async (tx) => {
         // Re-read version inside transaction for atomicity
         let txVersion = version;
         let txParentId = parentId;
         if (taskId) {
-          const lastVersion = db.prepare(`
+          const lastVersion = await tx.one(`
             SELECT MAX(version) as max_version FROM deliverables WHERE task_id = ?
-          `).get(taskId);
+          `, [taskId]);
           txVersion = (lastVersion?.max_version || 0) + 1;
           if (txVersion > 1) {
-            const parent = db.prepare(`
+            const parent = await tx.one(`
               SELECT id FROM deliverables WHERE task_id = ? AND version = ?
-            `).get(taskId, txVersion - 1);
+            `, [taskId, txVersion - 1]);
             txParentId = parent?.id || null;
           }
         }
 
-        const result = db.prepare(`
+        const result = await tx.insert(`
           INSERT INTO deliverables (
             task_id, project_id, agent_id, submitted_by_user_id, title, summary, content, content_type,
             version, parent_id, files, actions, metadata,
             input_tokens, output_tokens, provider, model
           )
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(
+        `, [
           taskId || null,
           resolvedProjectId,
           req.agent.id || null,
@@ -729,13 +730,13 @@ router.post('/', agentAuth, validateBody(submitDeliverableSchema), logAgentActiv
           outputTokens || null,
           provider || null,
           model || null
-        );
+        ]);
 
         // Update task status to review (if task-linked)
         if (taskId) {
-          db.prepare(`
+          await tx.exec(`
             UPDATE tasks SET status = 'review', updated_at = datetime('now') WHERE id = ?
-          `).run(taskId);
+          `, [taskId]);
         }
 
         return result.lastInsertRowid;
@@ -753,7 +754,7 @@ router.post('/', agentAuth, validateBody(submitDeliverableSchema), logAgentActiv
 
     // Log activity (outside transaction — safe to fail independently)
     const submitActorName = req.agent.id
-      ? (db.prepare('SELECT name FROM agents WHERE id = ?').get(req.agent.id)?.name || 'agent')
+      ? ((await db.one('SELECT name FROM agents WHERE id = ?', [req.agent.id]))?.name || 'agent')
       : 'user';
     logActivity('deliverable', Number(deliverableId), 'created', submitActorName, { title, source: submitActorName });
 
@@ -770,18 +771,18 @@ router.post('/', agentAuth, validateBody(submitDeliverableSchema), logAgentActiv
       }
 
       // Update deliverable with file references
-      db.prepare(`
+      await db.exec(`
         UPDATE deliverables SET files = ?, updated_at = datetime('now') WHERE id = ?
-      `).run(JSON.stringify(savedFiles), deliverableId);
+      `, [JSON.stringify(savedFiles), deliverableId]);
     }
 
-    const deliverable = db.prepare('SELECT * FROM deliverables WHERE id = ?').get(deliverableId);
+    const deliverable = await db.one('SELECT * FROM deliverables WHERE id = ?', [deliverableId]);
 
     // Dispatch to delivery routes
     if (resolvedProjectId) {
-      const project = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(resolvedProjectId);
+      const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [resolvedProjectId]);
       const agentInfo = req.agent.id
-        ? db.prepare('SELECT id, name FROM agents WHERE id = ?').get(req.agent.id)
+        ? await db.one('SELECT id, name FROM agents WHERE id = ?', [req.agent.id])
         : null;
 
       dispatchEvent('deliverable.submitted', {
@@ -825,12 +826,12 @@ router.post('/:id/revision', agentAuth, validateBody(submitRevisionSchema), logA
 })), async (req, res) => {
   try {
     // Get the parent deliverable
-    const parent = db.prepare(`
+    const parent = await db.one(`
       SELECT d.*, t.assigned_agent_id
       FROM deliverables d
       JOIN tasks t ON t.id = d.task_id
       WHERE d.id = ?
-    `).get(req.params.id);
+    `, [req.params.id]);
 
     if (!parent) {
       return response.notFound(res, 'Deliverable');
@@ -879,19 +880,19 @@ router.post('/:id/revision', agentAuth, validateBody(submitRevisionSchema), logA
     // Insert revision with version retry (Issue #15: use MAX(version) instead of parent.version + 1)
     let deliverableId;
     try {
-      const insertResult = insertDeliverableWithRetry(db, () => {
+      const insertResult = await insertDeliverableWithRetry(db, async (tx) => {
         // Re-read max version inside transaction for atomicity
-        const lastVersion = db.prepare(`
+        const lastVersion = await tx.one(`
           SELECT MAX(version) as max_version FROM deliverables WHERE task_id = ?
-        `).get(parent.task_id);
+        `, [parent.task_id]);
         const txVersion = (lastVersion?.max_version || 0) + 1;
 
-        const result = db.prepare(`
+        const result = await tx.insert(`
           INSERT INTO deliverables (
             task_id, agent_id, submitted_by_user_id, title, summary, content, content_type, version, parent_id, files, actions, metadata
           )
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(
+        `, [
           parent.task_id,
           req.agent.id,
           submittedByUserId,
@@ -904,12 +905,12 @@ router.post('/:id/revision', agentAuth, validateBody(submitRevisionSchema), logA
           '[]', // Placeholder for files, will update after saving
           JSON.stringify(finalActions),
           JSON.stringify(metadata || safeJsonParse(parent.metadata, {}))
-        );
+        ]);
 
         // Update parent deliverable status to 'revised'
-        db.prepare(`
+        await tx.exec(`
           UPDATE deliverables SET status = 'revised', updated_at = datetime('now') WHERE id = ?
-        `).run(parent.id);
+        `, [parent.id]);
 
         return result.lastInsertRowid;
       });
@@ -926,7 +927,7 @@ router.post('/:id/revision', agentAuth, validateBody(submitRevisionSchema), logA
 
     // Log activity (outside transaction)
     const revisionActorName = req.agent.id
-      ? (db.prepare('SELECT name FROM agents WHERE id = ?').get(req.agent.id)?.name || 'agent')
+      ? ((await db.one('SELECT name FROM agents WHERE id = ?', [req.agent.id]))?.name || 'agent')
       : 'user';
     logActivity('deliverable', Number(deliverableId), 'created', revisionActorName, { title: title || parent.title, source: revisionActorName, revision_of: parent.id });
 
@@ -943,18 +944,18 @@ router.post('/:id/revision', agentAuth, validateBody(submitRevisionSchema), logA
       }
 
       // Update deliverable with file references
-      db.prepare(`
+      await db.exec(`
         UPDATE deliverables SET files = ?, updated_at = datetime('now') WHERE id = ?
-      `).run(JSON.stringify(savedFiles), deliverableId);
+      `, [JSON.stringify(savedFiles), deliverableId]);
     }
 
-    const deliverable = db.prepare('SELECT * FROM deliverables WHERE id = ?').get(deliverableId);
+    const deliverable = await db.one('SELECT * FROM deliverables WHERE id = ?', [deliverableId]);
 
     // Dispatch deliverable.submitted event for delivery routes
     if (parent.project_id) {
-      const project = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(parent.project_id);
+      const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [parent.project_id]);
       const agentName = req.agent.id
-        ? (db.prepare('SELECT name FROM agents WHERE id = ?').get(req.agent.id)?.name || 'agent')
+        ? ((await db.one('SELECT name FROM agents WHERE id = ?', [req.agent.id]))?.name || 'agent')
         : 'user';
       dispatchEvent('deliverable.submitted', {
         project: project ? { id: project.id, name: project.name } : { id: parent.project_id },
@@ -994,27 +995,27 @@ router.post('/:id/revision', agentAuth, validateBody(submitRevisionSchema), logA
  * GET /api/deliverables/:id/activity
  * Get activity log for a deliverable
  */
-router.get('/:id/activity', dualAuth, (req, res) => {
+router.get('/:id/activity', dualAuth, async (req, res) => {
   try {
     // Authorization check
-    const access = canAccessDeliverable(req, req.params.id);
+    const access = await canAccessDeliverable(req, req.params.id);
     if (!access.allowed) {
       return access.reason === 'not_found'
         ? response.notFound(res, 'Deliverable')
         : response.forbidden(res, 'Access denied');
     }
 
-    const deliverable = db.prepare('SELECT id FROM deliverables WHERE id = ?').get(req.params.id);
+    const deliverable = await db.one('SELECT id FROM deliverables WHERE id = ?', [req.params.id]);
     if (!deliverable) {
       return response.notFound(res, 'Deliverable');
     }
 
-    const activities = db.prepare(`
+    const activities = await db.many(`
       SELECT id, event_type, actor_name, detail, created_at
       FROM activity_log
       WHERE entity_type = 'deliverable' AND entity_id = ?
       ORDER BY created_at DESC
-    `).all(req.params.id);
+    `, [req.params.id]);
 
     const parsed = activities.map(a => ({
       ...a,

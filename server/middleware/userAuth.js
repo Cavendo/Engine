@@ -1,18 +1,18 @@
-import db from '../db/connection.js';
+import db from '../db/adapter.js';
 import * as response from '../utils/response.js';
 
 /**
  * Middleware to authenticate users via session cookie
  * Attaches user object to req.user if authenticated
  */
-export function userAuth(req, res, next) {
+export async function userAuth(req, res, next) {
   const sessionId = req.cookies?.session;
 
   if (!sessionId) {
     return response.unauthorized(res, 'Session required');
   }
 
-  const session = db.prepare(`
+  const session = await db.one(`
     SELECT
       s.id as session_id,
       s.expires_at,
@@ -25,7 +25,7 @@ export function userAuth(req, res, next) {
     FROM sessions s
     JOIN users u ON u.id = s.user_id
     WHERE s.id = ?
-  `).get(sessionId);
+  `, [sessionId]);
 
   if (!session) {
     res.clearCookie('session');
@@ -35,7 +35,7 @@ export function userAuth(req, res, next) {
   // Check if session is expired
   if (new Date(session.expires_at) < new Date()) {
     // Delete expired session
-    db.prepare('DELETE FROM sessions WHERE id = ?').run(sessionId);
+    await db.exec('DELETE FROM sessions WHERE id = ?', [sessionId]);
     res.clearCookie('session');
     return response.unauthorized(res, 'Session expired');
   }
@@ -78,14 +78,14 @@ export function requireRoles(...allowedRoles) {
 /**
  * Optional user auth - doesn't fail if no session
  */
-export function optionalUserAuth(req, res, next) {
+export async function optionalUserAuth(req, res, next) {
   const sessionId = req.cookies?.session;
 
   if (!sessionId) {
     return next();
   }
 
-  const session = db.prepare(`
+  const session = await db.one(`
     SELECT
       s.id as session_id,
       s.expires_at,
@@ -98,7 +98,7 @@ export function optionalUserAuth(req, res, next) {
     FROM sessions s
     JOIN users u ON u.id = s.user_id
     WHERE s.id = ? AND u.status = 'active'
-  `).get(sessionId);
+  `, [sessionId]);
 
   if (session && new Date(session.expires_at) >= new Date()) {
     req.user = {

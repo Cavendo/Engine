@@ -13,7 +13,7 @@
  *   5. On failure, flag the task and log error details
  */
 
-import db from '../db/connection.js';
+import db from '../db/adapter.js';
 import { executeTask } from './agentExecutor.js';
 import { dispatchEvent } from './routeDispatcher.js';
 import {
@@ -32,12 +32,12 @@ let isRunning = false;
 /**
  * Log to agent_activity table
  */
-function logAgentActivity(agentId, action, resourceType, resourceId, details) {
+async function logAgentActivity(agentId, action, resourceType, resourceId, details) {
   try {
-    db.prepare(`
+    await db.exec(`
       INSERT INTO agent_activity (agent_id, action, resource_type, resource_id, details)
       VALUES (?, ?, ?, ?, ?)
-    `).run(agentId, action, resourceType, resourceId, JSON.stringify(details));
+    `, [agentId, action, resourceType, resourceId, JSON.stringify(details)]);
   } catch (err) {
     console.error('[Dispatcher] Failed to log agent activity:', err);
   }
@@ -46,12 +46,12 @@ function logAgentActivity(agentId, action, resourceType, resourceId, details) {
 /**
  * Log to universal activity_log table
  */
-function logActivity(entityType, entityId, eventType, actorName, detail) {
+async function logActivity(entityType, entityId, eventType, actorName, detail) {
   try {
-    db.prepare(`
+    await db.exec(`
       INSERT INTO activity_log (entity_type, entity_id, event_type, actor_name, detail)
       VALUES (?, ?, ?, ?, ?)
-    `).run(entityType, entityId, eventType, actorName, JSON.stringify(detail));
+    `, [entityType, entityId, eventType, actorName, JSON.stringify(detail)]);
   } catch (err) {
     console.error('[Dispatcher] Failed to log activity:', err);
   }
@@ -60,8 +60,8 @@ function logActivity(entityType, entityId, eventType, actorName, detail) {
 /**
  * Find tasks eligible for automatic execution
  */
-function findEligibleTasks() {
-  return db.prepare(`
+async function findEligibleTasks() {
+  return await db.many(`
     SELECT
       t.id as task_id,
       t.title as task_title,
@@ -85,7 +85,7 @@ function findEligibleTasks() {
       -- due_date is a deadline, not a start schedule; do not gate auto-dispatch on it
     ORDER BY t.priority ASC, t.created_at ASC
     LIMIT ?
-  `).all(MAX_BATCH_SIZE);
+  `, [MAX_BATCH_SIZE]);
 }
 
 /**
@@ -97,26 +97,26 @@ async function dispatchTask(eligible) {
   console.log(`[Dispatcher] Executing task #${task_id} "${task_title}" via agent "${agent_name}"`);
 
   // Increment active_task_count while executing
-  incrementActiveTaskCount(agent_id);
+  await incrementActiveTaskCount(agent_id);
 
   // Log execution start
-  logAgentActivity(agent_id, 'task.execution_started', 'task', task_id, {
+  await logAgentActivity(agent_id, 'task.execution_started', 'task', task_id, {
     title: task_title,
     trigger: 'auto_dispatch'
   });
-  logActivity('task', task_id, 'execution_started', 'system', {
+  await logActivity('task', task_id, 'execution_started', 'system', {
     agentId: agent_id,
     agentName: agent_name,
     trigger: 'auto_dispatch'
   });
 
   // Load full agent and task records for the executor
-  const agent = db.prepare('SELECT * FROM agents WHERE id = ?').get(agent_id);
-  const task = db.prepare('SELECT * FROM tasks WHERE id = ?').get(task_id);
+  const agent = await db.one('SELECT * FROM agents WHERE id = ?', [agent_id]);
+  const task = await db.one('SELECT * FROM tasks WHERE id = ?', [task_id]);
 
   if (!agent || !task) {
     console.error(`[Dispatcher] Agent or task not found (agent: ${agent_id}, task: ${task_id})`);
-    decrementActiveTaskCount(agent_id);
+    await decrementActiveTaskCount(agent_id);
     return;
   }
 
@@ -124,25 +124,25 @@ async function dispatchTask(eligible) {
     const result = await executeTask(agent, task);
 
     // Decrement active_task_count — task is no longer being actively executed
-    decrementActiveTaskCount(agent_id);
+    await decrementActiveTaskCount(agent_id);
 
     if (result.success) {
       console.log(`[Dispatcher] Task #${task_id} completed successfully — deliverable #${result.deliverableId}`);
 
       // Log success
-      logAgentActivity(agent_id, 'task.execution_completed', 'task', task_id, {
+      await logAgentActivity(agent_id, 'task.execution_completed', 'task', task_id, {
         title: task_title,
         deliverableId: result.deliverableId,
         usage: result.usage
       });
-      logActivity('task', task_id, 'execution_completed', 'system', {
+      await logActivity('task', task_id, 'execution_completed', 'system', {
         agentId: agent_id,
         agentName: agent_name,
         deliverableId: result.deliverableId,
         inputTokens: result.usage?.inputTokens,
         outputTokens: result.usage?.outputTokens
       });
-      logActivity('deliverable', result.deliverableId, 'created', agent_name, {
+      await logActivity('deliverable', result.deliverableId, 'created', agent_name, {
         taskId: task_id,
         taskTitle: task_title,
         trigger: 'auto_dispatch'
@@ -151,22 +151,22 @@ async function dispatchTask(eligible) {
       console.error(`[Dispatcher] Task #${task_id} execution failed: ${result.error}`);
 
       // Log failure
-      logAgentActivity(agent_id, 'task.execution_failed', 'task', task_id, {
+      await logAgentActivity(agent_id, 'task.execution_failed', 'task', task_id, {
         title: task_title,
         error: result.error
       });
-      logActivity('task', task_id, 'execution_failed', 'system', {
+      await logActivity('task', task_id, 'execution_failed', 'system', {
         agentId: agent_id,
         agentName: agent_name,
         error: result.error
       });
 
       // Flag the task so the user can see the error
-      flagTaskError(task_id, agent_name, result.error, result.category);
+      await flagTaskError(task_id, agent_name, result.error, result.category);
 
       // Dispatch task.execution_failed event to delivery routes
       if (eligible.project_id) {
-        const project = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(eligible.project_id);
+        const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [eligible.project_id]);
         dispatchEvent('task.execution_failed', {
           project: project ? { id: project.id, name: project.name } : { id: eligible.project_id },
           projectId: eligible.project_id,
@@ -182,23 +182,23 @@ async function dispatchTask(eligible) {
     console.error(`[Dispatcher] Unexpected error executing task #${task_id}:`, err);
 
     // Decrement active_task_count on failure too
-    decrementActiveTaskCount(agent_id);
+    await decrementActiveTaskCount(agent_id);
 
-    logAgentActivity(agent_id, 'task.execution_failed', 'task', task_id, {
+    await logAgentActivity(agent_id, 'task.execution_failed', 'task', task_id, {
       title: task_title,
       error: err.message
     });
-    logActivity('task', task_id, 'execution_failed', 'system', {
+    await logActivity('task', task_id, 'execution_failed', 'system', {
       agentId: agent_id,
       agentName: agent_name,
       error: err.message
     });
 
-    flagTaskError(task_id, agent_name, err.message, err.category);
+    await flagTaskError(task_id, agent_name, err.message, err.category);
 
     // Dispatch task.execution_failed event to delivery routes
     if (eligible.project_id) {
-      const project = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(eligible.project_id);
+      const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [eligible.project_id]);
       dispatchEvent('task.execution_failed', {
         project: project ? { id: project.id, name: project.name } : { id: eligible.project_id },
         projectId: eligible.project_id,
@@ -220,19 +220,19 @@ async function dispatchTask(eligible) {
  * Stores the error in the task's context JSON and resets status to 'assigned'
  * so the dispatcher doesn't retry it in a loop.
  */
-function flagTaskError(taskId, agentName, errorMessage, errorCategory) {
+async function flagTaskError(taskId, agentName, errorMessage, errorCategory) {
   // Step 1: Always reset status — must not be silenced by context-building failures
   try {
-    db.prepare(`
+    await db.exec(`
       UPDATE tasks SET status = 'assigned', updated_at = datetime('now') WHERE id = ?
-    `).run(taskId);
+    `, [taskId]);
   } catch (err) {
     console.error(`[Dispatcher] CRITICAL: Failed to reset task #${taskId} status from in_progress:`, err);
   }
 
   // Step 2: Store error details in context — secondary, safe to fail independently
   try {
-    const task = db.prepare('SELECT context FROM tasks WHERE id = ?').get(taskId);
+    const task = await db.one('SELECT context FROM tasks WHERE id = ?', [taskId]);
     let context = {};
     try { context = JSON.parse(task?.context || '{}'); } catch { context = {}; }
 
@@ -244,9 +244,9 @@ function flagTaskError(taskId, agentName, errorMessage, errorCategory) {
       retryable: isRetryableError(errorMessage, errorCategory)
     };
 
-    db.prepare(`
+    await db.exec(`
       UPDATE tasks SET context = ?, updated_at = datetime('now') WHERE id = ?
-    `).run(JSON.stringify(context), taskId);
+    `, [JSON.stringify(context), taskId]);
   } catch (err) {
     console.error(`[Dispatcher] Failed to store error context for task #${taskId}:`, err);
   }
@@ -283,28 +283,28 @@ function isRetryableError(errorMessage, category) {
  * Reconcile active_task_count with actual in-progress tasks.
  * Fixes drift caused by server crashes or unclean shutdowns.
  */
-function reconcileTaskCounts() {
+async function reconcileTaskCounts() {
   try {
     // Fix agents with NULL max_concurrent_tasks (created before default was enforced)
-    const nullCapacity = db.prepare(`
+    const nullCapacity = await db.exec(`
       UPDATE agents SET max_concurrent_tasks = 5 WHERE max_concurrent_tasks IS NULL
-    `).run();
+    `, []);
     if (nullCapacity.changes > 0) {
       console.log(`[Dispatcher] Fixed ${nullCapacity.changes} agent(s) with NULL max_concurrent_tasks → 5`);
     }
 
-    const drifted = db.prepare(`
+    const drifted = await db.many(`
       SELECT a.id, a.name, a.active_task_count,
         (SELECT COUNT(*) FROM tasks t WHERE t.assigned_agent_id = a.id AND t.status = 'in_progress') as actual_count
       FROM agents a
       WHERE a.active_task_count != (
         SELECT COUNT(*) FROM tasks t WHERE t.assigned_agent_id = a.id AND t.status = 'in_progress'
       )
-    `).all();
+    `, []);
 
     for (const agent of drifted) {
       console.log(`[Dispatcher] Reconciling active_task_count for "${agent.name}": ${agent.active_task_count} → ${agent.actual_count}`);
-      db.prepare('UPDATE agents SET active_task_count = ? WHERE id = ?').run(agent.actual_count, agent.id);
+      await db.exec('UPDATE agents SET active_task_count = ? WHERE id = ?', [agent.actual_count, agent.id]);
     }
   } catch (err) {
     console.error('[Dispatcher] Failed to reconcile task counts:', err);
@@ -329,9 +329,9 @@ function safeJsonParse(str, defaultValue = null) {
  * Re-attempts routing rules each cycle so tasks get assigned
  * once agent capacity frees up.
  */
-function routeUnassignedTasks() {
+async function routeUnassignedTasks() {
   try {
-    const unassigned = db.prepare(`
+    const unassigned = await db.many(`
       SELECT id, title, project_id, tags, priority, context,
              required_capabilities, preferred_agent_id
       FROM tasks
@@ -340,7 +340,7 @@ function routeUnassignedTasks() {
         AND project_id IS NOT NULL
       ORDER BY priority ASC, created_at ASC
       LIMIT ?
-    `).all(MAX_BATCH_SIZE);
+    `, [MAX_BATCH_SIZE]);
 
     if (unassigned.length === 0) return;
 
@@ -354,39 +354,39 @@ function routeUnassignedTasks() {
       };
 
       // Evaluate routing rules (read-only, outside transaction)
-      const routingResult = evaluateRoutingRules(task.project_id, taskData);
+      const routingResult = await evaluateRoutingRules(task.project_id, taskData);
       if (routingResult.matched && routingResult.agentId) {
         // Reserve capacity + assign in same transaction (Issue #18)
         let assigned = false;
-        db.transaction(() => {
-          const reservation = reserveAgentCapacity(routingResult.agentId);
+        await db.tx(async (tx) => {
+          const reservation = await reserveAgentCapacity(routingResult.agentId, tx);
           if (!reservation.ok) return; // skip — agent at capacity
 
-          const updateResult = db.prepare(`
+          const updateResult = await tx.exec(`
             UPDATE tasks SET assigned_agent_id = ?, status = 'assigned',
               assigned_at = datetime('now'), updated_at = datetime('now'),
               routing_rule_id = ?, routing_decision = ?
             WHERE id = ? AND assigned_agent_id IS NULL
-          `).run(routingResult.agentId, routingResult.ruleId || null, routingResult.decision, task.id);
+          `, [routingResult.agentId, routingResult.ruleId || null, routingResult.decision, task.id]);
 
           if (updateResult.changes === 0) {
             // Someone else won the race — release reservation
-            decrementActiveTaskCount(routingResult.agentId);
+            await decrementActiveTaskCount(routingResult.agentId, tx);
           } else {
             assigned = true;
           }
-        })();
+        });
 
         if (assigned) {
           console.log(`[Dispatcher] Routed task #${task.id} "${task.title}" → agent ${routingResult.agentId}`);
 
           // Dispatch task.assigned to delivery routes (e.g., notify human agents via email)
-          const project = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(task.project_id);
-          const assignedAgent = db.prepare('SELECT id, name, execution_mode, owner_user_id FROM agents WHERE id = ?').get(routingResult.agentId);
+          const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [task.project_id]);
+          const assignedAgent = await db.one('SELECT id, name, execution_mode, owner_user_id FROM agents WHERE id = ?', [routingResult.agentId]);
           const assignee = assignedAgent ? { id: assignedAgent.id, name: assignedAgent.name, executionMode: assignedAgent.execution_mode } : { id: routingResult.agentId };
           // Enrich with email for template resolution (e.g., {{assignee.email}})
           if (assignedAgent?.owner_user_id) {
-            const ownerUser = db.prepare('SELECT email, name FROM users WHERE id = ?').get(assignedAgent.owner_user_id);
+            const ownerUser = await db.one('SELECT email, name FROM users WHERE id = ?', [assignedAgent.owner_user_id]);
             if (ownerUser) { assignee.email = ownerUser.email; assignee.userName = ownerUser.name; }
           }
           dispatchEvent('task.assigned', {
@@ -405,7 +405,7 @@ function routeUnassignedTasks() {
         if (!ctx._routingWarningLogged) {
           console.warn(`[Dispatcher] Task #${task.id} not routed — no matching rules or default agent for project #${task.project_id}. Set up routing: see docs/guides/task-routing.md`);
           ctx._routingWarningLogged = true;
-          db.prepare('UPDATE tasks SET context = ? WHERE id = ?').run(JSON.stringify(ctx), task.id);
+          await db.exec('UPDATE tasks SET context = ? WHERE id = ?', [JSON.stringify(ctx), task.id]);
         }
       }
     }
@@ -418,16 +418,16 @@ function routeUnassignedTasks() {
  * Check for overdue tasks and dispatch task.overdue events.
  * Only fires once per task per day to avoid spamming routes.
  */
-function checkOverdueTasks() {
+async function checkOverdueTasks() {
   try {
-    const overdueTasks = db.prepare(`
+    const overdueTasks = await db.many(`
       SELECT t.id, t.title, t.description, t.status, t.priority, t.due_date,
              t.project_id, t.assigned_agent_id, t.tags, t.context
       FROM tasks t
       WHERE t.due_date < datetime('now')
         AND t.status NOT IN ('completed', 'cancelled')
         AND t.project_id IS NOT NULL
-    `).all();
+    `, []);
 
     if (overdueTasks.length === 0) return;
 
@@ -444,17 +444,17 @@ function checkOverdueTasks() {
 
       // Mark as notified
       context._lastOverdueNotify = now.toISOString();
-      db.prepare('UPDATE tasks SET context = ? WHERE id = ?').run(JSON.stringify(context), task.id);
+      await db.exec('UPDATE tasks SET context = ? WHERE id = ?', [JSON.stringify(context), task.id]);
 
-      const project = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(task.project_id);
+      const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [task.project_id]);
       // Build assignee info with email for template resolution (e.g., {{assignee.email}})
       let assignee = null;
       if (task.assigned_agent_id) {
-        const agent = db.prepare('SELECT id, name, execution_mode, owner_user_id FROM agents WHERE id = ?').get(task.assigned_agent_id);
+        const agent = await db.one('SELECT id, name, execution_mode, owner_user_id FROM agents WHERE id = ?', [task.assigned_agent_id]);
         if (agent) {
           assignee = { id: agent.id, name: agent.name, executionMode: agent.execution_mode };
           if (agent.owner_user_id) {
-            const ownerUser = db.prepare('SELECT email, name FROM users WHERE id = ?').get(agent.owner_user_id);
+            const ownerUser = await db.one('SELECT email, name FROM users WHERE id = ?', [agent.owner_user_id]);
             if (ownerUser) { assignee.email = ownerUser.email; assignee.userName = ownerUser.name; }
           }
         }
@@ -500,15 +500,15 @@ async function dispatchCycle() {
   isRunning = true;
   try {
     // Fix any count drift before checking for eligible tasks
-    reconcileTaskCounts();
+    await reconcileTaskCounts();
 
     // Re-attempt routing for unassigned tasks
-    routeUnassignedTasks();
+    await routeUnassignedTasks();
 
     // Check for overdue tasks
-    checkOverdueTasks();
+    await checkOverdueTasks();
 
-    const eligible = findEligibleTasks();
+    const eligible = await findEligibleTasks();
 
     if (eligible.length === 0) {
       return;
@@ -530,8 +530,9 @@ async function dispatchCycle() {
     };
     const DEFAULT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 
-    const tasksToRun = eligible.filter(e => {
-      const task = db.prepare('SELECT context FROM tasks WHERE id = ?').get(e.task_id);
+    const tasksToRun = [];
+    for (const e of eligible) {
+      const task = await db.one('SELECT context FROM tasks WHERE id = ?', [e.task_id]);
       let context = {};
       try { context = JSON.parse(task?.context || '{}'); } catch { context = {}; }
       if (context.lastExecutionError) {
@@ -543,12 +544,12 @@ async function dispatchCycle() {
         if (errorAge < cooldown) {
           const remainMin = Math.round((cooldown - errorAge) / 60000);
           console.log(`[Dispatcher] Skipping task #${e.task_id} — ${category} error (retry in ${remainMin}m): ${context.lastExecutionError.error}`);
-          return false;
+          continue;
         }
         console.log(`[Dispatcher] Retrying task #${e.task_id} — ${category} error cooldown expired after ${Math.round(errorAge / 60000)}m`);
       }
-      return true;
-    });
+      tasksToRun.push(e);
+    }
 
     if (tasksToRun.length === 0) {
       console.log(`[Dispatcher] All ${eligible.length} eligible task(s) skipped (previous errors)`);
@@ -600,31 +601,31 @@ export function stopDispatcher() {
  * Returns the result directly rather than going through the queue.
  */
 export async function executeTaskNow(taskId) {
-  const task = db.prepare(`
+  const task = await db.one(`
     SELECT t.*, a.name as agent_name
     FROM tasks t
     LEFT JOIN agents a ON a.id = t.assigned_agent_id
     WHERE t.id = ?
-  `).get(taskId);
+  `, [taskId]);
 
   if (!task) throw new Error('Task not found');
   if (!task.assigned_agent_id) throw new Error('Task is not assigned to an agent');
 
-  const agent = db.prepare('SELECT * FROM agents WHERE id = ?').get(task.assigned_agent_id);
+  const agent = await db.one('SELECT * FROM agents WHERE id = ?', [task.assigned_agent_id]);
   if (!agent) throw new Error('Assigned agent not found');
   if (!agent.provider || !agent.provider_api_key_encrypted) {
     throw new Error('Agent does not have task execution configured. Go to Manage > Task Execution to set up a provider.');
   }
 
   // Increment active_task_count while executing
-  incrementActiveTaskCount(agent.id);
+  await incrementActiveTaskCount(agent.id);
 
   // Log start
-  logAgentActivity(agent.id, 'task.execution_started', 'task', taskId, {
+  await logAgentActivity(agent.id, 'task.execution_started', 'task', taskId, {
     title: task.title,
     trigger: 'manual'
   });
-  logActivity('task', taskId, 'execution_started', 'system', {
+  await logActivity('task', taskId, 'execution_started', 'system', {
     agentId: agent.id,
     agentName: agent.name,
     trigger: 'manual'
@@ -634,48 +635,48 @@ export async function executeTaskNow(taskId) {
   try {
     result = await executeTask(agent, task);
   } catch (err) {
-    decrementActiveTaskCount(agent.id);
+    await decrementActiveTaskCount(agent.id);
     throw err;
   }
 
   // Decrement active_task_count — execution finished
-  decrementActiveTaskCount(agent.id);
+  await decrementActiveTaskCount(agent.id);
 
   if (result.success) {
-    logAgentActivity(agent.id, 'task.execution_completed', 'task', taskId, {
+    await logAgentActivity(agent.id, 'task.execution_completed', 'task', taskId, {
       title: task.title,
       deliverableId: result.deliverableId,
       usage: result.usage
     });
-    logActivity('task', taskId, 'execution_completed', 'system', {
+    await logActivity('task', taskId, 'execution_completed', 'system', {
       agentId: agent.id,
       agentName: agent.name,
       deliverableId: result.deliverableId,
       inputTokens: result.usage?.inputTokens,
       outputTokens: result.usage?.outputTokens
     });
-    logActivity('deliverable', result.deliverableId, 'created', agent.name, {
+    await logActivity('deliverable', result.deliverableId, 'created', agent.name, {
       taskId: taskId,
       taskTitle: task.title,
       trigger: 'manual'
     });
   } else {
-    logAgentActivity(agent.id, 'task.execution_failed', 'task', taskId, {
+    await logAgentActivity(agent.id, 'task.execution_failed', 'task', taskId, {
       title: task.title,
       error: result.error
     });
-    logActivity('task', taskId, 'execution_failed', 'system', {
+    await logActivity('task', taskId, 'execution_failed', 'system', {
       agentId: agent.id,
       agentName: agent.name,
       error: result.error
     });
 
     // Flag the task so it doesn't stay stuck at in_progress
-    flagTaskError(taskId, agent.name, result.error, result.category);
+    await flagTaskError(taskId, agent.name, result.error, result.category);
 
     // Dispatch task.execution_failed event to delivery routes
     if (task.project_id) {
-      const project = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(task.project_id);
+      const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [task.project_id]);
       dispatchEvent('task.execution_failed', {
         project: project ? { id: project.id, name: project.name } : { id: task.project_id },
         projectId: task.project_id,
@@ -694,8 +695,8 @@ export async function executeTaskNow(taskId) {
 /**
  * Get dispatcher status (for health checks / UI)
  */
-export function getDispatcherStatus() {
-  const pendingAutoTasks = db.prepare(`
+export async function getDispatcherStatus() {
+  const pendingAutoTasks = await db.one(`
     SELECT COUNT(*) as count
     FROM tasks t
     JOIN agents a ON a.id = t.assigned_agent_id
@@ -704,28 +705,28 @@ export function getDispatcherStatus() {
       AND a.status = 'active'
       AND a.provider IS NOT NULL
       AND a.provider_api_key_encrypted IS NOT NULL
-  `).get();
+  `, []);
 
-  const recentExecutions = db.prepare(`
+  const recentExecutions = await db.one(`
     SELECT COUNT(*) as count
     FROM activity_log
     WHERE event_type IN ('execution_started', 'execution_completed', 'execution_failed')
       AND created_at >= datetime('now', '-1 hour')
-  `).get();
+  `, []);
 
-  const unroutedTasks = db.prepare(`
+  const unroutedTasks = await db.one(`
     SELECT COUNT(*) as count FROM tasks
     WHERE status = 'pending' AND assigned_agent_id IS NULL AND project_id IS NOT NULL
-  `).get();
+  `, []);
 
-  const recentErrors = db.prepare(`
+  const recentErrors = await db.many(`
     SELECT al.entity_id as task_id, al.detail, al.created_at
     FROM activity_log al
     WHERE al.event_type = 'execution_failed'
       AND al.created_at >= datetime('now', '-24 hours')
     ORDER BY al.created_at DESC
     LIMIT 10
-  `).all();
+  `, []);
 
   return {
     running: !!intervalHandle,

@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import db from '../db/connection.js';
+import db from '../db/adapter.js';
 import * as response from '../utils/response.js';
 import { userAuth } from '../middleware/userAuth.js';
 
@@ -58,7 +58,7 @@ function normalizeStatsTimestamps(stats) {
  * GET /api/activity
  * List agent activity with filtering
  */
-router.get('/', userAuth, (req, res) => {
+router.get('/', userAuth, async (req, res) => {
   try {
     const { agentId, action, resourceType, period } = req.query;
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
@@ -102,7 +102,7 @@ router.get('/', userAuth, (req, res) => {
     query += ' ORDER BY aa.created_at DESC LIMIT ? OFFSET ?';
     params.push(limit, offset);
 
-    const activities = db.prepare(query).all(...params);
+    const activities = await db.many(query, params);
 
     const parsed = activities.map(a => normalizeActivityTimestamps({
       ...a,
@@ -120,7 +120,7 @@ router.get('/', userAuth, (req, res) => {
  * GET /api/activity/stats
  * Get activity statistics
  */
-router.get('/stats', userAuth, (req, res) => {
+router.get('/stats', userAuth, async (req, res) => {
   try {
     const { agentId, period = '7d' } = req.query;
 
@@ -147,19 +147,20 @@ router.get('/stats', userAuth, (req, res) => {
     }
 
     // Total actions
-    const totalActions = db.prepare(`
+    const totalRow = await db.one(`
       SELECT COUNT(*) as count ${baseQuery}
-    `).get(...baseParams).count;
+    `, baseParams);
+    const totalActions = totalRow.count;
 
     // Actions by type
-    const actionsByType = db.prepare(`
+    const actionsByType = await db.many(`
       SELECT action, COUNT(*) as count ${baseQuery}
       GROUP BY action
       ORDER BY count DESC
-    `).all(...baseParams);
+    `, baseParams);
 
     // Actions by agent
-    const actionsByAgent = db.prepare(`
+    const actionsByAgent = await db.many(`
       SELECT
         a.id as agent_id,
         a.name as agent_name,
@@ -169,17 +170,17 @@ router.get('/stats', userAuth, (req, res) => {
       ${agentId ? 'WHERE a.id = ?' : ''}
       GROUP BY a.id
       ORDER BY count DESC
-    `).all(since, ...(agentId ? [parseInt(agentId)] : []));
+    `, [since, ...(agentId ? [parseInt(agentId)] : [])]);
 
     // Actions over time (by day)
-    const actionsOverTime = db.prepare(`
+    const actionsOverTime = await db.many(`
       SELECT
         date(created_at) as date,
         COUNT(*) as count
       ${baseQuery}
       GROUP BY date(created_at)
       ORDER BY date ASC
-    `).all(...baseParams);
+    `, baseParams);
 
     response.success(res, {
       period,
@@ -198,9 +199,9 @@ router.get('/stats', userAuth, (req, res) => {
  * GET /api/activity/agents/:id
  * Get activity for a specific agent
  */
-router.get('/agents/:id', userAuth, (req, res) => {
+router.get('/agents/:id', userAuth, async (req, res) => {
   try {
-    const agent = db.prepare('SELECT id, name FROM agents WHERE id = ?').get(req.params.id);
+    const agent = await db.one('SELECT id, name FROM agents WHERE id = ?', [req.params.id]);
     if (!agent) {
       return response.notFound(res, 'Agent');
     }
@@ -208,12 +209,12 @@ router.get('/agents/:id', userAuth, (req, res) => {
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 50));
     const offset = Math.max(0, parseInt(req.query.offset) || 0);
 
-    const activities = db.prepare(`
+    const activities = await db.many(`
       SELECT * FROM agent_activity
       WHERE agent_id = ?
       ORDER BY created_at DESC
       LIMIT ? OFFSET ?
-    `).all(req.params.id, limit, offset);
+    `, [req.params.id, limit, offset]);
 
     const parsed = activities.map(a => normalizeActivityTimestamps({
       ...a,
@@ -221,7 +222,7 @@ router.get('/agents/:id', userAuth, (req, res) => {
     }));
 
     // Get summary stats
-    const stats = db.prepare(`
+    const stats = await db.one(`
       SELECT
         COUNT(*) as total_actions,
         COUNT(DISTINCT action) as unique_actions,
@@ -229,7 +230,7 @@ router.get('/agents/:id', userAuth, (req, res) => {
         MAX(created_at) as last_activity
       FROM agent_activity
       WHERE agent_id = ?
-    `).get(req.params.id);
+    `, [req.params.id]);
 
     response.success(res, {
       agent,
@@ -250,7 +251,7 @@ router.get('/agents/:id', userAuth, (req, res) => {
  * GET /api/activity/entity/:type/:id
  * Get activity log for a specific entity (deliverable or task)
  */
-router.get('/entity/:type/:id', userAuth, (req, res) => {
+router.get('/entity/:type/:id', userAuth, async (req, res) => {
   try {
     const { type, id } = req.params;
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
@@ -260,13 +261,13 @@ router.get('/entity/:type/:id', userAuth, (req, res) => {
       return response.validationError(res, 'Entity type must be "deliverable" or "task"');
     }
 
-    const activities = db.prepare(`
+    const activities = await db.many(`
       SELECT id, entity_type, entity_id, event_type, actor_name, detail, created_at
       FROM activity_log
       WHERE entity_type = ? AND entity_id = ?
       ORDER BY created_at DESC
       LIMIT ? OFFSET ?
-    `).all(type, parseInt(id), limit, offset);
+    `, [type, parseInt(id), limit, offset]);
 
     const parsed = activities.map(a => normalizeActivityTimestamps({
       ...a,

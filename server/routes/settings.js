@@ -7,7 +7,7 @@ import { userAuth, requireRoles } from '../middleware/userAuth.js';
 import { getConfig, isConfigured, sendEmail, reloadConfig } from '../services/emailProvider.js';
 import { getDispatcherStatus } from '../services/taskDispatcher.js';
 import { runCryptoHealthCheck } from '../utils/crypto.js';
-import db from '../db/connection.js';
+import db from '../db/adapter.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = join(__dirname, '../..');
@@ -189,9 +189,9 @@ router.post('/email/test', userAuth, requireRoles('admin'), async (req, res) => 
  * GET /api/settings/dispatcher
  * Get task dispatcher status
  */
-router.get('/dispatcher', userAuth, requireRoles('admin'), (req, res) => {
+router.get('/dispatcher', userAuth, requireRoles('admin'), async (req, res) => {
   try {
-    const status = getDispatcherStatus();
+    const status = await getDispatcherStatus();
     response.success(res, status);
   } catch (err) {
     console.error('Error getting dispatcher status:', err);
@@ -203,9 +203,9 @@ router.get('/dispatcher', userAuth, requireRoles('admin'), (req, res) => {
  * GET /api/settings/crypto-health
  * Admin-only endpoint to check encryption health status
  */
-router.get('/crypto-health', userAuth, requireRoles('admin'), (req, res) => {
+router.get('/crypto-health', userAuth, requireRoles('admin'), async (req, res) => {
   try {
-    const health = runCryptoHealthCheck(db);
+    const health = await runCryptoHealthCheck(db);
     response.success(res, {
       ok: health.ok,
       total: health.total,

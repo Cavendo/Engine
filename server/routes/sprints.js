@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import db from '../db/connection.js';
+import db from '../db/adapter.js';
 import * as response from '../utils/response.js';
 import { userAuth, requireRoles } from '../middleware/userAuth.js';
 import { dualAuth } from '../middleware/agentAuth.js';
@@ -47,8 +47,8 @@ function normalizeSprintTimestamps(sprint) {
 /**
  * Get task summary counts for a sprint
  */
-function getTaskSummary(sprintId) {
-  return db.prepare(`
+async function getTaskSummary(sprintId) {
+  return await db.one(`
     SELECT
       COUNT(*) as total,
       SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
@@ -57,7 +57,7 @@ function getTaskSummary(sprintId) {
       SUM(CASE WHEN status = 'pending' OR status = 'assigned' THEN 1 ELSE 0 END) as pending,
       SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) as cancelled
     FROM tasks WHERE sprint_id = ?
-  `).get(sprintId);
+  `, [sprintId]);
 }
 
 // ============================================
@@ -68,7 +68,7 @@ function getTaskSummary(sprintId) {
  * GET /api/sprints
  * List all sprints with filtering
  */
-router.get('/', dualAuth, (req, res) => {
+router.get('/', dualAuth, async (req, res) => {
   try {
     const { status, projectId } = req.query;
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
@@ -96,16 +96,17 @@ router.get('/', dualAuth, (req, res) => {
     query += ' ORDER BY s.created_at DESC LIMIT ? OFFSET ?';
     params.push(limit, offset);
 
-    const sprints = db.prepare(query).all(...params);
+    const sprints = await db.many(query, params);
 
     // Get task summary for each sprint
-    const sprintsWithSummary = sprints.map(sprint => {
-      const taskSummary = getTaskSummary(sprint.id);
-      return normalizeSprintTimestamps({
+    const sprintsWithSummary = [];
+    for (const sprint of sprints) {
+      const taskSummary = await getTaskSummary(sprint.id);
+      sprintsWithSummary.push(normalizeSprintTimestamps({
         ...sprint,
         taskSummary
-      });
-    });
+      }));
+    }
 
     response.success(res, sprintsWithSummary);
   } catch (err) {
@@ -118,23 +119,23 @@ router.get('/', dualAuth, (req, res) => {
  * GET /api/sprints/:id
  * Get sprint details with task summary
  */
-router.get('/:id', dualAuth, (req, res) => {
+router.get('/:id', dualAuth, async (req, res) => {
   try {
-    const sprint = db.prepare(`
+    const sprint = await db.one(`
       SELECT
         s.*,
         p.name as project_name
       FROM sprints s
       LEFT JOIN projects p ON p.id = s.project_id
       WHERE s.id = ?
-    `).get(req.params.id);
+    `, [req.params.id]);
 
     if (!sprint) {
       return response.notFound(res, 'Sprint');
     }
 
     // Get task summary
-    const taskSummary = getTaskSummary(sprint.id);
+    const taskSummary = await getTaskSummary(sprint.id);
 
     response.success(res, normalizeSprintTimestamps({
       ...sprint,
@@ -150,9 +151,9 @@ router.get('/:id', dualAuth, (req, res) => {
  * GET /api/sprints/:id/tasks
  * Get all tasks in a sprint
  */
-router.get('/:id/tasks', dualAuth, (req, res) => {
+router.get('/:id/tasks', dualAuth, async (req, res) => {
   try {
-    const sprint = db.prepare('SELECT id, name FROM sprints WHERE id = ?').get(req.params.id);
+    const sprint = await db.one('SELECT id, name FROM sprints WHERE id = ?', [req.params.id]);
     if (!sprint) {
       return response.notFound(res, 'Sprint');
     }
@@ -185,7 +186,7 @@ router.get('/:id/tasks', dualAuth, (req, res) => {
     query += ' ORDER BY t.priority ASC, t.created_at DESC LIMIT ? OFFSET ?';
     params.push(limit, offset);
 
-    const tasks = db.prepare(query).all(...params);
+    const tasks = await db.many(query, params);
 
     const parsed = tasks.map(task => ({
       ...task,
@@ -216,22 +217,22 @@ router.get('/:id/tasks', dualAuth, (req, res) => {
  * POST /api/sprints
  * Create a new sprint
  */
-router.post('/', userAuth, requireRoles('admin'), validateBody(createSprintSchema), (req, res) => {
+router.post('/', userAuth, requireRoles('admin'), validateBody(createSprintSchema), async (req, res) => {
   try {
     const { name, description, projectId, status, startDate, endDate, goal } = req.body;
 
     // Validate project exists if provided
     if (projectId) {
-      const project = db.prepare('SELECT id FROM projects WHERE id = ?').get(projectId);
+      const project = await db.one('SELECT id FROM projects WHERE id = ?', [projectId]);
       if (!project) {
         return response.validationError(res, 'Invalid project ID');
       }
     }
 
-    const result = db.prepare(`
+    const { lastInsertRowid: newId } = await db.insert(`
       INSERT INTO sprints (name, description, project_id, status, start_date, end_date, goal)
       VALUES (?, ?, ?, ?, ?, ?, ?)
-    `).run(
+    `, [
       name,
       description || null,
       projectId || null,
@@ -239,9 +240,9 @@ router.post('/', userAuth, requireRoles('admin'), validateBody(createSprintSchem
       startDate || null,
       endDate || null,
       goal || null
-    );
+    ]);
 
-    const sprint = db.prepare('SELECT * FROM sprints WHERE id = ?').get(result.lastInsertRowid);
+    const sprint = await db.one('SELECT * FROM sprints WHERE id = ?', [newId]);
 
     response.created(res, normalizeSprintTimestamps(sprint));
   } catch (err) {
@@ -254,9 +255,9 @@ router.post('/', userAuth, requireRoles('admin'), validateBody(createSprintSchem
  * PATCH /api/sprints/:id
  * Update sprint
  */
-router.patch('/:id', userAuth, requireRoles('admin'), validateBody(updateSprintSchema), (req, res) => {
+router.patch('/:id', userAuth, requireRoles('admin'), validateBody(updateSprintSchema), async (req, res) => {
   try {
-    const sprint = db.prepare('SELECT id FROM sprints WHERE id = ?').get(req.params.id);
+    const sprint = await db.one('SELECT id FROM sprints WHERE id = ?', [req.params.id]);
     if (!sprint) {
       return response.notFound(res, 'Sprint');
     }
@@ -276,7 +277,7 @@ router.patch('/:id', userAuth, requireRoles('admin'), validateBody(updateSprintS
     }
     if (projectId !== undefined) {
       if (projectId !== null) {
-        const project = db.prepare('SELECT id FROM projects WHERE id = ?').get(projectId);
+        const project = await db.one('SELECT id FROM projects WHERE id = ?', [projectId]);
         if (!project) {
           return response.validationError(res, 'Invalid project ID');
         }
@@ -312,16 +313,16 @@ router.patch('/:id', userAuth, requireRoles('admin'), validateBody(updateSprintS
     updates.push("updated_at = datetime('now')");
     values.push(req.params.id);
 
-    db.prepare(`UPDATE sprints SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+    await db.exec(`UPDATE sprints SET ${updates.join(', ')} WHERE id = ?`, values);
 
-    const updated = db.prepare(`
+    const updated = await db.one(`
       SELECT s.*, p.name as project_name
       FROM sprints s
       LEFT JOIN projects p ON p.id = s.project_id
       WHERE s.id = ?
-    `).get(req.params.id);
+    `, [req.params.id]);
 
-    const taskSummary = getTaskSummary(req.params.id);
+    const taskSummary = await getTaskSummary(req.params.id);
 
     response.success(res, normalizeSprintTimestamps({
       ...updated,
@@ -337,18 +338,18 @@ router.patch('/:id', userAuth, requireRoles('admin'), validateBody(updateSprintS
  * DELETE /api/sprints/:id
  * Delete sprint
  */
-router.delete('/:id', userAuth, requireRoles('admin'), (req, res) => {
+router.delete('/:id', userAuth, requireRoles('admin'), async (req, res) => {
   try {
-    const sprint = db.prepare('SELECT id FROM sprints WHERE id = ?').get(req.params.id);
+    const sprint = await db.one('SELECT id FROM sprints WHERE id = ?', [req.params.id]);
     if (!sprint) {
       return response.notFound(res, 'Sprint');
     }
 
     // Clear sprint_id from associated tasks (don't delete tasks)
-    db.prepare('UPDATE tasks SET sprint_id = NULL WHERE sprint_id = ?').run(req.params.id);
+    await db.exec('UPDATE tasks SET sprint_id = NULL WHERE sprint_id = ?', [req.params.id]);
 
     // Delete the sprint
-    db.prepare('DELETE FROM sprints WHERE id = ?').run(req.params.id);
+    await db.exec('DELETE FROM sprints WHERE id = ?', [req.params.id]);
 
     response.success(res, { deleted: true });
   } catch (err) {
@@ -361,16 +362,16 @@ router.delete('/:id', userAuth, requireRoles('admin'), (req, res) => {
  * POST /api/sprints/:id/tasks
  * Add a task to a sprint
  */
-router.post('/:id/tasks', userAuth, requireRoles('admin'), validateBody(addTaskToSprintSchema), (req, res) => {
+router.post('/:id/tasks', userAuth, requireRoles('admin'), validateBody(addTaskToSprintSchema), async (req, res) => {
   try {
-    const sprint = db.prepare('SELECT id, project_id FROM sprints WHERE id = ?').get(req.params.id);
+    const sprint = await db.one('SELECT id, project_id FROM sprints WHERE id = ?', [req.params.id]);
     if (!sprint) {
       return response.notFound(res, 'Sprint');
     }
 
     const { taskId } = req.body;
 
-    const task = db.prepare('SELECT id, sprint_id FROM tasks WHERE id = ?').get(taskId);
+    const task = await db.one('SELECT id, sprint_id FROM tasks WHERE id = ?', [taskId]);
     if (!task) {
       return response.validationError(res, 'Invalid task ID');
     }
@@ -379,11 +380,11 @@ router.post('/:id/tasks', userAuth, requireRoles('admin'), validateBody(addTaskT
       return response.validationError(res, 'Task is already in this sprint');
     }
 
-    db.prepare(`
+    await db.exec(`
       UPDATE tasks SET sprint_id = ?, updated_at = datetime('now') WHERE id = ?
-    `).run(req.params.id, taskId);
+    `, [req.params.id, taskId]);
 
-    const updatedTask = db.prepare(`
+    const updatedTask = await db.one(`
       SELECT
         t.*,
         p.name as project_name,
@@ -392,7 +393,7 @@ router.post('/:id/tasks', userAuth, requireRoles('admin'), validateBody(addTaskT
       LEFT JOIN projects p ON p.id = t.project_id
       LEFT JOIN agents a ON a.id = t.assigned_agent_id
       WHERE t.id = ?
-    `).get(taskId);
+    `, [taskId]);
 
     response.success(res, {
       ...updatedTask,
@@ -414,14 +415,14 @@ router.post('/:id/tasks', userAuth, requireRoles('admin'), validateBody(addTaskT
  * DELETE /api/sprints/:id/tasks/:taskId
  * Remove a task from a sprint
  */
-router.delete('/:id/tasks/:taskId', userAuth, requireRoles('admin'), (req, res) => {
+router.delete('/:id/tasks/:taskId', userAuth, requireRoles('admin'), async (req, res) => {
   try {
-    const sprint = db.prepare('SELECT id FROM sprints WHERE id = ?').get(req.params.id);
+    const sprint = await db.one('SELECT id FROM sprints WHERE id = ?', [req.params.id]);
     if (!sprint) {
       return response.notFound(res, 'Sprint');
     }
 
-    const task = db.prepare('SELECT id, sprint_id FROM tasks WHERE id = ?').get(req.params.taskId);
+    const task = await db.one('SELECT id, sprint_id FROM tasks WHERE id = ?', [req.params.taskId]);
     if (!task) {
       return response.notFound(res, 'Task');
     }
@@ -430,9 +431,9 @@ router.delete('/:id/tasks/:taskId', userAuth, requireRoles('admin'), (req, res) 
       return response.validationError(res, 'Task is not in this sprint');
     }
 
-    db.prepare(`
+    await db.exec(`
       UPDATE tasks SET sprint_id = NULL, updated_at = datetime('now') WHERE id = ?
-    `).run(req.params.taskId);
+    `, [req.params.taskId]);
 
     response.success(res, { removed: true });
   } catch (err) {

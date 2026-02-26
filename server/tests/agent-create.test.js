@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import Database from 'better-sqlite3';
+import { createSqliteAdapter } from '../db/sqliteAdapter.js';
 
 // Temp DB setup
 const tempDir = mkdtempSync(join(tmpdir(), 'cavendo-agent-create-'));
@@ -24,12 +25,14 @@ const { encrypt, decrypt } = await import('../utils/crypto.js');
 const { createAgentSchema } = await import('../utils/validation.js');
 
 let db;
+let adapter;
 
 beforeAll(async () => {
   db = new Database(tempDbPath);
   db.pragma('foreign_keys = ON');
-  await initializeDatabase(db);
-  runMigrations(db);
+  adapter = createSqliteAdapter(db);
+  await initializeDatabase(adapter);
+  await runMigrations(adapter);
 });
 
 afterAll(() => {

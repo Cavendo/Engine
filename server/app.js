@@ -48,8 +48,8 @@ import {
 // Import auth middleware for file serving
 import { dualAuth } from './middleware/agentAuth.js';
 
-// Import database connection
-import db from './db/connection.js';
+// Import database adapter
+import db from './db/adapter.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(readFileSync(join(__dirname, '../package.json'), 'utf8'));
@@ -236,14 +236,14 @@ export function createApp(options = {}) {
 
     // Run migrations
     try {
-      runMigrations(db);
+      await runMigrations(db);
     } catch (err) {
       throw new Error(`[AppFactory] Migrations failed: ${err.message}`, { cause: err });
     }
 
     // Crypto health check
     try {
-      const health = runCryptoHealthCheck(db);
+      const health = await runCryptoHealthCheck(db);
       if (!health.ok) {
         console.error(`[Crypto] Health check FAILED: ${health.failed}/${health.total} encrypted values cannot be decrypted`);
         for (const d of health.details.slice(0, 10)) {
@@ -298,16 +298,15 @@ export function createApp(options = {}) {
 
         // Session cleanup interval (every 15 min)
         sessionCleanupHandle = setInterval(() => {
-          try {
-            const result = db.prepare(
-              "DELETE FROM sessions WHERE expires_at < datetime('now')"
-            ).run();
-            if (result.changes > 0) {
-              console.log(`[Sessions] Cleaned up ${result.changes} expired session(s)`);
-            }
-          } catch (err) {
-            console.error('[Sessions] Cleanup error:', err);
-          }
+          db.exec("DELETE FROM sessions WHERE expires_at < datetime('now')")
+            .then(result => {
+              if (result.changes > 0) {
+                console.log(`[Sessions] Cleaned up ${result.changes} expired session(s)`);
+              }
+            })
+            .catch(err => {
+              console.error('[Sessions] Cleanup error:', err);
+            });
         }, 15 * 60 * 1000);
 
         resolve(server);
@@ -368,7 +367,7 @@ export function createApp(options = {}) {
       server = null;
     }
 
-    db.close();
+    await Promise.resolve(db.close());
   }
 
   return { app, start, stop };

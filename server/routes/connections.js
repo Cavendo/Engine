@@ -4,7 +4,7 @@
  */
 
 import express from 'express';
-import db from '../db/connection.js';
+import db from '../db/adapter.js';
 import { userAuth, requireRoles } from '../middleware/userAuth.js';
 import * as response from '../utils/response.js';
 import { validateBody, validateParams, idParamSchema, validateEndpoint, validateEndpointWithDns } from '../utils/validation.js';
@@ -13,6 +13,11 @@ import { encrypt, decrypt } from '../utils/crypto.js';
 import { testS3Connection } from '../services/s3Provider.js';
 
 const router = express.Router();
+
+// Dialect-aware JSON extraction for connection_id lookups
+const jsonExtractConnectionId = db.dialect === 'postgres'
+  ? "(r.destination_config::jsonb->>'connection_id')"
+  : "json_extract(r.destination_config, '$.connection_id')";
 
 // ============================================
 // Validation Schemas
@@ -75,15 +80,15 @@ function formatConnection(conn) {
  */
 router.get('/', userAuth, requireRoles('admin'), async (req, res) => {
   try {
-    const connections = db.prepare(`
+    const connections = await db.many(`
       SELECT sc.*,
         (SELECT COUNT(*) FROM routes r
          WHERE r.destination_type = 'storage'
-           AND json_extract(r.destination_config, '$.connection_id') = sc.id
+           AND ${jsonExtractConnectionId} = sc.id
         ) as route_count
       FROM storage_connections sc
       ORDER BY sc.name ASC
-    `).all();
+    `);
     response.success(res, connections.map(formatConnection));
   } catch (err) {
     console.error('Error listing storage connections:', err);
@@ -112,21 +117,21 @@ router.post('/', userAuth, requireRoles('admin'), validateBody(createConnectionS
     const skEncrypted = encrypt(secret_access_key);
     const akPreview = '...' + access_key_id.slice(-4);
 
-    const result = db.prepare(`
+    const result = await db.insert(`
       INSERT INTO storage_connections (
         name, provider, bucket, region, endpoint,
         access_key_id_encrypted, access_key_id_iv, access_key_id_key_version, access_key_id_preview,
         secret_access_key_encrypted, secret_access_key_iv, secret_access_key_key_version,
         created_by
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
+    `, [
       name, provider || 's3', bucket, region || 'us-east-1', endpoint || null,
       akEncrypted.encrypted, akEncrypted.iv, akEncrypted.keyVersion, akPreview,
       skEncrypted.encrypted, skEncrypted.iv, skEncrypted.keyVersion,
       req.user?.id || null
-    );
+    ]);
 
-    const conn = db.prepare('SELECT * FROM storage_connections WHERE id = ?').get(result.lastInsertRowid);
+    const conn = await db.one('SELECT * FROM storage_connections WHERE id = ?', [result.lastInsertRowid]);
     response.created(res, formatConnection(conn));
   } catch (err) {
     console.error('Error creating storage connection:', err);
@@ -140,7 +145,7 @@ router.post('/', userAuth, requireRoles('admin'), validateBody(createConnectionS
  */
 router.put('/:id', userAuth, requireRoles('admin'), validateParams(idParamSchema), validateBody(updateConnectionSchema), async (req, res) => {
   try {
-    const conn = db.prepare('SELECT * FROM storage_connections WHERE id = ?').get(req.params.id);
+    const conn = await db.one('SELECT * FROM storage_connections WHERE id = ?', [req.params.id]);
     if (!conn) return response.notFound(res, 'Storage connection');
 
     const { name, bucket, region, endpoint, access_key_id, secret_access_key } = req.body;
@@ -176,9 +181,9 @@ router.put('/:id', userAuth, requireRoles('admin'), validateParams(idParamSchema
     updates.push("updated_at = datetime('now')");
     values.push(req.params.id);
 
-    db.prepare(`UPDATE storage_connections SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+    await db.exec(`UPDATE storage_connections SET ${updates.join(', ')} WHERE id = ?`, values);
 
-    const updated = db.prepare('SELECT * FROM storage_connections WHERE id = ?').get(req.params.id);
+    const updated = await db.one('SELECT * FROM storage_connections WHERE id = ?', [req.params.id]);
     response.success(res, formatConnection(updated));
   } catch (err) {
     console.error('Error updating storage connection:', err);
@@ -192,15 +197,18 @@ router.put('/:id', userAuth, requireRoles('admin'), validateParams(idParamSchema
  */
 router.delete('/:id', userAuth, requireRoles('admin'), validateParams(idParamSchema), async (req, res) => {
   try {
-    const conn = db.prepare('SELECT * FROM storage_connections WHERE id = ?').get(req.params.id);
+    const conn = await db.one('SELECT * FROM storage_connections WHERE id = ?', [req.params.id]);
     if (!conn) return response.notFound(res, 'Storage connection');
 
     // Check if any routes reference this connection
-    const routes = db.prepare(`
+    const jsonExtractDirect = db.dialect === 'postgres'
+      ? "(destination_config::jsonb->>'connection_id')"
+      : "json_extract(destination_config, '$.connection_id')";
+    const routes = await db.many(`
       SELECT id, name FROM routes
       WHERE destination_type = 'storage'
-        AND json_extract(destination_config, '$.connection_id') = ?
-    `).all(req.params.id);
+        AND ${jsonExtractDirect} = ?
+    `, [req.params.id]);
 
     if (routes.length > 0) {
       const routeNames = routes.map(r => r.name).join(', ');
@@ -210,7 +218,7 @@ router.delete('/:id', userAuth, requireRoles('admin'), validateParams(idParamSch
       );
     }
 
-    db.prepare('DELETE FROM storage_connections WHERE id = ?').run(req.params.id);
+    await db.exec('DELETE FROM storage_connections WHERE id = ?', [req.params.id]);
     response.success(res, { message: 'Storage connection deleted' });
   } catch (err) {
     console.error('Error deleting storage connection:', err);
@@ -224,7 +232,7 @@ router.delete('/:id', userAuth, requireRoles('admin'), validateParams(idParamSch
  */
 router.post('/:id/test', userAuth, requireRoles('admin'), validateParams(idParamSchema), async (req, res) => {
   try {
-    const conn = db.prepare('SELECT * FROM storage_connections WHERE id = ?').get(req.params.id);
+    const conn = await db.one('SELECT * FROM storage_connections WHERE id = ?', [req.params.id]);
     if (!conn) return response.notFound(res, 'Storage connection');
 
     // Re-validate endpoint at call time with DNS resolution (defense-in-depth against stored data tampering and DNS rebinding)

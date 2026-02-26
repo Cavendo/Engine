@@ -23,23 +23,8 @@
  *   node server/scripts/crypto-rotate.js --apply --table agents
  */
 
-import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
-import { existsSync, readFileSync } from 'fs';
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const PROJECT_ROOT = join(__dirname, '../..');
-
-// Load .env
-const envPath = join(PROJECT_ROOT, '.env');
-if (existsSync(envPath)) {
-  for (const line of readFileSync(envPath, 'utf-8').split('\n')) {
-    const match = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
-    if (match && !process.env[match[1]]) {
-      process.env[match[1]] = match[2];
-    }
-  }
-}
+// Load .env via centralized bootstrap (must come before adapter/crypto imports)
+import '../env.js';
 
 // Parse CLI args
 const args = process.argv.slice(2);
@@ -62,7 +47,7 @@ const originalError = console.error;
 console.warn = () => {};
 console.error = () => {};
 
-const Database = (await import('better-sqlite3')).default;
+const { default: db } = await import('../db/adapter.js');
 const { encrypt, decrypt, _resetKeyringCache } = await import('../utils/crypto.js');
 
 // Reset cache after env is loaded so crypto module picks up the .env values
@@ -72,15 +57,6 @@ console.warn = originalWarn;
 console.error = originalError;
 
 try {
-  const DB_PATH = process.env.DATABASE_PATH || join(PROJECT_ROOT, 'data/cavendo.db');
-  if (!existsSync(DB_PATH)) {
-    process.stdout.write(JSON.stringify({ error: 'Database not found', path: DB_PATH }) + '\n');
-    process.exit(2);
-  }
-
-  const db = new Database(DB_PATH);
-  db.pragma('foreign_keys = ON');
-
   // Determine current version using the same logic as the crypto runtime:
   // explicit env var, or highest version in keyring, or 1 for legacy single-key
   let currentVersion;
@@ -109,15 +85,15 @@ try {
   if ((!tableFilter || tableFilter === 'agents') && remaining > 0) {
     let agents;
     try {
-      agents = db.prepare(`
+      agents = await db.many(`
         SELECT id, provider_api_key_encrypted, provider_api_key_iv, encryption_key_version
         FROM agents WHERE provider_api_key_encrypted IS NOT NULL
-      `).all();
+      `);
     } catch {
-      agents = db.prepare(`
+      agents = await db.many(`
         SELECT id, provider_api_key_encrypted, provider_api_key_iv
         FROM agents WHERE provider_api_key_encrypted IS NOT NULL
-      `).all();
+      `);
     }
 
     for (const agent of agents) {
@@ -143,11 +119,11 @@ try {
 
         if (!dryRun) {
           const { encrypted, iv, keyVersion } = encrypt(plaintext);
-          db.prepare(`
+          await db.exec(`
             UPDATE agents
             SET provider_api_key_encrypted = ?, provider_api_key_iv = ?, encryption_key_version = ?, updated_at = datetime('now')
             WHERE id = ?
-          `).run(encrypted, iv, keyVersion, agent.id);
+          `, [encrypted, iv, keyVersion, agent.id]);
         }
 
         result.succeeded++;
@@ -163,19 +139,19 @@ try {
   if ((!tableFilter || tableFilter === 'storage_connections') && remaining > 0) {
     let conns;
     try {
-      conns = db.prepare(`
+      conns = await db.many(`
         SELECT id, access_key_id_encrypted, access_key_id_iv, access_key_id_key_version,
           secret_access_key_encrypted, secret_access_key_iv, secret_access_key_key_version
         FROM storage_connections
         WHERE access_key_id_encrypted IS NOT NULL OR secret_access_key_encrypted IS NOT NULL
-      `).all();
+      `);
     } catch {
-      conns = db.prepare(`
+      conns = await db.many(`
         SELECT id, access_key_id_encrypted, access_key_id_iv,
           secret_access_key_encrypted, secret_access_key_iv
         FROM storage_connections
         WHERE access_key_id_encrypted IS NOT NULL OR secret_access_key_encrypted IS NOT NULL
-      `).all();
+      `);
     }
 
     for (const conn of conns) {
@@ -194,43 +170,58 @@ try {
       remaining--;
 
       try {
-        const updates = [];
-        const values = [];
-
-        // Rotate access_key_id
-        if (conn.access_key_id_encrypted && (akVer !== currentVersion || force)) {
-          const plainAk = decrypt(conn.access_key_id_encrypted, conn.access_key_id_iv, akVer);
-          if (!plainAk) {
-            result.failed++;
-            result.details.push({ table: 'storage_connections', id: conn.id, column: 'access_key_id', fromVersion: akVer, error: 'decrypt_returned_null' });
-            continue;
+        // In dry-run, just verify decryptability
+        if (dryRun) {
+          if (conn.access_key_id_encrypted && (akVer !== currentVersion || force)) {
+            const plainAk = decrypt(conn.access_key_id_encrypted, conn.access_key_id_iv, akVer);
+            if (!plainAk) {
+              result.failed++;
+              result.details.push({ table: 'storage_connections', id: conn.id, column: 'access_key_id', fromVersion: akVer, error: 'decrypt_returned_null' });
+              continue;
+            }
           }
-          if (!dryRun) {
+          if (conn.secret_access_key_encrypted && (skVer !== currentVersion || force)) {
+            const plainSk = decrypt(conn.secret_access_key_encrypted, conn.secret_access_key_iv, skVer);
+            if (!plainSk) {
+              result.failed++;
+              result.details.push({ table: 'storage_connections', id: conn.id, column: 'secret_access_key', fromVersion: skVer, error: 'decrypt_returned_null' });
+              continue;
+            }
+          }
+        } else {
+          // Apply mode: decrypt and re-encrypt each column, update in one statement
+          const updates = [];
+          const values = [];
+
+          if (conn.access_key_id_encrypted && (akVer !== currentVersion || force)) {
+            const plainAk = decrypt(conn.access_key_id_encrypted, conn.access_key_id_iv, akVer);
+            if (!plainAk) {
+              result.failed++;
+              result.details.push({ table: 'storage_connections', id: conn.id, column: 'access_key_id', fromVersion: akVer, error: 'decrypt_returned_null' });
+              continue;
+            }
             const enc = encrypt(plainAk);
             updates.push('access_key_id_encrypted = ?', 'access_key_id_iv = ?', 'access_key_id_key_version = ?');
             values.push(enc.encrypted, enc.iv, enc.keyVersion);
           }
-        }
 
-        // Rotate secret_access_key
-        if (conn.secret_access_key_encrypted && (skVer !== currentVersion || force)) {
-          const plainSk = decrypt(conn.secret_access_key_encrypted, conn.secret_access_key_iv, skVer);
-          if (!plainSk) {
-            result.failed++;
-            result.details.push({ table: 'storage_connections', id: conn.id, column: 'secret_access_key', fromVersion: skVer, error: 'decrypt_returned_null' });
-            continue;
-          }
-          if (!dryRun) {
+          if (conn.secret_access_key_encrypted && (skVer !== currentVersion || force)) {
+            const plainSk = decrypt(conn.secret_access_key_encrypted, conn.secret_access_key_iv, skVer);
+            if (!plainSk) {
+              result.failed++;
+              result.details.push({ table: 'storage_connections', id: conn.id, column: 'secret_access_key', fromVersion: skVer, error: 'decrypt_returned_null' });
+              continue;
+            }
             const enc = encrypt(plainSk);
             updates.push('secret_access_key_encrypted = ?', 'secret_access_key_iv = ?', 'secret_access_key_key_version = ?');
             values.push(enc.encrypted, enc.iv, enc.keyVersion);
           }
-        }
 
-        if (!dryRun && updates.length > 0) {
-          updates.push("updated_at = datetime('now')");
-          values.push(conn.id);
-          db.prepare(`UPDATE storage_connections SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+          if (updates.length > 0) {
+            updates.push("updated_at = datetime('now')");
+            values.push(conn.id);
+            await db.exec(`UPDATE storage_connections SET ${updates.join(', ')} WHERE id = ?`, values);
+          }
         }
 
         result.succeeded++;
@@ -249,7 +240,7 @@ try {
     }
   }
 
-  db.close();
+  await db.close();
 
   process.stdout.write(JSON.stringify(result, null, 2) + '\n');
   process.exit(result.failed > 0 ? 1 : 0);

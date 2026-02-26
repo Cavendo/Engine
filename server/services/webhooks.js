@@ -1,6 +1,6 @@
 import { URL } from 'url';
 import dns from 'dns/promises';
-import db from '../db/connection.js';
+import db from '../db/adapter.js';
 import { generateWebhookSignature } from '../utils/crypto.js';
 import { isPrivateOrLocalIp, isLocalHostname, PRIVATE_IP_PATTERNS } from '../utils/networkUtils.js';
 
@@ -126,18 +126,18 @@ export async function triggerWebhook(agentId, eventType, payload) {
 
   try {
     // Find all active webhooks for this agent that subscribe to this event
-    const webhooks = db.prepare(`
+    const webhooks = await db.many(`
       SELECT id, url, secret, events
       FROM webhooks
       WHERE agent_id = ? AND status = 'active'
-    `).all(agentId);
+    `, [agentId]);
 
     // Also check agent's inline webhook config
-    const agent = db.prepare(`
+    const agent = await db.one(`
       SELECT webhook_url, webhook_secret, webhook_events
       FROM agents
       WHERE id = ? AND webhook_url IS NOT NULL
-    `).get(agentId);
+    `, [agentId]);
 
     const targets = [];
 
@@ -177,13 +177,13 @@ export async function triggerWebhook(agentId, eventType, payload) {
 
       // Create delivery record
       // For inline webhooks (webhookId is null), store agent_id for tracking
-      const result = db.prepare(`
+      const { lastInsertRowid: deliveryId } = await db.insert(`
         INSERT INTO webhook_deliveries (webhook_id, agent_id, event_type, payload, status)
         VALUES (?, ?, ?, ?, 'pending')
-      `).run(target.webhookId, target.webhookId ? null : agentId, eventType, payloadString);
+      `, [target.webhookId, target.webhookId ? null : agentId, eventType, payloadString]);
 
       // Attempt delivery asynchronously
-      deliverWebhook(result.lastInsertRowid, target.url, target.secret, payloadString)
+      deliverWebhook(deliveryId, target.url, target.secret, payloadString)
         .catch(err => console.error('Webhook delivery failed:', err));
     }
   } catch (err) {
@@ -200,11 +200,11 @@ export async function triggerWebhook(agentId, eventType, payload) {
 export async function triggerWebhookForProject(projectId, eventType, payload) {
   try {
     // Find all agents with tasks in this project
-    const agents = db.prepare(`
+    const agents = await db.many(`
       SELECT DISTINCT assigned_agent_id as agent_id
       FROM tasks
       WHERE project_id = ? AND assigned_agent_id IS NOT NULL
-    `).all(projectId);
+    `, [projectId]);
 
     for (const { agent_id } of agents) {
       await triggerWebhook(agent_id, eventType, payload);
@@ -224,12 +224,12 @@ export async function triggerWebhookForProject(projectId, eventType, payload) {
 export async function deliverWebhook(deliveryId, url, secret, payload) {
   // Fetch delivery record if not all params provided
   if (!url || !payload) {
-    const delivery = db.prepare(`
+    const delivery = await db.one(`
       SELECT d.*, w.url, w.secret
       FROM webhook_deliveries d
       LEFT JOIN webhooks w ON w.id = d.webhook_id
       WHERE d.id = ?
-    `).get(deliveryId);
+    `, [deliveryId]);
 
     if (!delivery) {
       throw new Error('Delivery not found');
@@ -241,25 +241,25 @@ export async function deliverWebhook(deliveryId, url, secret, payload) {
   }
 
   // Get current attempt count
-  const delivery = db.prepare('SELECT attempts FROM webhook_deliveries WHERE id = ?').get(deliveryId);
+  const delivery = await db.one('SELECT attempts FROM webhook_deliveries WHERE id = ?', [deliveryId]);
   const attempts = (delivery?.attempts || 0) + 1;
 
   // Update attempt info
-  db.prepare(`
+  await db.exec(`
     UPDATE webhook_deliveries
     SET attempts = ?, last_attempt_at = datetime('now')
     WHERE id = ?
-  `).run(attempts, deliveryId);
+  `, [attempts, deliveryId]);
 
   try {
     // SSRF protection: validate URL at delivery time (not just creation time)
     const urlCheck = await validateWebhookUrl(url);
     if (!urlCheck.valid) {
-      db.prepare(`
+      await db.exec(`
         UPDATE webhook_deliveries
         SET status = 'failed', error = ?
         WHERE id = ?
-      `).run(`SSRF blocked: ${urlCheck.reason}`, deliveryId);
+      `, [`SSRF blocked: ${urlCheck.reason}`, deliveryId]);
       return { success: false, error: `SSRF blocked: ${urlCheck.reason}` };
     }
 
@@ -296,11 +296,11 @@ export async function deliverWebhook(deliveryId, url, secret, payload) {
 
     if (response.ok) {
       // Success
-      db.prepare(`
+      await db.exec(`
         UPDATE webhook_deliveries
         SET status = 'delivered', response_status = ?, response_body = ?
         WHERE id = ?
-      `).run(response.status, responseBody.substring(0, 1000), deliveryId);
+      `, [response.status, responseBody.substring(0, 1000), deliveryId]);
 
       return { success: true, status: response.status };
     } else {
@@ -312,11 +312,11 @@ export async function deliverWebhook(deliveryId, url, secret, payload) {
 
     // Check if we should retry
     if (attempts < MAX_RETRIES) {
-      db.prepare(`
+      await db.exec(`
         UPDATE webhook_deliveries
         SET status = 'pending', error = ?
         WHERE id = ?
-      `).run(errorMessage, deliveryId);
+      `, [errorMessage, deliveryId]);
 
       // Schedule retry with exponential backoff
       const delay = Math.pow(2, attempts) * 1000; // 2s, 4s, 8s
@@ -328,11 +328,11 @@ export async function deliverWebhook(deliveryId, url, secret, payload) {
       return { success: false, willRetry: true, attempts, error: errorMessage };
     } else {
       // Max retries reached
-      db.prepare(`
+      await db.exec(`
         UPDATE webhook_deliveries
         SET status = 'failed', error = ?
         WHERE id = ?
-      `).run(errorMessage, deliveryId);
+      `, [errorMessage, deliveryId]);
 
       return { success: false, willRetry: false, attempts, error: errorMessage };
     }
@@ -344,18 +344,18 @@ export async function deliverWebhook(deliveryId, url, secret, payload) {
  */
 export async function processPendingDeliveries() {
   // Fetch pending deliveries from explicit webhooks
-  const explicitWebhooks = db.prepare(`
+  const explicitWebhooks = await db.many(`
     SELECT d.id, d.payload, w.url, w.secret
     FROM webhook_deliveries d
     JOIN webhooks w ON w.id = d.webhook_id
     WHERE d.status = 'pending' AND d.attempts < ?
     ORDER BY d.created_at ASC
     LIMIT 100
-  `).all(MAX_RETRIES);
+  `, [MAX_RETRIES]);
 
   // Fetch pending deliveries from inline agent webhooks
   // These have webhook_id = NULL but agent_id is set
-  const inlineWebhooks = db.prepare(`
+  const inlineWebhooks = await db.many(`
     SELECT d.id, d.payload, a.webhook_url as url, a.webhook_secret as secret
     FROM webhook_deliveries d
     JOIN agents a ON a.id = d.agent_id
@@ -366,7 +366,7 @@ export async function processPendingDeliveries() {
       AND a.webhook_url IS NOT NULL
     ORDER BY d.created_at ASC
     LIMIT 100
-  `).all(MAX_RETRIES);
+  `, [MAX_RETRIES]);
 
   const pending = [...explicitWebhooks, ...inlineWebhooks];
 

@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import db from '../db/connection.js';
+import db from '../db/adapter.js';
 import { generateUserKey, hashApiKey, getUserKeyPrefix, hashPassword } from '../utils/crypto.js';
 import * as response from '../utils/response.js';
 import { userAuth, requireRoles } from '../middleware/userAuth.js';
@@ -53,14 +53,14 @@ function normalizeKeyTimestamps(key) {
  * GET /api/users/me/keys
  * List current user's API keys (prefix only, not full key)
  */
-router.get('/me/keys', userAuth, (req, res) => {
+router.get('/me/keys', userAuth, async (req, res) => {
   try {
-    const keys = db.prepare(`
+    const keys = await db.many(`
       SELECT id, key_prefix, name, last_used_at, created_at
       FROM user_keys
       WHERE user_id = ?
       ORDER BY created_at DESC
-    `).all(req.user.id);
+    `, [req.user.id]);
 
     response.success(res, keys.map(key => ({
       id: key.id,
@@ -79,20 +79,20 @@ router.get('/me/keys', userAuth, (req, res) => {
  * POST /api/users/me/keys
  * Generate a new personal API key
  */
-router.post('/me/keys', userAuth, keyGenLimiter, validateBody(createUserKeySchema), (req, res) => {
+router.post('/me/keys', userAuth, keyGenLimiter, validateBody(createUserKeySchema), async (req, res) => {
   try {
     const { name } = req.body;
 
     const { key, hash, prefix } = generateUserKey();
 
-    const result = db.prepare(`
+    const { lastInsertRowid: id } = await db.insert(`
       INSERT INTO user_keys (user_id, key_hash, key_prefix, name)
       VALUES (?, ?, ?, ?)
-    `).run(req.user.id, hash, prefix, name || null);
+    `, [req.user.id, hash, prefix, name || null]);
 
     // Return the key once - it cannot be retrieved again
     response.created(res, {
-      id: result.lastInsertRowid,
+      id: id,
       apiKey: key, // Only time the full key is returned
       prefix: prefix,
       name: name || null,
@@ -108,12 +108,12 @@ router.post('/me/keys', userAuth, keyGenLimiter, validateBody(createUserKeySchem
  * PATCH /api/users/me/keys/:keyId
  * Update key name
  */
-router.patch('/me/keys/:keyId', userAuth, validateBody(updateUserKeySchema), (req, res) => {
+router.patch('/me/keys/:keyId', userAuth, validateBody(updateUserKeySchema), async (req, res) => {
   try {
     // Verify key exists and belongs to this user
-    const key = db.prepare(`
+    const key = await db.one(`
       SELECT id FROM user_keys WHERE id = ? AND user_id = ?
-    `).get(req.params.keyId, req.user.id);
+    `, [req.params.keyId, req.user.id]);
 
     if (!key) {
       return response.notFound(res, 'API key');
@@ -121,9 +121,9 @@ router.patch('/me/keys/:keyId', userAuth, validateBody(updateUserKeySchema), (re
 
     const { name } = req.body;
 
-    db.prepare(`
+    await db.exec(`
       UPDATE user_keys SET name = ? WHERE id = ?
-    `).run(name, req.params.keyId);
+    `, [name, req.params.keyId]);
 
     response.success(res, { updated: true });
   } catch (err) {
@@ -136,20 +136,20 @@ router.patch('/me/keys/:keyId', userAuth, validateBody(updateUserKeySchema), (re
  * DELETE /api/users/me/keys/:keyId
  * Revoke a personal API key
  */
-router.delete('/me/keys/:keyId', userAuth, (req, res) => {
+router.delete('/me/keys/:keyId', userAuth, async (req, res) => {
   try {
     // Verify key exists and belongs to this user
-    const key = db.prepare(`
+    const key = await db.one(`
       SELECT id FROM user_keys WHERE id = ? AND user_id = ?
-    `).get(req.params.keyId, req.user.id);
+    `, [req.params.keyId, req.user.id]);
 
     if (!key) {
       return response.notFound(res, 'API key');
     }
 
-    db.prepare(`
+    await db.exec(`
       DELETE FROM user_keys WHERE id = ?
-    `).run(req.params.keyId);
+    `, [req.params.keyId]);
 
     response.success(res, { revoked: true });
   } catch (err) {
@@ -167,15 +167,15 @@ router.delete('/me/keys/:keyId', userAuth, (req, res) => {
  * List all users (admin only)
  * Includes linked agent info for each user
  */
-router.get('/', userAuth, requireRoles('admin'), (req, res) => {
+router.get('/', userAuth, requireRoles('admin'), async (req, res) => {
   try {
-    const users = db.prepare(`
+    const users = await db.many(`
       SELECT u.id, u.email, u.name, u.role, u.status, u.last_login_at, u.created_at, u.updated_at,
         a.id as linked_agent_id, a.name as linked_agent_name, a.status as linked_agent_status
       FROM users u
       LEFT JOIN agents a ON a.owner_user_id = u.id AND a.execution_mode = 'human'
       ORDER BY u.created_at DESC
-    `).all();
+    `, []);
 
     response.success(res, users.map(u => ({
       ...normalizeUserTimestamps(u),
@@ -193,12 +193,12 @@ router.get('/', userAuth, requireRoles('admin'), (req, res) => {
  * GET /api/users/me
  * Get current user's profile
  */
-router.get('/me', userAuth, (req, res) => {
+router.get('/me', userAuth, async (req, res) => {
   try {
-    const user = db.prepare(`
+    const user = await db.one(`
       SELECT id, email, name, role, status, last_login_at, created_at
       FROM users WHERE id = ?
-    `).get(req.user.id);
+    `, [req.user.id]);
 
     if (!user) {
       return response.notFound(res, 'User');
@@ -221,7 +221,7 @@ router.post('/', userAuth, requireRoles('admin'), validateBody(createUserSchema)
     const { email, password, name, role } = req.body;
 
     // Check for duplicate email
-    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email.toLowerCase());
+    const existing = await db.one('SELECT id FROM users WHERE email = ?', [email.toLowerCase()]);
     if (existing) {
       return response.error(res, 'A user with this email already exists', 409, 'DUPLICATE_EMAIL');
     }
@@ -229,34 +229,32 @@ router.post('/', userAuth, requireRoles('admin'), validateBody(createUserSchema)
     const passwordHash = await hashPassword(password);
 
     // Create user + linked human agent in a transaction
-    const result = db.transaction(() => {
-      const userResult = db.prepare(`
+    const result = await db.tx(async (tx) => {
+      const { lastInsertRowid: userId } = await tx.insert(`
         INSERT INTO users (email, password_hash, name, role)
         VALUES (?, ?, ?, ?)
-      `).run(email.toLowerCase(), passwordHash, name || null, role || 'reviewer');
-
-      const userId = userResult.lastInsertRowid;
+      `, [email.toLowerCase(), passwordHash, name || null, role || 'reviewer']);
 
       // Auto-create linked human agent
-      const agentResult = db.prepare(`
+      const { lastInsertRowid: agentId } = await tx.insert(`
         INSERT INTO agents (name, type, description, capabilities, execution_mode, owner_user_id, status)
         VALUES (?, 'supervised', ?, '[]', 'human', ?, 'active')
-      `).run(
+      `, [
         name || email.split('@')[0],
         `Linked agent for user ${name || email}`,
         userId
-      );
+      ]);
 
-      return { userId, agentId: agentResult.lastInsertRowid };
-    })();
+      return { userId, agentId };
+    });
 
-    const user = db.prepare(`
+    const user = await db.one(`
       SELECT u.id, u.email, u.name, u.role, u.status, u.created_at, u.updated_at,
         a.id as linked_agent_id, a.name as linked_agent_name
       FROM users u
       LEFT JOIN agents a ON a.owner_user_id = u.id AND a.execution_mode = 'human'
       WHERE u.id = ?
-    `).get(result.userId);
+    `, [result.userId]);
 
     // Dispatch agent.registered event for the auto-created linked agent
     dispatchEvent('agent.registered', {
@@ -292,15 +290,15 @@ router.post('/', userAuth, requireRoles('admin'), validateBody(createUserSchema)
  * GET /api/users/:id
  * Get a specific user (admin only)
  */
-router.get('/:id', userAuth, requireRoles('admin'), (req, res) => {
+router.get('/:id', userAuth, requireRoles('admin'), async (req, res) => {
   try {
-    const user = db.prepare(`
+    const user = await db.one(`
       SELECT u.id, u.email, u.name, u.role, u.status, u.last_login_at, u.created_at, u.updated_at,
         a.id as linked_agent_id, a.name as linked_agent_name, a.status as linked_agent_status
       FROM users u
       LEFT JOIN agents a ON a.owner_user_id = u.id AND a.execution_mode = 'human'
       WHERE u.id = ?
-    `).get(req.params.id);
+    `, [req.params.id]);
 
     if (!user) {
       return response.notFound(res, 'User');
@@ -325,7 +323,7 @@ router.get('/:id', userAuth, requireRoles('admin'), (req, res) => {
  */
 router.patch('/:id', userAuth, requireRoles('admin'), validateBody(updateUserSchema), async (req, res) => {
   try {
-    const user = db.prepare('SELECT id, email FROM users WHERE id = ?').get(req.params.id);
+    const user = await db.one('SELECT id, email FROM users WHERE id = ?', [req.params.id]);
     if (!user) {
       return response.notFound(res, 'User');
     }
@@ -337,7 +335,7 @@ router.patch('/:id', userAuth, requireRoles('admin'), validateBody(updateUserSch
 
     if (email !== undefined) {
       // Check for duplicate
-      const existing = db.prepare('SELECT id FROM users WHERE email = ? AND id != ?').get(email.toLowerCase(), req.params.id);
+      const existing = await db.one('SELECT id FROM users WHERE email = ? AND id != ?', [email.toLowerCase(), req.params.id]);
       if (existing) {
         return response.error(res, 'A user with this email already exists', 409, 'DUPLICATE_EMAIL');
       }
@@ -363,34 +361,34 @@ router.patch('/:id', userAuth, requireRoles('admin'), validateBody(updateUserSch
     updates.push("updated_at = datetime('now')");
     values.push(req.params.id);
 
-    db.transaction(() => {
-      db.prepare(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+    await db.tx(async (tx) => {
+      await tx.exec(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`, values);
 
       // Cascade status to linked human agent
       if (status !== undefined) {
         const agentStatus = status === 'active' ? 'active' : 'disabled';
-        db.prepare(`
+        await tx.exec(`
           UPDATE agents SET status = ?, updated_at = datetime('now')
           WHERE owner_user_id = ? AND execution_mode = 'human'
-        `).run(agentStatus, req.params.id);
+        `, [agentStatus, req.params.id]);
       }
 
       // Cascade name to linked agent
       if (name !== undefined) {
-        db.prepare(`
+        await tx.exec(`
           UPDATE agents SET name = ?, updated_at = datetime('now')
           WHERE owner_user_id = ? AND execution_mode = 'human'
-        `).run(name, req.params.id);
+        `, [name, req.params.id]);
       }
-    })();
+    });
 
-    const updated = db.prepare(`
+    const updated = await db.one(`
       SELECT u.id, u.email, u.name, u.role, u.status, u.last_login_at, u.created_at, u.updated_at,
         a.id as linked_agent_id, a.name as linked_agent_name, a.status as linked_agent_status
       FROM users u
       LEFT JOIN agents a ON a.owner_user_id = u.id AND a.execution_mode = 'human'
       WHERE u.id = ?
-    `).get(req.params.id);
+    `, [req.params.id]);
 
     response.success(res, {
       ...normalizeUserTimestamps(updated),
@@ -409,7 +407,7 @@ router.patch('/:id', userAuth, requireRoles('admin'), validateBody(updateUserSch
  * Delete a user and their linked human agent (admin only)
  * Cannot delete yourself
  */
-router.delete('/:id', userAuth, requireRoles('admin'), (req, res) => {
+router.delete('/:id', userAuth, requireRoles('admin'), async (req, res) => {
   try {
     const userId = parseInt(req.params.id);
 
@@ -417,20 +415,20 @@ router.delete('/:id', userAuth, requireRoles('admin'), (req, res) => {
       return response.error(res, 'Cannot delete your own account', 400, 'SELF_DELETE');
     }
 
-    const user = db.prepare('SELECT id FROM users WHERE id = ?').get(userId);
+    const user = await db.one('SELECT id FROM users WHERE id = ?', [userId]);
     if (!user) {
       return response.notFound(res, 'User');
     }
 
-    db.transaction(() => {
+    await db.tx(async (tx) => {
       // Delete linked human agent (cascade handles agent_keys, agent_activity)
-      db.prepare(`
+      await tx.exec(`
         DELETE FROM agents WHERE owner_user_id = ? AND execution_mode = 'human'
-      `).run(userId);
+      `, [userId]);
 
       // Delete user (cascade handles sessions, user_keys)
-      db.prepare('DELETE FROM users WHERE id = ?').run(userId);
-    })();
+      await tx.exec('DELETE FROM users WHERE id = ?', [userId]);
+    });
 
     response.success(res, { deleted: true });
   } catch (err) {
@@ -445,7 +443,7 @@ router.delete('/:id', userAuth, requireRoles('admin'), (req, res) => {
  */
 router.post('/:id/reset-password', userAuth, requireRoles('admin'), async (req, res) => {
   try {
-    const user = db.prepare('SELECT id FROM users WHERE id = ?').get(req.params.id);
+    const user = await db.one('SELECT id FROM users WHERE id = ?', [req.params.id]);
     if (!user) {
       return response.notFound(res, 'User');
     }
@@ -456,14 +454,14 @@ router.post('/:id/reset-password', userAuth, requireRoles('admin'), async (req, 
     }
 
     const passwordHash = await hashPassword(password);
-    db.prepare(`
+    await db.exec(`
       UPDATE users
       SET password_hash = ?, force_password_change = 1, updated_at = datetime('now')
       WHERE id = ?
-    `).run(passwordHash, req.params.id);
+    `, [passwordHash, req.params.id]);
 
     // Invalidate all sessions for this user
-    db.prepare('DELETE FROM sessions WHERE user_id = ?').run(req.params.id);
+    await db.exec('DELETE FROM sessions WHERE user_id = ?', [req.params.id]);
 
     response.success(res, { reset: true });
   } catch (err) {

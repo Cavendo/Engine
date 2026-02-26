@@ -19,17 +19,19 @@ import {
   decrementActiveTaskCount,
   incrementActiveTaskCount
 } from '../services/taskRouter.js';
+import { createSqliteAdapter } from '../db/sqliteAdapter.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const schemaPath = join(__dirname, '..', 'db', 'schema.sql');
 
 function createTestDb() {
-  const db = Database(':memory:');
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
+  const raw = Database(':memory:');
+  raw.pragma('journal_mode = WAL');
+  raw.pragma('foreign_keys = ON');
   const schema = readFileSync(schemaPath, 'utf-8');
-  db.exec(schema);
-  return db;
+  raw.exec(schema);
+  const adapter = createSqliteAdapter(raw);
+  return { raw, adapter };
 }
 
 function seedAgent(db, overrides = {}) {
@@ -70,9 +72,12 @@ function seedDeliverable(db, taskId, version, agentId = null) {
 
 describe('Issue #15: Deliverable version uniqueness', () => {
   let db;
+  let adapter;
 
   beforeEach(() => {
-    db = createTestDb();
+    const testDb = createTestDb();
+    db = testDb.raw;
+    adapter = testDb.adapter;
   });
 
   afterEach(() => {
@@ -114,13 +119,13 @@ describe('Issue #15: Deliverable version uniqueness', () => {
     expect(id1).not.toBe(id2);
   });
 
-  test('retry succeeds after one forced unique conflict (production insertDeliverableWithRetry)', () => {
+  test('retry succeeds after one forced unique conflict (production insertDeliverableWithRetry)', async () => {
     const agentId = seedAgent(db);
     const taskId = seedTask(db, agentId);
     seedDeliverable(db, taskId, 1, agentId);
 
     let callCount = 0;
-    const result = insertDeliverableWithRetry(db, () => {
+    const result = await insertDeliverableWithRetry(adapter, async (tx) => {
       callCount++;
       if (callCount === 1) {
         // First attempt: force conflict by trying version 1 (already exists)
@@ -167,14 +172,14 @@ describe('Issue #15: Deliverable version uniqueness', () => {
     expect(count.count).toBe(2);
   });
 
-  test('revision path allocates correct version via MAX(version) (production insertDeliverableWithRetry)', () => {
+  test('revision path allocates correct version via MAX(version) (production insertDeliverableWithRetry)', async () => {
     const agentId = seedAgent(db);
     const taskId = seedTask(db, agentId);
     const d1Id = seedDeliverable(db, taskId, 1, agentId);
     seedDeliverable(db, taskId, 2, agentId);
 
     // Simulate revision: should get version 3 via MAX(version), not parent.version + 1
-    const result = insertDeliverableWithRetry(db, () => {
+    const result = await insertDeliverableWithRetry(adapter, async (tx) => {
       const lastVersion = db.prepare(
         'SELECT MAX(version) as max_version FROM deliverables WHERE task_id = ?'
       ).get(taskId);
@@ -189,20 +194,24 @@ describe('Issue #15: Deliverable version uniqueness', () => {
     expect(result.version).toBe(3);
   });
 
-  test('retry exhaustion throws after max retries (production insertDeliverableWithRetry)', () => {
+  test('retry exhaustion throws after max retries (production insertDeliverableWithRetry)', async () => {
     const agentId = seedAgent(db);
     const taskId = seedTask(db, agentId);
     seedDeliverable(db, taskId, 1, agentId);
 
     // Always try to insert version 1 — should exhaust retries
-    expect(() => {
-      insertDeliverableWithRetry(db, () => {
+    let threw = false;
+    try {
+      await insertDeliverableWithRetry(adapter, async (tx) => {
         db.prepare(`
           INSERT INTO deliverables (task_id, agent_id, title, content, version, status)
           VALUES (?, ?, ?, ?, ?, 'pending')
         `).run(taskId, agentId, 'Conflict', 'content', 1);
       });
-    }).toThrow();
+    } catch (err) {
+      threw = true;
+    }
+    expect(threw).toBe(true);
   });
 });
 
@@ -212,27 +221,30 @@ describe('Issue #15: Deliverable version uniqueness', () => {
 
 describe('Issue #18: Atomic capacity reservation', () => {
   let db;
+  let adapter;
 
   beforeEach(() => {
-    db = createTestDb();
+    const testDb = createTestDb();
+    db = testDb.raw;
+    adapter = testDb.adapter;
   });
 
   afterEach(() => {
     db.close();
   });
 
-  test('reserveAgentCapacity succeeds when capacity available (production fn)', () => {
+  test('reserveAgentCapacity succeeds when capacity available (production fn)', async () => {
     const agentId = seedAgent(db, { max_concurrent_tasks: 5, active_task_count: 2 });
-    const result = reserveAgentCapacity(agentId, db);
+    const result = await reserveAgentCapacity(agentId, adapter);
     expect(result.ok).toBe(true);
 
     const agent = db.prepare('SELECT active_task_count FROM agents WHERE id = ?').get(agentId);
     expect(agent.active_task_count).toBe(3);
   });
 
-  test('reserveAgentCapacity fails when at max capacity (production fn)', () => {
+  test('reserveAgentCapacity fails when at max capacity (production fn)', async () => {
     const agentId = seedAgent(db, { max_concurrent_tasks: 3, active_task_count: 3 });
-    const result = reserveAgentCapacity(agentId, db);
+    const result = await reserveAgentCapacity(agentId, adapter);
     expect(result.ok).toBe(false);
     expect(result.reason).toContain('At capacity');
 
@@ -240,32 +252,32 @@ describe('Issue #18: Atomic capacity reservation', () => {
     expect(agent.active_task_count).toBe(3); // unchanged
   });
 
-  test('reserveAgentCapacity fails for non-active agent (production fn)', () => {
+  test('reserveAgentCapacity fails for non-active agent (production fn)', async () => {
     const agentId = seedAgent(db, { status: 'paused', max_concurrent_tasks: 5, active_task_count: 0 });
-    const result = reserveAgentCapacity(agentId, db);
+    const result = await reserveAgentCapacity(agentId, adapter);
     expect(result.ok).toBe(false);
     expect(result.reason).toContain('paused');
   });
 
-  test('reserveAgentCapacity treats NULL active_task_count as 0 (production fn)', () => {
+  test('reserveAgentCapacity treats NULL active_task_count as 0 (production fn)', async () => {
     const result = db.prepare(`
       INSERT INTO agents (name, type, capabilities, status, max_concurrent_tasks, active_task_count)
       VALUES (?, ?, ?, ?, ?, NULL)
     `).run('NULL Count Agent', 'autonomous', '["test"]', 'active', 5);
     const agentId = Number(result.lastInsertRowid);
 
-    const reservation = reserveAgentCapacity(agentId, db);
+    const reservation = await reserveAgentCapacity(agentId, adapter);
     expect(reservation.ok).toBe(true);
 
     const agent = db.prepare('SELECT active_task_count FROM agents WHERE id = ?').get(agentId);
     expect(agent.active_task_count).toBe(1);
   });
 
-  test('simulated contention: fill to 1 slot left, two sequential reservations — exactly one succeeds', () => {
+  test('simulated contention: fill to 1 slot left, two sequential reservations — exactly one succeeds', async () => {
     const agentId = seedAgent(db, { max_concurrent_tasks: 3, active_task_count: 2 });
 
-    const r1 = reserveAgentCapacity(agentId, db);
-    const r2 = reserveAgentCapacity(agentId, db);
+    const r1 = await reserveAgentCapacity(agentId, adapter);
+    const r2 = await reserveAgentCapacity(agentId, adapter);
 
     expect(r1.ok).toBe(true);
     expect(r2.ok).toBe(false);
@@ -274,62 +286,66 @@ describe('Issue #18: Atomic capacity reservation', () => {
     expect(agent.active_task_count).toBe(3); // capped at max
   });
 
-  test('after failed reservation, active_task_count unchanged', () => {
+  test('after failed reservation, active_task_count unchanged', async () => {
     const agentId = seedAgent(db, { max_concurrent_tasks: 2, active_task_count: 2 });
 
     const before = db.prepare('SELECT active_task_count FROM agents WHERE id = ?').get(agentId);
-    reserveAgentCapacity(agentId, db); // should fail
+    await reserveAgentCapacity(agentId, adapter); // should fail
     const after = db.prepare('SELECT active_task_count FROM agents WHERE id = ?').get(agentId);
 
     expect(after.active_task_count).toBe(before.active_task_count);
   });
 
-  test('count consistency: reserve + release returns to original count (production fns)', () => {
+  test('count consistency: reserve + release returns to original count (production fns)', async () => {
     const agentId = seedAgent(db, { max_concurrent_tasks: 5, active_task_count: 2 });
 
-    reserveAgentCapacity(agentId, db);
+    await reserveAgentCapacity(agentId, adapter);
     const afterReserve = db.prepare('SELECT active_task_count FROM agents WHERE id = ?').get(agentId);
     expect(afterReserve.active_task_count).toBe(3);
 
-    decrementActiveTaskCount(agentId, db);
+    await decrementActiveTaskCount(agentId, adapter);
     const afterRelease = db.prepare('SELECT active_task_count FROM agents WHERE id = ?').get(agentId);
     expect(afterRelease.active_task_count).toBe(2);
   });
 
-  test('no count leak on task write failure: transaction rolls back reservation (production fn)', () => {
+  test('no count leak on task write failure: transaction rolls back reservation (production fn)', async () => {
     const agentId = seedAgent(db, { max_concurrent_tasks: 5, active_task_count: 1 });
 
     const beforeCount = db.prepare('SELECT active_task_count FROM agents WHERE id = ?').get(agentId).active_task_count;
 
     // Simulate: reserve + task INSERT that fails (violate NOT NULL on title)
-    expect(() => {
-      db.transaction(() => {
-        const reservation = reserveAgentCapacity(agentId, db);
+    let threw = false;
+    try {
+      await adapter.tx(async (tx) => {
+        const reservation = await reserveAgentCapacity(agentId, adapter);
         expect(reservation.ok).toBe(true);
 
         // Force task INSERT to fail
         db.prepare(`
           INSERT INTO tasks (title, assigned_agent_id, status) VALUES (NULL, ?, 'assigned')
         `).run(agentId);
-      })();
-    }).toThrow();
+      });
+    } catch (err) {
+      threw = true;
+    }
+    expect(threw).toBe(true);
 
     // Reservation should be rolled back
     const afterCount = db.prepare('SELECT active_task_count FROM agents WHERE id = ?').get(agentId).active_task_count;
     expect(afterCount).toBe(beforeCount);
   });
 
-  test('direct (manual) assignment bypasses capacity check (production incrementActiveTaskCount)', () => {
+  test('direct (manual) assignment bypasses capacity check (production incrementActiveTaskCount)', async () => {
     const agentId = seedAgent(db, { max_concurrent_tasks: 2, active_task_count: 2 });
 
     // Direct assignment uses incrementActiveTaskCount (unconditional)
-    incrementActiveTaskCount(agentId, db);
+    await incrementActiveTaskCount(agentId, adapter);
 
     const agent = db.prepare('SELECT active_task_count FROM agents WHERE id = ?').get(agentId);
     expect(agent.active_task_count).toBe(3); // exceeds max — that's intentional for admin override
   });
 
-  test('reserveAgentCapacity with NULL max_concurrent_tasks always succeeds (production fn)', () => {
+  test('reserveAgentCapacity with NULL max_concurrent_tasks always succeeds (production fn)', async () => {
     // NULL max = unlimited capacity
     const result = db.prepare(`
       INSERT INTO agents (name, type, capabilities, status, max_concurrent_tasks, active_task_count)
@@ -337,20 +353,20 @@ describe('Issue #18: Atomic capacity reservation', () => {
     `).run('Unlimited Agent', 'autonomous', '["test"]', 'active');
     const agentId = Number(result.lastInsertRowid);
 
-    const reservation = reserveAgentCapacity(agentId, db);
+    const reservation = await reserveAgentCapacity(agentId, adapter);
     expect(reservation.ok).toBe(true);
 
     const agent = db.prepare('SELECT active_task_count FROM agents WHERE id = ?').get(agentId);
     expect(agent.active_task_count).toBe(101);
   });
 
-  test('reserveAgentCapacity fails for non-existent agent (production fn)', () => {
-    const result = reserveAgentCapacity(99999, db);
+  test('reserveAgentCapacity fails for non-existent agent (production fn)', async () => {
+    const result = await reserveAgentCapacity(99999, adapter);
     expect(result.ok).toBe(false);
     expect(result.reason).toBe('Agent not found');
   });
 
-  test('PATCH reassign fallback: old agent count decremented when new reservation fails', () => {
+  test('PATCH reassign fallback: old agent count decremented when new reservation fails', async () => {
     // Simulates: task assigned to Agent A, PATCH auto-assign tries Agent B (at capacity),
     // reservation fails → task becomes unassigned, Agent A count must still decrement.
     const agentA = seedAgent(db, { name: 'Agent A', max_concurrent_tasks: 5, active_task_count: 2 });
@@ -361,17 +377,17 @@ describe('Issue #18: Atomic capacity reservation', () => {
     // 1. Try to reserve Agent B — should fail (at capacity)
     // 2. Task becomes unassigned (assigned_agent_id = NULL)
     // 3. Agent A's count must still be decremented
-    db.transaction(() => {
-      const reservation = reserveAgentCapacity(agentB, db);
+    await adapter.tx(async (tx) => {
+      const reservation = await reserveAgentCapacity(agentB, tx);
       expect(reservation.ok).toBe(false);
 
       // Regardless of reservation outcome, old agent is released
-      decrementActiveTaskCount(agentA, db);
+      await decrementActiveTaskCount(agentA, tx);
 
       // Update task to unassigned
-      db.prepare('UPDATE tasks SET assigned_agent_id = NULL, status = ?, updated_at = datetime(\'now\') WHERE id = ?')
-        .run('pending', taskId);
-    })();
+      await tx.exec('UPDATE tasks SET assigned_agent_id = NULL, status = ?, updated_at = datetime(\'now\') WHERE id = ?',
+        ['pending', taskId]);
+    });
 
     const agentAAfter = db.prepare('SELECT active_task_count FROM agents WHERE id = ?').get(agentA);
     const agentBAfter = db.prepare('SELECT active_task_count FROM agents WHERE id = ?').get(agentB);

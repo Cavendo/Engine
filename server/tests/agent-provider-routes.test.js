@@ -53,7 +53,7 @@ const { default: supertest } = await import('supertest');
 const { initializeDatabase } = await import('../db/init.js');
 const { runMigrations } = await import('../db/migrator.js');
 const { default: agentsRouter } = await import('../routes/agents.js');
-const { default: db } = await import('../db/connection.js');
+const { default: db } = await import('../db/adapter.js');
 
 // ============================================
 // Build minimal test app
@@ -86,21 +86,21 @@ function authed(req) {
 beforeAll(async () => {
   // Initialize schema + migrations on the shared db connection
   await initializeDatabase(db);
-  runMigrations(db);
+  await runMigrations(db);
 
   // Create an admin user
-  const userResult = db.prepare(`
+  const userResult = await db.insert(`
     INSERT INTO users (email, password_hash, name, role, status)
     VALUES ('admin@test.local', ?, 'Test Admin', 'admin', 'active')
-  `).run(FAKE_HASH);
+  `, [FAKE_HASH]);
   adminUserId = userResult.lastInsertRowid;
 
   // Create a session (expires in 1 hour)
   sessionId = crypto.randomUUID();
-  db.prepare(`
+  await db.exec(`
     INSERT INTO sessions (id, user_id, expires_at)
     VALUES (?, ?, datetime('now', '+1 hour'))
-  `).run(sessionId, adminUserId);
+  `, [sessionId, adminUserId]);
 
   app = buildApp();
 });
@@ -299,10 +299,10 @@ describe('POST /api/agents/:id/execute — openai_compatible without key', () =>
 
   it('does not reject execution for missing API key (openai_compatible)', async () => {
     // Create a task assigned to this agent
-    const task = db.prepare(`
+    const task = await db.insert(`
       INSERT INTO tasks (title, assigned_agent_id, status)
       VALUES ('Test task for execution', ?, 'assigned')
-    `).run(agentId);
+    `, [agentId]);
     const taskId = task.lastInsertRowid;
 
     // Execute will fail at the network level (no real Ollama running)

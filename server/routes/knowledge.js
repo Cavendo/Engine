@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import db from '../db/connection.js';
+import db from '../db/adapter.js';
 import * as response from '../utils/response.js';
 import { userAuth, requireRoles } from '../middleware/userAuth.js';
 import { dualAuth } from '../middleware/agentAuth.js';
@@ -73,7 +73,7 @@ function normalizeKnowledgeTimestamps(knowledge) {
  * Search knowledge base (accessible by agents)
  * NOTE: This route MUST come before /:id to avoid "search" being matched as an ID
  */
-router.get('/search', dualAuth, validateQuery(searchKnowledgeSchema), (req, res) => {
+router.get('/search', dualAuth, validateQuery(searchKnowledgeSchema), async (req, res) => {
   try {
     const { q, projectId, category } = req.query;
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 20));
@@ -109,7 +109,7 @@ router.get('/search', dualAuth, validateQuery(searchKnowledgeSchema), (req, res)
     query += ' ORDER BY k.created_at DESC LIMIT ?';
     params.push(limit);
 
-    const results = db.prepare(query).all(...params);
+    const results = await db.many(query, params);
 
     const parsed = results.map(k => normalizeKnowledgeTimestamps({
       ...k,
@@ -130,7 +130,7 @@ router.get('/search', dualAuth, validateQuery(searchKnowledgeSchema), (req, res)
  * List all knowledge entries with filtering
  * Supports both user auth (session/user keys) and agent auth (agent keys)
  */
-router.get('/', dualAuth, (req, res) => {
+router.get('/', dualAuth, async (req, res) => {
   try {
     const { projectId, category, search } = req.query;
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
@@ -162,7 +162,7 @@ router.get('/', dualAuth, (req, res) => {
     query += ' ORDER BY k.created_at DESC LIMIT ? OFFSET ?';
     params.push(limit, offset);
 
-    const knowledge = db.prepare(query).all(...params);
+    const knowledge = await db.many(query, params);
 
     const parsed = knowledge.map(k => normalizeKnowledgeTimestamps({
       ...k,
@@ -180,31 +180,31 @@ router.get('/', dualAuth, (req, res) => {
  * POST /api/knowledge
  * Create a new knowledge entry
  */
-router.post('/', userAuth, validateBody(createKnowledgeSchema), (req, res) => {
+router.post('/', userAuth, validateBody(createKnowledgeSchema), async (req, res) => {
   try {
     const { projectId, title, content, contentType, category, tags } = req.body;
 
     // Validate project exists if provided
     if (projectId) {
-      const project = db.prepare('SELECT id FROM projects WHERE id = ?').get(projectId);
+      const project = await db.one('SELECT id FROM projects WHERE id = ?', [projectId]);
       if (!project) {
         return response.validationError(res, 'Invalid project ID');
       }
     }
 
-    const result = db.prepare(`
+    const result = await db.insert(`
       INSERT INTO knowledge (project_id, title, content, content_type, category, tags)
       VALUES (?, ?, ?, ?, ?, ?)
-    `).run(
+    `, [
       projectId || null,
       title,
       content,
       contentType || 'markdown',
       category || null,
       JSON.stringify(tags || [])
-    );
+    ]);
 
-    const knowledge = db.prepare('SELECT * FROM knowledge WHERE id = ?').get(result.lastInsertRowid);
+    const knowledge = await db.one('SELECT * FROM knowledge WHERE id = ?', [result.lastInsertRowid]);
 
     // Trigger webhook for project knowledge update
     if (projectId) {
@@ -218,7 +218,7 @@ router.post('/', userAuth, validateBody(createKnowledgeSchema), (req, res) => {
       });
 
       // Dispatch knowledge.updated delivery route event
-      const project = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(projectId);
+      const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [projectId]);
       dispatchEvent('knowledge.updated', {
         project: project ? { id: project.id, name: project.name } : { id: projectId },
         projectId,
@@ -248,16 +248,16 @@ router.post('/', userAuth, validateBody(createKnowledgeSchema), (req, res) => {
  * GET /api/knowledge/:id
  * Get knowledge entry details
  */
-router.get('/:id', dualAuth, (req, res) => {
+router.get('/:id', dualAuth, async (req, res) => {
   try {
-    const knowledge = db.prepare(`
+    const knowledge = await db.one(`
       SELECT
         k.*,
         p.name as project_name
       FROM knowledge k
       LEFT JOIN projects p ON p.id = k.project_id
       WHERE k.id = ?
-    `).get(req.params.id);
+    `, [req.params.id]);
 
     if (!knowledge) {
       return response.notFound(res, 'Knowledge');
@@ -277,9 +277,9 @@ router.get('/:id', dualAuth, (req, res) => {
  * PATCH /api/knowledge/:id
  * Update knowledge entry
  */
-router.patch('/:id', userAuth, validateBody(updateKnowledgeSchema), (req, res) => {
+router.patch('/:id', userAuth, validateBody(updateKnowledgeSchema), async (req, res) => {
   try {
-    const knowledge = db.prepare('SELECT * FROM knowledge WHERE id = ?').get(req.params.id);
+    const knowledge = await db.one('SELECT * FROM knowledge WHERE id = ?', [req.params.id]);
     if (!knowledge) {
       return response.notFound(res, 'Knowledge');
     }
@@ -317,9 +317,9 @@ router.patch('/:id', userAuth, validateBody(updateKnowledgeSchema), (req, res) =
     updates.push("updated_at = datetime('now')");
     values.push(req.params.id);
 
-    db.prepare(`UPDATE knowledge SET ${updates.join(', ')} WHERE id = ?`).run(...values);
+    await db.exec(`UPDATE knowledge SET ${updates.join(', ')} WHERE id = ?`, values);
 
-    const updated = db.prepare('SELECT * FROM knowledge WHERE id = ?').get(req.params.id);
+    const updated = await db.one('SELECT * FROM knowledge WHERE id = ?', [req.params.id]);
 
     // Trigger webhook
     if (updated.project_id) {
@@ -333,7 +333,7 @@ router.patch('/:id', userAuth, validateBody(updateKnowledgeSchema), (req, res) =
       });
 
       // Dispatch knowledge.updated delivery route event
-      const project = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(updated.project_id);
+      const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [updated.project_id]);
       dispatchEvent('knowledge.updated', {
         project: project ? { id: project.id, name: project.name } : { id: updated.project_id },
         projectId: updated.project_id,
@@ -363,14 +363,14 @@ router.patch('/:id', userAuth, validateBody(updateKnowledgeSchema), (req, res) =
  * DELETE /api/knowledge/:id
  * Delete knowledge entry
  */
-router.delete('/:id', userAuth, requireRoles('admin'), (req, res) => {
+router.delete('/:id', userAuth, requireRoles('admin'), async (req, res) => {
   try {
-    const knowledge = db.prepare('SELECT * FROM knowledge WHERE id = ?').get(req.params.id);
+    const knowledge = await db.one('SELECT * FROM knowledge WHERE id = ?', [req.params.id]);
     if (!knowledge) {
       return response.notFound(res, 'Knowledge');
     }
 
-    db.prepare('DELETE FROM knowledge WHERE id = ?').run(req.params.id);
+    await db.exec('DELETE FROM knowledge WHERE id = ?', [req.params.id]);
 
     // Trigger webhook
     if (knowledge.project_id) {
@@ -381,7 +381,7 @@ router.delete('/:id', userAuth, requireRoles('admin'), (req, res) => {
       });
 
       // Dispatch knowledge.updated delivery route event
-      const project = db.prepare('SELECT id, name FROM projects WHERE id = ?').get(knowledge.project_id);
+      const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [knowledge.project_id]);
       dispatchEvent('knowledge.updated', {
         project: project ? { id: project.id, name: project.name } : { id: knowledge.project_id },
         projectId: knowledge.project_id,

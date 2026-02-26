@@ -4,6 +4,7 @@ import { join, dirname } from 'path';
 import { tmpdir } from 'os';
 import { fileURLToPath } from 'url';
 import Database from 'better-sqlite3';
+import { createSqliteAdapter } from '../db/sqliteAdapter.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -34,9 +35,10 @@ describe('Startup sequence (fresh install)', () => {
   test('initializeDatabase → runMigrations → runCryptoHealthCheck succeeds on empty DB', async () => {
     const db = new Database(freshDbPath);
     db.pragma('foreign_keys = ON');
+    const adapter = createSqliteAdapter(db);
 
     // Step 1: Initialize schema + seed data
-    await initializeDatabase(db);
+    await initializeDatabase(adapter);
 
     // Verify core tables exist
     const tables = db.prepare(
@@ -47,14 +49,14 @@ describe('Startup sequence (fresh install)', () => {
     expect(tables).toContain('deliverables');
 
     // Step 2: Run migrations (should handle "duplicate column" gracefully)
-    expect(() => runMigrations(db)).not.toThrow();
+    await runMigrations(adapter);
 
     // Verify schema_migrations table exists and migration 001 is marked applied
     const migrations = db.prepare('SELECT version FROM schema_migrations').all().map(r => r.version);
     expect(migrations).toContain('001_encryption_key_versions');
 
     // Step 3: Crypto health check
-    const health = runCryptoHealthCheck(db);
+    const health = await runCryptoHealthCheck(adapter);
     expect(health.ok).toBe(true);
 
     db.close();
@@ -66,6 +68,7 @@ describe('Startup sequence (upgrade from pre-001 schema)', () => {
     // Simulate an old database: create tables from pre-migration-001 fixture
     const db = new Database(upgradeDbPath);
     db.pragma('foreign_keys = ON');
+    const adapter = createSqliteAdapter(db);
 
     const oldSchema = readFileSync(join(__dirname, 'fixtures/schema-pre-001.sql'), 'utf-8');
     db.exec(oldSchema);
@@ -86,10 +89,10 @@ describe('Startup sequence (upgrade from pre-001 schema)', () => {
     // Now run initializeDatabase (idempotent CREATE TABLE IF NOT EXISTS)
     // Point DATABASE_PATH so init.js logs the right path
     process.env.DATABASE_PATH = upgradeDbPath;
-    await initializeDatabase(db);
+    await initializeDatabase(adapter);
 
     // Run migrations — 001 should ADD the columns and backfill
-    expect(() => runMigrations(db)).not.toThrow();
+    await runMigrations(adapter);
 
     // Verify columns were added
     const agentColsAfter = db.prepare('PRAGMA table_info(agents)').all().map(c => c.name);
@@ -108,7 +111,7 @@ describe('Startup sequence (upgrade from pre-001 schema)', () => {
     expect(migrations).toContain('001_encryption_key_versions');
 
     // Crypto health check should pass
-    const health = runCryptoHealthCheck(db);
+    const health = await runCryptoHealthCheck(adapter);
     expect(health.ok).toBe(true);
 
     db.close();

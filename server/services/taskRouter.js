@@ -3,7 +3,7 @@
  * Handles automatic task assignment based on project routing rules.
  */
 
-import db from '../db/connection.js';
+import db from '../db/adapter.js';
 
 // ============================================
 // Main Entry Point
@@ -15,13 +15,13 @@ import db from '../db/connection.js';
  * @param {Object} task - Task object with tags, priority, context
  * @returns {Object} Routing result: { matched, agentId, ruleId, ruleName, decision } or { matched: false, decision }
  */
-export function evaluateRoutingRules(projectId, task) {
+export async function evaluateRoutingRules(projectId, task) {
   // Load project's routing rules
-  const project = db.prepare(`
+  const project = await db.one(`
     SELECT task_routing_rules, default_agent_id
     FROM projects
     WHERE id = ?
-  `).get(projectId);
+  `, [projectId]);
 
   if (!project) {
     return { matched: false, decision: 'Project not found' };
@@ -31,7 +31,7 @@ export function evaluateRoutingRules(projectId, task) {
 
   if (!Array.isArray(rules) || rules.length === 0) {
     // No rules configured, try default agent
-    return tryDefaultAgent(project.default_agent_id, projectId, task.requiredCapabilities);
+    return await tryDefaultAgent(project.default_agent_id, projectId, task.requiredCapabilities);
   }
 
   // Sort rules by priority (ascending - lower number = higher priority)
@@ -41,8 +41,8 @@ export function evaluateRoutingRules(projectId, task) {
 
   // Check preferred agent first (before routing rules)
   if (task.preferredAgentId) {
-    const availability = checkAgentAvailability(task.preferredAgentId);
-    if (availability.available && agentHasCapabilities(task.preferredAgentId, task.requiredCapabilities)) {
+    const availability = await checkAgentAvailability(task.preferredAgentId);
+    if (availability.available && await agentHasCapabilities(task.preferredAgentId, task.requiredCapabilities)) {
       return {
         matched: true,
         agentId: parseInt(task.preferredAgentId, 10),
@@ -72,14 +72,14 @@ export function evaluateRoutingRules(projectId, task) {
 
     // Direct assignment
     if (rule.assign_to) {
-      const availability = checkAgentAvailability(rule.assign_to);
-      if (availability.available && agentHasCapabilities(rule.assign_to, task.requiredCapabilities)) {
+      const availability = await checkAgentAvailability(rule.assign_to);
+      if (availability.available && await agentHasCapabilities(rule.assign_to, task.requiredCapabilities)) {
         agentId = rule.assign_to;
         decision = `Assigned via rule "${rule.name}" to agent ${agentId}`;
       } else if (rule.fallback_to) {
         // Try fallback agent
-        const fallbackAvailability = checkAgentAvailability(rule.fallback_to);
-        if (fallbackAvailability.available && agentHasCapabilities(rule.fallback_to, task.requiredCapabilities)) {
+        const fallbackAvailability = await checkAgentAvailability(rule.fallback_to);
+        if (fallbackAvailability.available && await agentHasCapabilities(rule.fallback_to, task.requiredCapabilities)) {
           agentId = rule.fallback_to;
           decision = `Assigned via rule "${rule.name}" to fallback agent ${agentId} (primary unavailable: ${availability.reason})`;
         } else {
@@ -92,7 +92,7 @@ export function evaluateRoutingRules(projectId, task) {
     // Capability-based assignment
     else if (rule.assign_to_capability) {
       const strategy = rule.assign_strategy || 'least_busy';
-      agentId = findAgentByCapability(rule.assign_to_capability, strategy, task.requiredCapabilities);
+      agentId = await findAgentByCapability(rule.assign_to_capability, strategy, task.requiredCapabilities);
 
       if (agentId) {
         decision = `Assigned via rule "${rule.name}" to agent ${agentId} (capability: ${rule.assign_to_capability}, strategy: ${strategy})`;
@@ -115,7 +115,7 @@ export function evaluateRoutingRules(projectId, task) {
   }
 
   // No rules matched, try default agent
-  return tryDefaultAgent(project.default_agent_id, projectId, task.requiredCapabilities);
+  return await tryDefaultAgent(project.default_agent_id, projectId, task.requiredCapabilities);
 }
 
 /**
@@ -125,13 +125,13 @@ export function evaluateRoutingRules(projectId, task) {
  * @param {string[]} requiredCapabilities - Required capabilities the agent must have
  * @returns {Object} Routing result
  */
-function tryDefaultAgent(defaultAgentId, projectId, requiredCapabilities) {
+async function tryDefaultAgent(defaultAgentId, projectId, requiredCapabilities) {
   if (!defaultAgentId) {
     return { matched: false, decision: 'No matching rule and no default agent configured' };
   }
 
-  const availability = checkAgentAvailability(defaultAgentId);
-  if (availability.available && agentHasCapabilities(defaultAgentId, requiredCapabilities)) {
+  const availability = await checkAgentAvailability(defaultAgentId);
+  if (availability.available && await agentHasCapabilities(defaultAgentId, requiredCapabilities)) {
     return {
       matched: true,
       agentId: parseInt(defaultAgentId, 10),
@@ -218,12 +218,12 @@ export function matchConditions(conditions, task) {
  * @param {number|string} agentId - Agent ID to check
  * @returns {Object} { available: boolean, reason?: string }
  */
-export function checkAgentAvailability(agentId) {
-  const agent = db.prepare(`
+export async function checkAgentAvailability(agentId) {
+  const agent = await db.one(`
     SELECT status, max_concurrent_tasks, active_task_count
     FROM agents
     WHERE id = ?
-  `).get(agentId);
+  `, [agentId]);
 
   if (!agent) {
     return { available: false, reason: 'Agent not found' };
@@ -258,25 +258,28 @@ export function checkAgentAvailability(agentId) {
  * @param {string[]} requiredCapabilities - Additional required capabilities the agent must have
  * @returns {number|null} Agent ID or null if none available
  */
-export function findAgentByCapability(capability, strategy = 'least_busy', requiredCapabilities) {
+export async function findAgentByCapability(capability, strategy = 'least_busy', requiredCapabilities) {
   // Find all active agents with the capability
   // capabilities is stored as JSON array, so we search for the capability string
-  const agents = db.prepare(`
+  const agents = await db.many(`
     SELECT id, active_task_count, max_concurrent_tasks
     FROM agents
     WHERE status = 'active'
       AND capabilities LIKE ?
-  `).all(`%"${capability}"%`);
+  `, [`%"${capability}"%`]);
 
   if (agents.length === 0) {
     return null;
   }
 
   // Filter by availability and required capabilities
-  const availableAgents = agents.filter(agent => {
-    const availability = checkAgentAvailability(agent.id);
-    return availability.available && agentHasCapabilities(agent.id, requiredCapabilities);
-  });
+  const availableAgents = [];
+  for (const agent of agents) {
+    const availability = await checkAgentAvailability(agent.id);
+    if (availability.available && await agentHasCapabilities(agent.id, requiredCapabilities)) {
+      availableAgents.push(agent);
+    }
+  }
 
   if (availableAgents.length === 0) {
     return null;
@@ -325,12 +328,12 @@ export function findAgentByCapability(capability, strategy = 'least_busy', requi
  * and increment into a single atomic UPDATE with a WHERE guard.
  *
  * @param {number|string} agentId - Agent ID
- * @param {import('better-sqlite3').Database} [_db] - Optional DB override (for testing)
+ * @param {Object} [_db] - Optional DB override (for testing)
  * @returns {{ ok: boolean, reason?: string }}
  */
-export function reserveAgentCapacity(agentId, _db) {
+export async function reserveAgentCapacity(agentId, _db) {
   const d = _db || db;
-  const result = d.prepare(`
+  const result = await d.exec(`
     UPDATE agents
     SET active_task_count = COALESCE(active_task_count, 0) + 1,
         updated_at = datetime('now')
@@ -338,14 +341,14 @@ export function reserveAgentCapacity(agentId, _db) {
       AND status = 'active'
       AND (max_concurrent_tasks IS NULL
            OR COALESCE(active_task_count, 0) < max_concurrent_tasks)
-  `).run(agentId);
+  `, [agentId]);
 
   if (result.changes === 1) {
     return { ok: true };
   }
 
   // Determine reason for failure
-  const agent = d.prepare('SELECT status, active_task_count, max_concurrent_tasks FROM agents WHERE id = ?').get(agentId);
+  const agent = await d.one('SELECT status, active_task_count, max_concurrent_tasks FROM agents WHERE id = ?', [agentId]);
   if (!agent) return { ok: false, reason: 'Agent not found' };
   if (agent.status !== 'active') return { ok: false, reason: `Agent status is ${agent.status}` };
   const count = agent.active_task_count ?? 0;
@@ -356,17 +359,17 @@ export function reserveAgentCapacity(agentId, _db) {
  * Increment the active task count for an agent (unconditional).
  * Used for direct/manual assignment where capacity is not enforced.
  * @param {number|string} agentId - Agent ID
- * @param {import('better-sqlite3').Database} [_db] - Optional DB override (for testing)
+ * @param {Object} [_db] - Optional DB override (for testing)
  * @returns {boolean} True if successful
  */
-export function incrementActiveTaskCount(agentId, _db) {
+export async function incrementActiveTaskCount(agentId, _db) {
   const d = _db || db;
-  const result = d.prepare(`
+  const result = await d.exec(`
     UPDATE agents
     SET active_task_count = COALESCE(active_task_count, 0) + 1,
         updated_at = datetime('now')
     WHERE id = ?
-  `).run(agentId);
+  `, [agentId]);
 
   return result.changes > 0;
 }
@@ -375,17 +378,17 @@ export function incrementActiveTaskCount(agentId, _db) {
  * Decrement the active task count for an agent (atomic update).
  * Alias: releaseAgentCapacity
  * @param {number|string} agentId - Agent ID
- * @param {import('better-sqlite3').Database} [_db] - Optional DB override (for testing)
+ * @param {Object} [_db] - Optional DB override (for testing)
  * @returns {boolean} True if successful
  */
-export function decrementActiveTaskCount(agentId, _db) {
+export async function decrementActiveTaskCount(agentId, _db) {
   const d = _db || db;
-  const result = d.prepare(`
+  const result = await d.exec(`
     UPDATE agents
     SET active_task_count = MAX(0, COALESCE(active_task_count, 0) - 1),
         updated_at = datetime('now')
     WHERE id = ?
-  `).run(agentId);
+  `, [agentId]);
 
   return result.changes > 0;
 }
@@ -402,18 +405,18 @@ export const releaseAgentCapacity = decrementActiveTaskCount;
  * @param {number} projectId - Project ID
  * @returns {number|null} Agent ID or null if not set/unavailable
  */
-export function getProjectDefaultAgent(projectId) {
-  const project = db.prepare(`
+export async function getProjectDefaultAgent(projectId) {
+  const project = await db.one(`
     SELECT default_agent_id
     FROM projects
     WHERE id = ?
-  `).get(projectId);
+  `, [projectId]);
 
   if (!project || !project.default_agent_id) {
     return null;
   }
 
-  const availability = checkAgentAvailability(project.default_agent_id);
+  const availability = await checkAgentAvailability(project.default_agent_id);
   if (!availability.available) {
     return null;
   }
@@ -431,9 +434,9 @@ export function getProjectDefaultAgent(projectId) {
  * @param {string[]} requiredCapabilities - List of required capabilities
  * @returns {boolean} True if agent has all required capabilities (or none required)
  */
-function agentHasCapabilities(agentId, requiredCapabilities) {
+async function agentHasCapabilities(agentId, requiredCapabilities) {
   if (!requiredCapabilities || requiredCapabilities.length === 0) return true;
-  const agent = db.prepare('SELECT capabilities FROM agents WHERE id = ?').get(agentId);
+  const agent = await db.one('SELECT capabilities FROM agents WHERE id = ?', [agentId]);
   const agentCaps = safeJsonParse(agent?.capabilities, []);
   return requiredCapabilities.every(cap => agentCaps.includes(cap));
 }

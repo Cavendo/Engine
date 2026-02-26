@@ -4,7 +4,7 @@
  */
 
 import express from 'express';
-import db from '../db/connection.js';
+import db from '../db/adapter.js';
 import { userAuth, requireRoles } from '../middleware/userAuth.js';
 import * as response from '../utils/response.js';
 import { validateBody, validateParams, validateQuery, idParamSchema, TRIGGER_EVENTS, validateEndpoint, validateEndpointWithDns } from '../utils/validation.js';
@@ -205,7 +205,7 @@ function formatRoute(route, isAdmin = false) {
  */
 router.get('/routes/global', userAuth, requireRoles('admin'), async (req, res) => {
   try {
-    const routes = db.prepare(`
+    const routes = await db.many(`
       SELECT r.*,
         (SELECT COUNT(*) FROM delivery_logs dl WHERE dl.route_id = r.id AND dl.status = 'delivered') as success_count,
         (SELECT COUNT(*) FROM delivery_logs dl WHERE dl.route_id = r.id AND dl.status = 'failed') as failure_count,
@@ -213,7 +213,7 @@ router.get('/routes/global', userAuth, requireRoles('admin'), async (req, res) =
       FROM routes r
       WHERE r.project_id IS NULL
       ORDER BY r.created_at DESC
-    `).all();
+    `, []);
 
     response.success(res, routes.map(r => formatRoute(r, true)));
   } catch (err) {
@@ -241,13 +241,13 @@ router.post('/routes/global', userAuth, requireRoles('admin'), validateBody(crea
       }
     }
 
-    const result = db.prepare(`
+    const result = await db.insert(`
       INSERT INTO routes (
         project_id, name, description, trigger_event, trigger_conditions,
         destination_type, destination_config, field_mapping, retry_policy, enabled
       )
       VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
+    `, [
       name,
       description || null,
       trigger_event,
@@ -257,9 +257,9 @@ router.post('/routes/global', userAuth, requireRoles('admin'), validateBody(crea
       JSON.stringify(field_mapping || null),
       JSON.stringify(retry_policy || { max_retries: 3, backoff_type: 'exponential', initial_delay_ms: 1000 }),
       enabled ? 1 : 0
-    );
+    ]);
 
-    const route = db.prepare('SELECT * FROM routes WHERE id = ?').get(result.lastInsertRowid);
+    const route = await db.one('SELECT * FROM routes WHERE id = ?', [result.lastInsertRowid]);
     response.created(res, formatRoute(route, true));
   } catch (err) {
     console.error('Error creating global route:', err);
@@ -280,7 +280,7 @@ router.post('/projects/:id/routes', userAuth, requireRoles('admin'), validatePar
     const projectId = req.params.id;
 
     // Verify project exists
-    const project = db.prepare('SELECT id FROM projects WHERE id = ?').get(projectId);
+    const project = await db.one('SELECT id FROM projects WHERE id = ?', [projectId]);
     if (!project) {
       return response.notFound(res, 'Project');
     }
@@ -305,13 +305,13 @@ router.post('/projects/:id/routes', userAuth, requireRoles('admin'), validatePar
       }
     }
 
-    const result = db.prepare(`
+    const result = await db.insert(`
       INSERT INTO routes (
         project_id, name, description, trigger_event, trigger_conditions,
         destination_type, destination_config, field_mapping, retry_policy, enabled
       )
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
+    `, [
       projectId,
       name,
       description || null,
@@ -322,9 +322,9 @@ router.post('/projects/:id/routes', userAuth, requireRoles('admin'), validatePar
       JSON.stringify(field_mapping || null),
       JSON.stringify(retry_policy || { max_retries: 3, backoff_type: 'exponential', initial_delay_ms: 1000 }),
       enabled ? 1 : 0
-    );
+    ]);
 
-    const route = db.prepare('SELECT * FROM routes WHERE id = ?').get(result.lastInsertRowid);
+    const route = await db.one('SELECT * FROM routes WHERE id = ?', [result.lastInsertRowid]);
     // Admin-only endpoint, so show full config
     response.created(res, formatRoute(route, true));
   } catch (err) {
@@ -344,12 +344,12 @@ router.get('/projects/:id/routes', userAuth, validateParams(idParamSchema), asyn
     const isAdmin = req.user?.role === 'admin';
 
     // Verify project exists
-    const project = db.prepare('SELECT id FROM projects WHERE id = ?').get(projectId);
+    const project = await db.one('SELECT id FROM projects WHERE id = ?', [projectId]);
     if (!project) {
       return response.notFound(res, 'Project');
     }
 
-    const routes = db.prepare(`
+    const routes = await db.many(`
       SELECT r.*,
         (SELECT COUNT(*) FROM delivery_logs dl WHERE dl.route_id = r.id AND dl.status = 'delivered') as success_count,
         (SELECT COUNT(*) FROM delivery_logs dl WHERE dl.route_id = r.id AND dl.status = 'failed') as failure_count,
@@ -357,7 +357,7 @@ router.get('/projects/:id/routes', userAuth, validateParams(idParamSchema), asyn
       FROM routes r
       WHERE r.project_id = ?
       ORDER BY r.created_at DESC
-    `).all(projectId);
+    `, [projectId]);
 
     response.success(res, routes.map(r => formatRoute(r, isAdmin)));
   } catch (err) {
@@ -379,14 +379,14 @@ router.get('/routes/:id', userAuth, validateParams(idParamSchema), async (req, r
   try {
     const isAdmin = req.user?.role === 'admin';
 
-    const route = db.prepare(`
+    const route = await db.one(`
       SELECT r.*,
         (SELECT COUNT(*) FROM delivery_logs dl WHERE dl.route_id = r.id AND dl.status = 'delivered') as success_count,
         (SELECT COUNT(*) FROM delivery_logs dl WHERE dl.route_id = r.id AND dl.status = 'failed') as failure_count,
         (SELECT MAX(dispatched_at) FROM delivery_logs dl WHERE dl.route_id = r.id) as last_fired_at
       FROM routes r
       WHERE r.id = ?
-    `).get(req.params.id);
+    `, [req.params.id]);
 
     if (!route) {
       return response.notFound(res, 'Route');
@@ -405,7 +405,7 @@ router.get('/routes/:id', userAuth, validateParams(idParamSchema), async (req, r
  */
 router.put('/routes/:id', userAuth, requireRoles('admin'), validateParams(idParamSchema), validateBody(updateRouteSchema), async (req, res) => {
   try {
-    const route = db.prepare('SELECT * FROM routes WHERE id = ?').get(req.params.id);
+    const route = await db.one('SELECT * FROM routes WHERE id = ?', [req.params.id]);
     if (!route) {
       return response.notFound(res, 'Route');
     }
@@ -491,11 +491,11 @@ router.put('/routes/:id', userAuth, requireRoles('admin'), validateParams(idPara
     updates.push('updated_at = datetime(\'now\')');
     values.push(req.params.id);
 
-    db.prepare(`
+    await db.exec(`
       UPDATE routes SET ${updates.join(', ')} WHERE id = ?
-    `).run(...values);
+    `, values);
 
-    const updated = db.prepare('SELECT * FROM routes WHERE id = ?').get(req.params.id);
+    const updated = await db.one('SELECT * FROM routes WHERE id = ?', [req.params.id]);
     // Admin-only endpoint, so show full config
     response.success(res, formatRoute(updated, true));
   } catch (err) {
@@ -510,12 +510,12 @@ router.put('/routes/:id', userAuth, requireRoles('admin'), validateParams(idPara
  */
 router.delete('/routes/:id', userAuth, requireRoles('admin'), validateParams(idParamSchema), async (req, res) => {
   try {
-    const route = db.prepare('SELECT * FROM routes WHERE id = ?').get(req.params.id);
+    const route = await db.one('SELECT * FROM routes WHERE id = ?', [req.params.id]);
     if (!route) {
       return response.notFound(res, 'Route');
     }
 
-    db.prepare('DELETE FROM routes WHERE id = ?').run(req.params.id);
+    await db.exec('DELETE FROM routes WHERE id = ?', [req.params.id]);
     response.success(res, { message: 'Route deleted successfully' });
   } catch (err) {
     console.error('Error deleting route:', err);
@@ -529,7 +529,7 @@ router.delete('/routes/:id', userAuth, requireRoles('admin'), validateParams(idP
  */
 router.post('/routes/:id/test', userAuth, requireRoles('admin'), validateParams(idParamSchema), async (req, res) => {
   try {
-    const route = db.prepare('SELECT * FROM routes WHERE id = ?').get(req.params.id);
+    const route = await db.one('SELECT * FROM routes WHERE id = ?', [req.params.id]);
     if (!route) {
       return response.notFound(res, 'Route');
     }
@@ -584,7 +584,7 @@ router.post('/routes/:id/test', userAuth, requireRoles('admin'), validateParams(
  */
 router.get('/routes/:id/logs', userAuth, validateParams(idParamSchema), validateQuery(logsQuerySchema), async (req, res) => {
   try {
-    const route = db.prepare('SELECT id FROM routes WHERE id = ?').get(req.params.id);
+    const route = await db.one('SELECT id FROM routes WHERE id = ?', [req.params.id]);
     if (!route) {
       return response.notFound(res, 'Route');
     }
@@ -610,7 +610,7 @@ router.get('/routes/:id/logs', userAuth, validateParams(idParamSchema), validate
     query += ' ORDER BY dispatched_at DESC LIMIT ? OFFSET ?';
     params.push(limit || 50, offset || 0);
 
-    const logs = db.prepare(query).all(...params);
+    const logs = await db.many(query, params);
 
     // Get total count for pagination
     let countQuery = 'SELECT COUNT(*) as total FROM delivery_logs WHERE route_id = ?';
@@ -627,7 +627,7 @@ router.get('/routes/:id/logs', userAuth, validateParams(idParamSchema), validate
       countQuery += ' AND event_type = ?';
       countParams.push(event_type);
     }
-    const { total } = db.prepare(countQuery).get(...countParams);
+    const { total } = await db.one(countQuery, countParams);
 
     const isAdmin = req.user?.role === 'admin';
     response.success(res, {
@@ -652,12 +652,12 @@ router.post('/routes/:id/logs/:logId/retry', userAuth, requireRoles('admin'), as
   try {
     const { id: routeId, logId } = req.params;
 
-    const log = db.prepare(`
+    const log = await db.one(`
       SELECT dl.*, r.destination_type, r.destination_config, r.field_mapping
       FROM delivery_logs dl
       JOIN routes r ON r.id = dl.route_id
       WHERE dl.id = ? AND dl.route_id = ?
-    `).get(logId, routeId);
+    `, [logId, routeId]);
 
     if (!log) {
       return response.notFound(res, 'Delivery log');
@@ -668,16 +668,16 @@ router.post('/routes/:id/logs/:logId/retry', userAuth, requireRoles('admin'), as
     }
 
     // Get the route
-    const route = db.prepare('SELECT * FROM routes WHERE id = ?').get(routeId);
+    const route = await db.one('SELECT * FROM routes WHERE id = ?', [routeId]);
 
     // Reconstruct event data, enriching with assignee info if missing
     const eventData = safeJsonParse(log.event_payload, {});
     if (!eventData.assignee && eventData.task?.assigned_agent_id) {
-      const agent = db.prepare('SELECT id, name, execution_mode, owner_user_id FROM agents WHERE id = ?').get(eventData.task.assigned_agent_id);
+      const agent = await db.one('SELECT id, name, execution_mode, owner_user_id FROM agents WHERE id = ?', [eventData.task.assigned_agent_id]);
       if (agent) {
         const assignee = { id: agent.id, name: agent.name, executionMode: agent.execution_mode };
         if (agent.owner_user_id) {
-          const user = db.prepare('SELECT email, name FROM users WHERE id = ?').get(agent.owner_user_id);
+          const user = await db.one('SELECT email, name FROM users WHERE id = ?', [agent.owner_user_id]);
           if (user) { assignee.email = user.email; assignee.userName = user.name; }
         }
         eventData.assignee = assignee;

@@ -1,7 +1,8 @@
 import { generateWebhookSignature, verifyWebhookSignature, encrypt, decrypt, canDecrypt, testEncryption, runCryptoHealthCheck, _resetKeyringCache } from '../utils/crypto.js';
+import { createSqliteAdapter } from '../db/sqliteAdapter.js';
 
 // Helper: set env vars and reset cache
-function withEnv(vars, fn) {
+async function withEnv(vars, fn) {
   const saved = {};
   for (const [k, v] of Object.entries(vars)) {
     saved[k] = process.env[k];
@@ -10,7 +11,7 @@ function withEnv(vars, fn) {
   }
   _resetKeyringCache();
   try {
-    return fn();
+    return await fn();
   } finally {
     for (const [k, v] of Object.entries(saved)) {
       if (v === undefined) delete process.env[k];
@@ -283,6 +284,7 @@ describe('encryption key versioning', () => {
   describe('runCryptoHealthCheck', () => {
     let Database;
     let db;
+    let adapter;
 
     beforeAll(async () => {
       Database = (await import('better-sqlite3')).default;
@@ -309,19 +311,20 @@ describe('encryption key versioning', () => {
           secret_access_key_key_version INTEGER
         );
       `);
+      adapter = createSqliteAdapter(db);
     });
 
     afterEach(() => {
       db.close();
     });
 
-    it('returns ok for empty database', () => {
-      withEnv({
+    it('returns ok for empty database', async () => {
+      await withEnv({
         ENCRYPTION_KEY: KEY_V1,
         ENCRYPTION_KEYRING: undefined,
         ENCRYPTION_KEY_VERSION_CURRENT: undefined
-      }, () => {
-        const result = runCryptoHealthCheck(db);
+      }, async () => {
+        const result = await runCryptoHealthCheck(adapter);
         expect(result.ok).toBe(true);
         expect(result.total).toBe(0);
         expect(result.failed).toBe(0);
@@ -330,32 +333,32 @@ describe('encryption key versioning', () => {
       });
     });
 
-    it('returns ok for correctly encrypted rows', () => {
-      withEnv({
+    it('returns ok for correctly encrypted rows', async () => {
+      await withEnv({
         ENCRYPTION_KEY: KEY_V1,
         ENCRYPTION_KEYRING: undefined,
         ENCRYPTION_KEY_VERSION_CURRENT: undefined
-      }, () => {
+      }, async () => {
         const { encrypted, iv, keyVersion } = encrypt('test-key');
         db.prepare('INSERT INTO agents (id, provider_api_key_encrypted, provider_api_key_iv, encryption_key_version) VALUES (?, ?, ?, ?)').run(1, encrypted, iv, keyVersion);
 
-        const result = runCryptoHealthCheck(db);
+        const result = await runCryptoHealthCheck(adapter);
         expect(result.ok).toBe(true);
         expect(result.total).toBe(1);
         expect(result.failed).toBe(0);
       });
     });
 
-    it('reports failures for unreadable encrypted rows', () => {
-      withEnv({
+    it('reports failures for unreadable encrypted rows', async () => {
+      await withEnv({
         ENCRYPTION_KEY: KEY_V1,
         ENCRYPTION_KEYRING: undefined,
         ENCRYPTION_KEY_VERSION_CURRENT: undefined
-      }, () => {
+      }, async () => {
         // Insert a row with garbage encrypted data
         db.prepare('INSERT INTO agents (id, provider_api_key_encrypted, provider_api_key_iv, encryption_key_version) VALUES (?, ?, ?, ?)').run(1, 'garbage', 'garbage', 1);
 
-        const result = runCryptoHealthCheck(db);
+        const result = await runCryptoHealthCheck(adapter);
         expect(result.ok).toBe(false);
         expect(result.total).toBe(1);
         expect(result.failed).toBe(1);
@@ -370,12 +373,12 @@ describe('encryption key versioning', () => {
       });
     });
 
-    it('checks storage_connections correctly', () => {
-      withEnv({
+    it('checks storage_connections correctly', async () => {
+      await withEnv({
         ENCRYPTION_KEY: KEY_V1,
         ENCRYPTION_KEYRING: undefined,
         ENCRYPTION_KEY_VERSION_CURRENT: undefined
-      }, () => {
+      }, async () => {
         const ak = encrypt('access-key');
         const sk = encrypt('secret-key');
         db.prepare(`
@@ -383,19 +386,19 @@ describe('encryption key versioning', () => {
           VALUES (?, ?, ?, ?, ?, ?, ?)
         `).run(1, ak.encrypted, ak.iv, ak.keyVersion, sk.encrypted, sk.iv, sk.keyVersion);
 
-        const result = runCryptoHealthCheck(db);
+        const result = await runCryptoHealthCheck(adapter);
         expect(result.ok).toBe(true);
         expect(result.total).toBe(2); // Two encrypted columns
       });
     });
 
-    it('returns correct shape', () => {
-      withEnv({
+    it('returns correct shape', async () => {
+      await withEnv({
         ENCRYPTION_KEY: KEY_V1,
         ENCRYPTION_KEYRING: undefined,
         ENCRYPTION_KEY_VERSION_CURRENT: undefined
-      }, () => {
-        const result = runCryptoHealthCheck(db);
+      }, async () => {
+        const result = await runCryptoHealthCheck(adapter);
         expect(result).toHaveProperty('ok');
         expect(result).toHaveProperty('total');
         expect(result).toHaveProperty('failed');

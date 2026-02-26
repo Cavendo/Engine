@@ -14,23 +14,8 @@
  *   node server/scripts/crypto-audit.js
  */
 
-import { dirname, join } from 'path';
-import { fileURLToPath } from 'url';
-import { existsSync, readFileSync } from 'fs';
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const PROJECT_ROOT = join(__dirname, '../..');
-
-// Load .env
-const envPath = join(PROJECT_ROOT, '.env');
-if (existsSync(envPath)) {
-  for (const line of readFileSync(envPath, 'utf-8').split('\n')) {
-    const match = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
-    if (match && !process.env[match[1]]) {
-      process.env[match[1]] = match[2];
-    }
-  }
-}
+// Load .env via centralized bootstrap (must come before adapter/crypto imports)
+import '../env.js';
 
 // Suppress console.warn/error from crypto module during audit (we capture results structurally)
 const originalWarn = console.warn;
@@ -38,7 +23,7 @@ const originalError = console.error;
 console.warn = () => {};
 console.error = () => {};
 
-const Database = (await import('better-sqlite3')).default;
+const { default: db } = await import('../db/adapter.js');
 const { canDecrypt, _resetKeyringCache } = await import('../utils/crypto.js');
 
 // Reset cache after env is loaded so crypto module picks up the .env values
@@ -49,16 +34,6 @@ console.warn = originalWarn;
 console.error = originalError;
 
 try {
-  const DB_PATH = process.env.DATABASE_PATH || join(PROJECT_ROOT, 'data/cavendo.db');
-  if (!existsSync(DB_PATH)) {
-    const result = { error: 'Database not found', path: DB_PATH };
-    process.stdout.write(JSON.stringify(result, null, 2) + '\n');
-    process.exit(2);
-  }
-
-  const db = new Database(DB_PATH, { readonly: true });
-  db.pragma('foreign_keys = ON');
-
   const report = {
     timestamp: new Date().toISOString(),
     tables: {},
@@ -71,16 +46,16 @@ try {
     let agents;
     let hasVersionCol = true;
     try {
-      agents = db.prepare(`
+      agents = await db.many(`
         SELECT id, name, provider_api_key_encrypted, provider_api_key_iv, encryption_key_version
         FROM agents WHERE provider_api_key_encrypted IS NOT NULL
-      `).all();
+      `);
     } catch {
       hasVersionCol = false;
-      agents = db.prepare(`
+      agents = await db.many(`
         SELECT id, name, provider_api_key_encrypted, provider_api_key_iv
         FROM agents WHERE provider_api_key_encrypted IS NOT NULL
-      `).all();
+      `);
     }
 
     const agentResults = [];
@@ -108,20 +83,20 @@ try {
     let conns;
     let hasVersionCols = true;
     try {
-      conns = db.prepare(`
+      conns = await db.many(`
         SELECT id, name, access_key_id_encrypted, access_key_id_iv, access_key_id_key_version,
           secret_access_key_encrypted, secret_access_key_iv, secret_access_key_key_version
         FROM storage_connections
         WHERE access_key_id_encrypted IS NOT NULL OR secret_access_key_encrypted IS NOT NULL
-      `).all();
+      `);
     } catch {
       hasVersionCols = false;
-      conns = db.prepare(`
+      conns = await db.many(`
         SELECT id, name, access_key_id_encrypted, access_key_id_iv,
           secret_access_key_encrypted, secret_access_key_iv
         FROM storage_connections
         WHERE access_key_id_encrypted IS NOT NULL OR secret_access_key_encrypted IS NOT NULL
-      `).all();
+      `);
     }
 
     const connResults = [];
@@ -160,7 +135,7 @@ try {
     report.tables.storage_connections = { error: err.message };
   }
 
-  db.close();
+  await db.close();
 
   process.stdout.write(JSON.stringify(report, null, 2) + '\n');
   process.exit(report.summary.failed > 0 ? 1 : 0);
