@@ -1,15 +1,11 @@
 import db from '../db/adapter.js';
 import * as response from '../utils/response.js';
 
-/**
- * Middleware to authenticate users via session cookie
- * Attaches user object to req.user if authenticated
- */
-export async function userAuth(req, res, next) {
+async function resolveUserSession(req) {
   const sessionId = req.cookies?.session;
 
   if (!sessionId) {
-    return response.unauthorized(res, 'Session required');
+    return { ok: false, reason: 'missing_session' };
   }
 
   const session = await db.one(`
@@ -28,30 +24,75 @@ export async function userAuth(req, res, next) {
   `, [sessionId]);
 
   if (!session) {
-    res.clearCookie('session');
-    return response.unauthorized(res, 'Invalid session');
+    return { ok: false, reason: 'invalid_session', clearCookie: true };
   }
 
-  // Check if session is expired
   if (new Date(session.expires_at) < new Date()) {
-    // Delete expired session
     await db.exec('DELETE FROM sessions WHERE id = ?', [sessionId]);
-    res.clearCookie('session');
-    return response.unauthorized(res, 'Session expired');
+    return { ok: false, reason: 'expired_session', clearCookie: true };
   }
 
-  // Check if user is active
   if (session.status !== 'active') {
-    return response.forbidden(res, 'Account is inactive');
+    return { ok: false, reason: 'inactive_account' };
   }
 
-  // Attach user to request
-  req.user = {
+  const user = {
     id: session.user_id,
     email: session.email,
     name: session.name,
     role: session.role,
     forcePasswordChange: Boolean(session.force_password_change)
+  };
+
+  return { ok: true, user };
+}
+
+/**
+ * Non-writing probe for user session auth (for anyAuth composition).
+ */
+export async function userAuthProbe(req) {
+  const result = await resolveUserSession(req);
+  if (!result.ok) {
+    return { ok: false, reason: result.reason };
+  }
+  return {
+    ok: true,
+    user: result.user,
+    auth: {
+      type: 'user',
+      actorType: 'user',
+      actorId: `user:${result.user.id}`
+    }
+  };
+}
+
+/**
+ * Middleware to authenticate users via session cookie
+ * Attaches user object to req.user if authenticated
+ */
+export async function userAuth(req, res, next) {
+  const result = await resolveUserSession(req);
+  if (!result.ok) {
+    if (result.clearCookie) {
+      res.clearCookie('session');
+    }
+    if (result.reason === 'missing_session') {
+      return response.unauthorized(res, 'Session required');
+    }
+    if (result.reason === 'invalid_session') {
+      return response.unauthorized(res, 'Invalid session');
+    }
+    if (result.reason === 'expired_session') {
+      return response.unauthorized(res, 'Session expired');
+    }
+    return response.forbidden(res, 'Account is inactive');
+  }
+
+  req.user = result.user;
+  req.auth = {
+    type: 'user',
+    actorType: 'user',
+    actorId: `user:${result.user.id}`
   };
 
   next();

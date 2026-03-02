@@ -471,6 +471,30 @@ export const updateWebhookSchema = z.object({
 });
 
 // ============================================
+// Runtime Skills Schemas
+// ============================================
+
+export const skillsRuntimeCatalogQuerySchema = z.object({
+  workspaceId: z.string().regex(/^\d+$/).transform(Number).optional()
+});
+
+export const createSkillsInvocationSchema = z.object({
+  skillKey: z.string().min(1).max(200),
+  idempotencyKey: z.string().min(1).max(200),
+  inputs: z.record(z.any()).optional().default({}),
+  contextData: z.record(z.any()).optional().default({}),
+  workspaceId: z.number().int().positive().optional().nullable(),
+  taskId: z.number().int().positive().optional().nullable(),
+  workflowRunId: z.string().max(200).optional().nullable(),
+  workflowStepId: z.string().max(200).optional().nullable(),
+  timeoutMs: z.number().int().min(5000).max(3600000).optional()
+});
+
+export const cancelSkillsInvocationSchema = z.object({
+  reason: z.string().max(1000).optional()
+});
+
+// ============================================
 // Validation Middleware
 // ============================================
 

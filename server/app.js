@@ -23,11 +23,13 @@ import sprintsRouter from './routes/sprints.js';
 import routesRouter from './routes/routes.js';
 import connectionsRouter from './routes/connections.js';
 import settingsRouter from './routes/settings.js';
+import skillsRuntimeRouter from './routes/skillsRuntime.js';
 
 // Import services
 import { processPendingDeliveries } from './services/webhooks.js';
 import { startDispatcher, stopDispatcher } from './services/taskDispatcher.js';
 import { startRetrySweep, stopRetrySweep } from './services/routeDispatcher.js';
+import { startSkillsRuntimePoller, stopSkillsRuntimePoller } from './services/skills/poller.js';
 
 // Import response utilities
 import * as response from './utils/response.js';
@@ -136,6 +138,7 @@ export function createApp(options = {}) {
     app.use('/api', routesRouter);
     app.use('/api/storage-connections', connectionsRouter);
     app.use('/api/settings', settingsRouter);
+    app.use('/api/skills-runtime', skillsRuntimeRouter);
 
     // Serve uploaded files (deliverable attachments) with authentication
     const uploadsPath = join(__dirname, '../data/uploads');
@@ -295,6 +298,7 @@ export function createApp(options = {}) {
           console.error('Error processing pending deliveries:', err));
         startDispatcher();
         startRetrySweep();
+        startSkillsRuntimePoller();
 
         // Session cleanup interval (every 15 min)
         sessionCleanupHandle = setInterval(() => {
@@ -357,6 +361,7 @@ export function createApp(options = {}) {
 
     stopDispatcher();
     stopRetrySweep();
+    stopSkillsRuntimePoller();
     if (sessionCleanupHandle) {
       clearInterval(sessionCleanupHandle);
       sessionCleanupHandle = null;
