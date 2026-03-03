@@ -1,6 +1,6 @@
 /**
  * Agent Executor Service
- * Executes tasks using AI provider APIs (Anthropic, OpenAI)
+ * Executes tasks using AI provider APIs (Anthropic, OpenAI, Google Gemini)
  * Pulls in full task context (knowledge base, deliverables, related tasks)
  * to match the same context available to MCP/external agents.
  */
@@ -134,6 +134,8 @@ export async function executeTask(agent, task) {
   try {
     if (agent.provider === 'anthropic') {
       result = await executeAnthropic(apiKey, agent.provider_model, systemPrompt, userPrompt, agent.max_tokens, agent.temperature);
+    } else if (agent.provider === 'google') {
+      result = await executeGoogle(apiKey, agent.provider_model, systemPrompt, userPrompt, agent.max_tokens, agent.temperature);
     } else if (agent.provider === 'openai' || agent.provider === 'openai_compatible') {
       const baseUrl = resolveBaseUrl(agent);
       result = await executeOpenAI(apiKey, agent.provider_model, systemPrompt, userPrompt, agent.max_tokens, agent.temperature, baseUrl);
@@ -260,6 +262,23 @@ export async function testConnection(provider, apiKey, model, baseUrl) {
         const error = await response.json().catch(() => ({}));
         return { success: false, message: error.error?.message || `Connection failed (HTTP ${response.status})` };
       }
+    } else if (provider === 'google') {
+      const modelId = model || 'gemini-2.5-pro';
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelId)}:generateContent?key=${encodeURIComponent(apiKey)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: 'Hi' }] }],
+          generationConfig: { maxOutputTokens: 10 }
+        })
+      });
+
+      if (response.ok) {
+        return { success: true, message: 'Connection successful' };
+      } else {
+        const error = await response.json().catch(() => ({}));
+        return { success: false, message: error.error?.message || `Connection failed (HTTP ${response.status})` };
+      }
     } else {
       return { success: false, message: `Unsupported provider: ${provider}` };
     }
@@ -377,6 +396,56 @@ async function executeOpenAI(apiKey, model, systemPrompt, userPrompt, maxTokens,
       usage: {
         inputTokens: data.usage?.prompt_tokens,
         outputTokens: data.usage?.completion_tokens
+      }
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+/**
+ * Execute using Google Gemini API
+ */
+async function executeGoogle(apiKey, model, systemPrompt, userPrompt, maxTokens, temperature) {
+  const modelId = model || 'gemini-2.5-pro';
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), EXECUTION_TIMEOUT_MS);
+  try {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelId)}:generateContent?key=${encodeURIComponent(apiKey)}`, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: `${systemPrompt}\n\n${userPrompt}` }]
+          }
+        ],
+        generationConfig: {
+          maxOutputTokens: maxTokens || 4096,
+          temperature: temperature ?? 0.7
+        }
+      })
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw classifyApiError(response.status, error, 'google');
+    }
+
+    const data = await response.json();
+    const content = data?.candidates?.[0]?.content?.parts
+      ?.map(p => p?.text || '')
+      .join('') || '';
+
+    return {
+      content,
+      usage: {
+        inputTokens: data?.usageMetadata?.promptTokenCount,
+        outputTokens: data?.usageMetadata?.candidatesTokenCount
       }
     };
   } finally {

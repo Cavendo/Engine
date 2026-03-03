@@ -168,6 +168,14 @@ const PROVIDERS = {
       { id: 'gpt-3.5-turbo', name: 'GPT-3.5 Turbo', description: 'Fast and affordable' }
     ]
   },
+  google: {
+    name: 'Google (Gemini)',
+    models: [
+      { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', description: 'Most capable Gemini model' },
+      { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash', description: 'Fast and efficient Gemini model' },
+      { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro', description: 'Long-context Gemini model' }
+    ]
+  },
   openai_compatible: {
     name: 'OpenAI-Compatible (Local/Self-Hosted)',
     models: [
@@ -1237,7 +1245,7 @@ router.post('/:id/test-connection', userAuth, requireRoles('admin'), async (req,
       return response.badRequest(res, 'Provider is required');
     }
 
-    // API key is required for anthropic and openai, optional for openai_compatible
+    // API key is required for anthropic/openai/google, optional for openai_compatible
     if (!apiKey && provider !== 'openai_compatible') {
       return response.badRequest(res, 'API key is required for this provider');
     }

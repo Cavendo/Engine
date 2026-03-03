@@ -73,7 +73,7 @@ export const createAgentSchema = z.preprocess((data) => {
   projectAccess: z.array(z.string().max(100)).optional().default(['*']), // Project names/ids or '*' for all
   taskTypes: z.array(z.string().max(50)).optional().default(['*']), // Task types this agent handles
   // Optional execution fields (one-step create with provider config)
-  provider: z.enum(['anthropic', 'openai', 'openai_compatible']).optional().nullable(),
+  provider: z.enum(['anthropic', 'openai', 'openai_compatible', 'google']).optional().nullable(),
   providerApiKey: z.string().optional(),
   providerModel: z.string().max(100).optional().nullable(),
   providerBaseUrl: z.string().max(500).optional().nullable(),
@@ -115,7 +115,7 @@ export const updateAgentOwnerSchema = z.object({
 });
 
 export const updateAgentExecutionSchema = z.object({
-  provider: z.enum(['anthropic', 'openai', 'openai_compatible']).optional().nullable(),
+  provider: z.enum(['anthropic', 'openai', 'openai_compatible', 'google']).optional().nullable(),
   providerApiKey: z.string().optional(),
   providerModel: z.string().max(100).optional().nullable(),
   providerBaseUrl: z.string().max(500).optional().nullable(),
