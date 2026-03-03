@@ -483,11 +483,23 @@ export const createSkillsInvocationSchema = z.object({
   idempotencyKey: z.string().min(1).max(200),
   inputs: z.record(z.any()).optional().default({}),
   contextData: z.record(z.any()).optional().default({}),
+  connectorBindings: z.record(z.enum(['workspace', 'managed', 'none'])).optional().default({}),
   workspaceId: z.number().int().positive().optional().nullable(),
   taskId: z.number().int().positive().optional().nullable(),
   workflowRunId: z.string().max(200).optional().nullable(),
   workflowStepId: z.string().max(200).optional().nullable(),
   timeoutMs: z.number().int().min(5000).max(3600000).optional()
+}).superRefine((data, ctx) => {
+  const keyRegex = /^[a-z0-9][a-z0-9:_-]{0,199}$/;
+  for (const key of Object.keys(data.connectorBindings || {})) {
+    if (!keyRegex.test(key)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['connectorBindings', key],
+        message: 'Invalid connector binding key format'
+      });
+    }
+  }
 });
 
 export const cancelSkillsInvocationSchema = z.object({

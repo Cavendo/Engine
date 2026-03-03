@@ -13,16 +13,37 @@ const router = Router();
 
 const runtimeAuth = anyAuth([userAuthProbe, internalServiceAuthProbe]);
 
-function mapError(err, res) {
-  const code = err.code || SKILLS_ERROR_CODES.UPSTREAM_ERROR;
-  const status = err.status || (
-    code === SKILLS_ERROR_CODES.POLICY_DENIED ? 403 :
-    code === SKILLS_ERROR_CODES.INPUT_VALIDATION_FAILED ? 422 :
-    code === SKILLS_ERROR_CODES.SKILL_NOT_FOUND ? 404 :
-    code === SKILLS_ERROR_CODES.PROVIDER_UNAVAILABLE ? 503 :
-    code === SKILLS_ERROR_CODES.TIMEOUT ? 504 : 400
+function isPlainObject(value) {
+  return (
+    value !== null &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    Object.getPrototypeOf(value) === Object.prototype
   );
-  return response.error(res, err.message || 'Runtime skills request failed', status, code);
+}
+
+export function sendRuntimeError(res, err) {
+  const code = err.code || SKILLS_ERROR_CODES.UPSTREAM_ERROR;
+  const status = code === SKILLS_ERROR_CODES.DEPENDENCY_NOT_READY
+    ? 409
+    : (err.status || (
+      code === SKILLS_ERROR_CODES.POLICY_DENIED ? 403 :
+      code === SKILLS_ERROR_CODES.INPUT_VALIDATION_FAILED ? 422 :
+      code === SKILLS_ERROR_CODES.SKILL_NOT_FOUND ? 404 :
+      code === SKILLS_ERROR_CODES.PROVIDER_UNAVAILABLE ? 503 :
+      code === SKILLS_ERROR_CODES.TIMEOUT ? 504 : 400
+    ));
+  const payload = {
+    success: false,
+    error: {
+      code,
+      message: err.message || 'Runtime skills request failed'
+    }
+  };
+  if (isPlainObject(err.details)) {
+    payload.error.details = err.details;
+  }
+  return res.status(status).json(payload);
 }
 
 router.get('/catalog', runtimeAuth, validateQuery(skillsRuntimeCatalogQuerySchema), async (req, res) => {
@@ -35,7 +56,7 @@ router.get('/catalog', runtimeAuth, validateQuery(skillsRuntimeCatalogQuerySchem
     response.success(res, data);
   } catch (err) {
     console.error('[SkillsRuntime] Catalog error:', err);
-    mapError(err, res);
+    sendRuntimeError(res, err);
   }
 });
 
@@ -48,7 +69,7 @@ router.post('/invocations', runtimeAuth, validateBody(createSkillsInvocationSche
     response.created(res, invocation);
   } catch (err) {
     console.error('[SkillsRuntime] Create invocation error:', err);
-    mapError(err, res);
+    sendRuntimeError(res, err);
   }
 });
 
@@ -58,7 +79,7 @@ router.get('/invocations/:id', runtimeAuth, validateParams(idParamSchema), async
     response.success(res, invocation);
   } catch (err) {
     console.error('[SkillsRuntime] Get invocation error:', err);
-    mapError(err, res);
+    sendRuntimeError(res, err);
   }
 });
 
@@ -68,7 +89,7 @@ router.post('/invocations/:id/cancel', runtimeAuth, validateParams(idParamSchema
     response.success(res, invocation);
   } catch (err) {
     console.error('[SkillsRuntime] Cancel invocation error:', err);
-    mapError(err, res);
+    sendRuntimeError(res, err);
   }
 });
 
@@ -85,7 +106,7 @@ router.get('/health', runtimeAuth, async (req, res) => {
     });
   } catch (err) {
     console.error('[SkillsRuntime] Health error:', err);
-    mapError(err, res);
+    sendRuntimeError(res, err);
   }
 });
 

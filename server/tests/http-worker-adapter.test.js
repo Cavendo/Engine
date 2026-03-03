@@ -40,6 +40,7 @@ describe('HttpWorkerAdapter worker v1 contract', () => {
       workspace_id: 42,
       inputs: { target: 'example.com' },
       context_data: { workflow_run_id: 'wr_123', workflow_step_id: 'wrs_55', task_id: 901 },
+      connector_bindings: { 'google:gsc': 'none', 'google:psi': 'managed' },
       timeout_ms: 600000,
       idempotency_key: 'user:user:17:key_abc',
       actor: { type: 'user', id: 'user:17' },
@@ -64,6 +65,7 @@ describe('HttpWorkerAdapter worker v1 contract', () => {
       idempotency_key: 'user:user:17:key_abc'
     });
     expect(body.limits).toEqual({ timeout_seconds: 600 });
+    expect(body.connector_bindings).toEqual({ 'google:gsc': 'none', 'google:psi': 'managed' });
   });
 
   test('invoke requires job_id in response', async () => {
@@ -91,7 +93,17 @@ describe('HttpWorkerAdapter worker v1 contract', () => {
       calls.push({ url, options });
       return jsonResponse(200, {
         skills: [
-          { id: 'seo_audit', name: 'SEO Audit', description: '...', version: '1.0.0', input_schema: {}, metadata: { team: 'growth' } }
+          {
+            id: 'seo_audit',
+            name: 'SEO Audit',
+            description: '...',
+            version: '1.0.0',
+            input_schema: {},
+            metadata: { team: 'growth' },
+            dependencies: { connectors: [{ id: 'google:gsc', required: false }] },
+            runtime: { permissions: ['read:gsc'] },
+            output_policy: { mode: 'inline_or_artifact' }
+          }
         ]
       });
     });
@@ -102,8 +114,29 @@ describe('HttpWorkerAdapter worker v1 contract', () => {
     expect(result.skills[0]).toMatchObject({
       key: 'seo_audit',
       name: 'SEO Audit',
-      version: '1.0.0'
+      version: '1.0.0',
+      dependencies: { connectors: [{ id: 'google:gsc', required: false }] },
+      runtime: { permissions: ['read:gsc'] },
+      output_policy: { mode: 'inline_or_artifact' }
     });
+  });
+
+  test('catalog object-like guards null out invalid passthrough fields', async () => {
+    global.fetch = jest.fn(async () => jsonResponse(200, {
+      skills: [
+        {
+          id: 'seo_audit',
+          dependencies: [],
+          runtime: 'invalid',
+          output_policy: 123
+        }
+      ]
+    }));
+    const adapter = new HttpWorkerAdapter('http://worker.local');
+    const result = await adapter.listSkills();
+    expect(result.skills[0].dependencies).toBeNull();
+    expect(result.skills[0].runtime).toBeNull();
+    expect(result.skills[0].output_policy).toBeNull();
   });
 
   test('catalog fails when skills[] missing', async () => {

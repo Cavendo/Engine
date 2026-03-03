@@ -22,8 +22,7 @@ async function parseJsonResponse(response) {
     return JSON.parse(text);
   } catch {
     throw createError(SKILLS_ERROR_CODES.UPSTREAM_ERROR, 'Worker returned non-JSON response', {
-      status: response.status,
-      body: text.slice(0, 500)
+      status: response.status
     });
   }
 }
@@ -75,6 +74,10 @@ function normalizeRunContext(input = {}) {
   return output;
 }
 
+function isObjectLike(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
 function mapInvokePayloadToWorker(payload = {}) {
   const contextData = payload.context_data && typeof payload.context_data === 'object' && !Array.isArray(payload.context_data)
     ? payload.context_data
@@ -107,6 +110,10 @@ function mapInvokePayloadToWorker(payload = {}) {
     inputs: payload.inputs || {},
     idempotency_key: payload.idempotency_key
   };
+
+  if (isObjectLike(payload.connector_bindings)) {
+    body.connector_bindings = payload.connector_bindings;
+  }
 
   if (timeoutSeconds) {
     body.limits = { timeout_seconds: timeoutSeconds };
@@ -164,7 +171,7 @@ export class HttpWorkerAdapter extends SkillsAdapter {
         throw createError(SKILLS_ERROR_CODES.SKILL_NOT_FOUND, message, { status: response.status });
       }
       if (response.status >= 400 && response.status < 500) {
-        throw createError(SKILLS_ERROR_CODES.UPSTREAM_ERROR, message, { status: response.status, body: data });
+        throw createError(SKILLS_ERROR_CODES.UPSTREAM_ERROR, message, { status: response.status });
       }
 
       if (attempt > retries) {
@@ -195,7 +202,10 @@ export class HttpWorkerAdapter extends SkillsAdapter {
         description: typeof s.description === 'string' ? s.description : '',
         version: typeof s.version === 'string' ? s.version : null,
         input_schema: s.input_schema || null,
-        metadata: s.metadata && typeof s.metadata === 'object' && !Array.isArray(s.metadata) ? s.metadata : {}
+        metadata: isObjectLike(s.metadata) ? s.metadata : {},
+        dependencies: isObjectLike(s.dependencies) ? s.dependencies : null,
+        runtime: isObjectLike(s.runtime) ? s.runtime : null,
+        output_policy: isObjectLike(s.output_policy) ? s.output_policy : null
       };
     });
 

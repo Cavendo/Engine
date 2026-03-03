@@ -46,6 +46,29 @@ function createError(code, message, status = 400, details = null) {
   return err;
 }
 
+export function createPolicyDeniedError(message, details = {}) {
+  const safeDetails = {
+    denied_reason: typeof details.denied_reason === 'string' && details.denied_reason
+      ? details.denied_reason
+      : 'policy_forbidden'
+  };
+  if (typeof details.blocked_connector_id === 'string' && details.blocked_connector_id) {
+    safeDetails.blocked_connector_id = details.blocked_connector_id;
+  }
+  return createError(SKILLS_ERROR_CODES.POLICY_DENIED, message, 403, safeDetails);
+}
+
+export function createDependencyNotReadyError(message, details = {}) {
+  const normalizeArray = (v) => (Array.isArray(v) ? v : []);
+  return createError(SKILLS_ERROR_CODES.DEPENDENCY_NOT_READY, message, 409, {
+    missing_connectors: normalizeArray(details.missing_connectors),
+    missing_workspace_config_keys: normalizeArray(details.missing_workspace_config_keys),
+    missing_secret_keys: normalizeArray(details.missing_secret_keys),
+    missing_external_services: normalizeArray(details.missing_external_services),
+    missing_permissions: normalizeArray(details.missing_permissions)
+  });
+}
+
 function normalizeInvocationRow(row) {
   return {
     ...row,
@@ -71,13 +94,13 @@ async function loadArtifacts(invocationId) {
 
 function validateActor(auth) {
   if (!auth?.actorType || !auth?.actorId) {
-    throw createError(SKILLS_ERROR_CODES.POLICY_DENIED, 'Missing auth actor context', 403);
+    throw createPolicyDeniedError('Missing auth actor context', { denied_reason: 'missing_auth_actor' });
   }
   if (auth.actorType === 'user' && !/^user:\d+$/.test(auth.actorId)) {
-    throw createError(SKILLS_ERROR_CODES.POLICY_DENIED, 'Invalid user actor identifier', 403);
+    throw createPolicyDeniedError('Invalid user actor identifier', { denied_reason: 'invalid_actor_identifier' });
   }
   if (auth.actorType === 'system' && !/^system:[a-z0-9][a-z0-9_-]{1,63}$/.test(auth.actorId)) {
-    throw createError(SKILLS_ERROR_CODES.POLICY_DENIED, 'Invalid system actor identifier', 403);
+    throw createPolicyDeniedError('Invalid system actor identifier', { denied_reason: 'invalid_actor_identifier' });
   }
 }
 
@@ -172,7 +195,7 @@ export async function getInvocationById(id, auth) {
   }
 
   if (auth.actorType !== 'system' && row.actor_id !== auth.actorId) {
-    throw createError(SKILLS_ERROR_CODES.POLICY_DENIED, 'Invocation is not accessible', 403);
+    throw createPolicyDeniedError('Invocation is not accessible', { denied_reason: 'not_owner' });
   }
 
   const normalized = normalizeInvocationRow(row);
@@ -286,6 +309,7 @@ export async function createInvocation(payload, { auth, user }) {
       skill_version: skill.version || null,
       inputs: payload.inputs || {},
       context_data: payload.contextData || {},
+      connector_bindings: payload.connectorBindings || {},
       workspace_id: payload.workspaceId || null,
       workflow_run_id: payload.workflowRunId || null,
       workflow_step_id: payload.workflowStepId || null,
@@ -384,7 +408,7 @@ export async function cancelInvocation(id, auth) {
     throw createError(SKILLS_ERROR_CODES.SKILL_NOT_FOUND, 'Invocation not found', 404);
   }
   if (auth.actorType !== 'system' && invocation.actor_id !== auth.actorId) {
-    throw createError(SKILLS_ERROR_CODES.POLICY_DENIED, 'Invocation is not accessible', 403);
+    throw createPolicyDeniedError('Invocation is not accessible', { denied_reason: 'not_owner' });
   }
 
   if (![SKILLS_STATUSES.QUEUED, SKILLS_STATUSES.RUNNING].includes(invocation.status)) {
