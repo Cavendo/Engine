@@ -176,6 +176,16 @@ WHERE a = $1 AND b = '?' /* block ? */ AND c = $2`;
       expect(result).toBe('SELECT id, name FROM tasks WHERE status = $1');
     });
 
+    test('rewrites scalar MAX clamp to GREATEST for postgres', () => {
+      const result = rewriteSQL(`
+        UPDATE agents
+        SET active_task_count = MAX(0, COALESCE(active_task_count, 0) - 1)
+        WHERE id = ?
+      `);
+      expect(result).toContain('active_task_count = GREATEST(0, COALESCE(active_task_count, 0) - 1)');
+      expect(result).toContain('WHERE id = $1');
+    });
+
     test("mysql target keeps '?' placeholders and rewrites INSERT OR IGNORE", () => {
       const result = rewriteSQL('INSERT OR IGNORE INTO t (a) VALUES (?)', 'mysql');
       expect(result).toBe('INSERT IGNORE INTO t (a) VALUES (?)');
@@ -200,6 +210,16 @@ WHERE a = $1 AND b = '?' /* block ? */ AND c = $2`;
       const sql = "SELECT * FROM t WHERE a >= datetime('now', '-1 hour') AND b < datetime('now')";
       const result = rewriteSQL(sql, 'mysql');
       expect(result).toBe('SELECT * FROM t WHERE a >= DATE_SUB(NOW(), INTERVAL 1 HOUR) AND b < NOW()');
+    });
+
+    test('mysql target rewrites scalar MAX clamp to GREATEST', () => {
+      const result = rewriteSQL(`
+        UPDATE agents
+        SET active_task_count = MAX(0, COALESCE(active_task_count, 0) - ?)
+        WHERE id = ?
+      `, 'mysql');
+      expect(result).toContain('active_task_count = GREATEST(0, COALESCE(active_task_count, 0) - ?)');
+      expect(result).toContain('WHERE id = ?');
     });
   });
 });

@@ -6,6 +6,7 @@
  * 2a. datetime('now', '[+-]N unit') → (NOW() [+-] INTERVAL 'N unit')
  * 2b. datetime('now') → NOW()
  * 3. INSERT OR IGNORE → INSERT ... ON CONFLICT DO NOTHING
+ * 4. MAX(0, expr) scalar clamp → GREATEST(0, expr)
  *
  * Placeholder rewriting skips `?` inside:
  * - Single-quoted string literals ('...' with '' escape)
@@ -36,6 +37,10 @@ function rewriteDatetimeForMysql(sql) {
   return result;
 }
 
+function rewriteScalarClamps(sql) {
+  return sql.replace(/\bMAX\(\s*0\s*,/gi, 'GREATEST(0,');
+}
+
 /**
  * Rewrite SQLite-style SQL for target dialect.
  * @param {string} sql - SQLite-compatible SQL string
@@ -49,6 +54,7 @@ export function rewriteSQL(sql, target = 'postgres') {
     // INSERT OR IGNORE -> INSERT IGNORE
     result = result.replace(/\bINSERT\s+OR\s+IGNORE\b/gi, 'INSERT IGNORE');
     result = rewriteDatetimeForMysql(result);
+    result = rewriteScalarClamps(result);
     // MySQL uses '?' placeholders; no positional rewrite needed.
     return result;
   }
@@ -68,6 +74,9 @@ export function rewriteSQL(sql, target = 'postgres') {
 
   // 2b. datetime('now') → NOW()
   result = result.replace(/datetime\(\s*'now'\s*\)/gi, 'NOW()');
+
+  // 2c. MAX(0, expr) scalar clamp → GREATEST(0, expr)
+  result = rewriteScalarClamps(result);
 
   // 3. Placeholder rewriting: ? → $1, $2, ...
   result = rewritePlaceholders(result);
