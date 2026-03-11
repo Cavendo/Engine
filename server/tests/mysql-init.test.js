@@ -1,5 +1,5 @@
 import { describe, test, expect, jest } from '@jest/globals';
-import { applyMySqlSchema, splitSqlStatements } from '../db/init.js';
+import { applyMySqlSchema, splitSqlStatements, coreTableExists } from '../db/init.js';
 
 describe('MySQL schema bootstrap', () => {
   test('splitSqlStatements keeps quoted semicolons intact', () => {
@@ -47,6 +47,18 @@ describe('MySQL schema bootstrap', () => {
     expect(run).toHaveBeenNthCalledWith(
       2,
       expect.stringContaining('CREATE INDEX idx_foo_name ON foo(name)')
+    );
+  });
+
+  test('coreTableExists checks mysql information_schema', async () => {
+    const one = jest.fn(async () => ({ table_name: 'users' }));
+
+    const exists = await coreTableExists({ dialect: 'mysql', one }, 'users');
+
+    expect(exists).toBe(true);
+    expect(one).toHaveBeenCalledWith(
+      expect.stringContaining('FROM information_schema.tables'),
+      ['users']
     );
   });
 });

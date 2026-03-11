@@ -57,6 +57,36 @@ async function mysqlIndexExists(db, tableName, indexName) {
   return Boolean(row);
 }
 
+export async function coreTableExists(db, tableName) {
+  if (db.dialect === 'sqlite') {
+    const row = await db.one(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+      [tableName]
+    );
+    return Boolean(row);
+  }
+
+  if (db.dialect === 'postgres') {
+    const row = await db.one(`
+      SELECT table_name
+      FROM information_schema.tables
+      WHERE table_schema = 'public'
+        AND table_name = ?
+      LIMIT 1
+    `, [tableName]);
+    return Boolean(row);
+  }
+
+  const row = await db.one(`
+    SELECT table_name
+    FROM information_schema.tables
+    WHERE table_schema = DATABASE()
+      AND table_name = ?
+    LIMIT 1
+  `, [tableName]);
+  return Boolean(row);
+}
+
 export async function applyMySqlSchema(db, schema) {
   const statements = splitSqlStatements(schema);
 
@@ -92,17 +122,21 @@ export async function initializeDatabase(db) {
     await db.run('PRAGMA foreign_keys = ON');
   }
 
-  // Read and execute schema
-  // Note: schema.sql is the canonical baseline schema.
-  // For upgrades, use the migrator (server/db/migrator.js) which runs after this.
-  const schemaFile = db.dialect === 'postgres'
-    ? 'schema.pg.sql'
-    : (db.dialect === 'mysql' ? 'schema.mysql.sql' : 'schema.sql');
-  const schema = readFileSync(join(__dirname, schemaFile), 'utf-8');
-  if (db.dialect === 'mysql') {
-    await applyMySqlSchema(db, schema);
-  } else {
-    await db.run(schema);
+  const hasUsersTable = await coreTableExists(db, 'users');
+
+  // Read and execute baseline schema only for fresh databases.
+  // Existing databases must evolve through migrations, not by replaying the
+  // latest schema file against older tables.
+  if (!hasUsersTable) {
+    const schemaFile = db.dialect === 'postgres'
+      ? 'schema.pg.sql'
+      : (db.dialect === 'mysql' ? 'schema.mysql.sql' : 'schema.sql');
+    const schema = readFileSync(join(__dirname, schemaFile), 'utf-8');
+    if (db.dialect === 'mysql') {
+      await applyMySqlSchema(db, schema);
+    } else {
+      await db.run(schema);
+    }
   }
 
   console.log('Database initialized at:',
