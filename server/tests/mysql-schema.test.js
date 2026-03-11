@@ -62,4 +62,9 @@ describe('mysql schema safety', () => {
     const migrator = readFileSync('server/db/migrator.js', 'utf8');
     expect(migrator).toMatch(/migrationVersionType\s*=\s*db\.dialect === 'mysql' \? 'VARCHAR\(255\)'/);
   });
+
+  test('uses expression defaults for TEXT/LONGTEXT columns', () => {
+    // MySQL 8 requires expression-form defaults for TEXT/BLOB families.
+    expect(schema).not.toMatch(/\b(?:TEXT|LONGTEXT)\s+DEFAULT\s+'[^']*'/i);
+  });
 });

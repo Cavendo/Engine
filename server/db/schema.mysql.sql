@@ -50,8 +50,8 @@ CREATE TABLE IF NOT EXISTS agents (
     temperature DOUBLE DEFAULT 0.7,
     agent_type VARCHAR(64) DEFAULT 'general',
     specialization VARCHAR(255),
-    project_access LONGTEXT DEFAULT '["*"]',
-    task_types LONGTEXT DEFAULT '["*"]',
+    project_access LONGTEXT DEFAULT ('["*"]'),
+    task_types LONGTEXT DEFAULT ('["*"]'),
     created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
     updated_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3)
 );
@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS agent_keys (
     key_hash VARCHAR(255) NOT NULL,
     key_prefix VARCHAR(64) NOT NULL,
     name VARCHAR(255),
-    scopes LONGTEXT DEFAULT '["read","write"]',
+    scopes LONGTEXT DEFAULT ('["read","write"]'),
     last_used_at DATETIME(3),
     expires_at DATETIME(3),
     revoked_at DATETIME(3),
@@ -256,7 +256,7 @@ CREATE TABLE IF NOT EXISTS routes (
     destination_type VARCHAR(64) NOT NULL,
     destination_config LONGTEXT NOT NULL,
     field_mapping LONGTEXT,
-    retry_policy LONGTEXT DEFAULT '{"max_retries": 3, "backoff_type": "exponential", "initial_delay_ms": 1000}',
+    retry_policy LONGTEXT DEFAULT ('{"max_retries": 3, "backoff_type": "exponential", "initial_delay_ms": 1000}'),
     enabled TINYINT(1) DEFAULT 1,
     created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
     updated_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3)
