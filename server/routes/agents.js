@@ -16,7 +16,11 @@ import {
   updateAgentExecutionSchema
 } from '../utils/validation.js';
 import { validateProviderBaseUrl, resolveBaseUrl } from '../utils/providerEndpoint.js';
-import { toISOTimestamp as formatTimestamp } from '../utils/routeHelpers.js';
+import {
+  toISOTimestamp as formatTimestamp,
+  dateBucketExpression,
+  normalizeDateBucket
+} from '../utils/routeHelpers.js';
 
 const router = Router();
 
@@ -26,6 +30,10 @@ const router = Router();
  */
 function toISOTimestamp(timestamp) {
   return formatTimestamp(timestamp);
+}
+
+function agentDateBucket(column) {
+  return dateBucketExpression(column, db.dialect);
 }
 
 /**
@@ -846,26 +854,28 @@ router.get('/:id/metrics', userAuth, async (req, res) => {
     `, [req.params.id]);
 
     // Recent activity (last 7 days regardless of period filter)
+    const completedDateExpr = agentDateBucket('t.completed_at');
+    const deliverableDateExpr = agentDateBucket('d.created_at');
     const recentActivity = await db.many(`
       SELECT
-        date(t.completed_at) as date,
+        ${completedDateExpr} as date,
         COUNT(t.id) as tasks_completed,
         0 as deliverables_submitted
       FROM tasks t
       WHERE t.assigned_agent_id = ?
         AND t.status = 'completed'
         AND t.completed_at >= datetime('now', '-7 days')
-      GROUP BY date(t.completed_at)
+      GROUP BY ${completedDateExpr}
     `, [req.params.id]);
 
     const recentDeliverables = await db.many(`
       SELECT
-        date(d.created_at) as date,
+        ${deliverableDateExpr} as date,
         COUNT(d.id) as deliverables_submitted
       FROM deliverables d
       WHERE d.agent_id = ?
         AND d.created_at >= datetime('now', '-7 days')
-      GROUP BY date(d.created_at)
+      GROUP BY ${deliverableDateExpr}
     `, [req.params.id]);
 
     // Merge recent activity data
@@ -881,15 +891,17 @@ router.get('/:id/metrics', userAuth, async (req, res) => {
 
     // Fill in task completions
     for (const row of recentActivity) {
-      if (activityMap.has(row.date)) {
-        activityMap.get(row.date).tasks_completed = row.tasks_completed;
+      const dateKey = normalizeDateBucket(row.date);
+      if (activityMap.has(dateKey)) {
+        activityMap.get(dateKey).tasks_completed = row.tasks_completed;
       }
     }
 
     // Fill in deliverable submissions
     for (const row of recentDeliverables) {
-      if (activityMap.has(row.date)) {
-        activityMap.get(row.date).deliverables_submitted = row.deliverables_submitted;
+      const dateKey = normalizeDateBucket(row.date);
+      if (activityMap.has(dateKey)) {
+        activityMap.get(dateKey).deliverables_submitted = row.deliverables_submitted;
       }
     }
 

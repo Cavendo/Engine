@@ -72,4 +72,10 @@ describe('mysql schema safety', () => {
     const init = readFileSync('server/db/init.js', 'utf8');
     expect(init).toMatch(/if \(db\.dialect === 'mysql'\) \{\s*await applyMySqlSchema\(db, schema\);/s);
   });
+
+  test('defines explicit foreign key constraints for MySQL baseline schema', () => {
+    expect(schema).toMatch(/ALTER TABLE agents ADD CONSTRAINT fk_agents_owner_user FOREIGN KEY \(owner_user_id\) REFERENCES users\(id\) ON DELETE SET NULL;/);
+    expect(schema).toMatch(/ALTER TABLE tasks ADD CONSTRAINT fk_tasks_project FOREIGN KEY \(project_id\) REFERENCES projects\(id\) ON DELETE SET NULL;/);
+    expect(schema).toMatch(/ALTER TABLE skill_invocation_artifacts ADD CONSTRAINT fk_skill_invocation_artifacts_invocation FOREIGN KEY \(skill_invocation_id\) REFERENCES skill_invocations\(id\) ON DELETE CASCADE;/);
+  });
 });

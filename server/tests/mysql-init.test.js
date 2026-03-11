@@ -1,5 +1,5 @@
 import { describe, test, expect, jest } from '@jest/globals';
-import { applyMySqlSchema, splitSqlStatements, coreTableExists } from '../db/init.js';
+import { applyMySqlSchema, splitSqlStatements, coreTableExists, ensureMySqlForeignKeys } from '../db/init.js';
 
 describe('MySQL schema bootstrap', () => {
   test('splitSqlStatements keeps quoted semicolons intact', () => {
@@ -59,6 +59,31 @@ describe('MySQL schema bootstrap', () => {
     expect(one).toHaveBeenCalledWith(
       expect.stringContaining('FROM information_schema.tables'),
       ['users']
+    );
+  });
+
+  test('ensureMySqlForeignKeys repairs missing constraints after orphan cleanup', async () => {
+    const many = jest.fn(async () => ([
+      { table_name: 'users' },
+      { table_name: 'agents' }
+    ]));
+    const one = jest.fn(async () => undefined);
+    const run = jest.fn(async () => {});
+
+    const repaired = await ensureMySqlForeignKeys({ dialect: 'mysql', many, one, run });
+
+    expect(repaired).toBe(1);
+    expect(run).toHaveBeenNthCalledWith(
+      1,
+      expect.stringContaining('UPDATE `agents` c')
+    );
+    expect(run).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining('ALTER TABLE `agents`')
+    );
+    expect(run).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining('ADD CONSTRAINT `fk_agents_owner_user`')
     );
   });
 });

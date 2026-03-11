@@ -9,6 +9,37 @@ function stripLeadingSqlComments(sql) {
   return sql.replace(/^(?:\s*--.*\n)+/g, '').trim();
 }
 
+const MYSQL_FOREIGN_KEYS = [
+  { table: 'agents', column: 'owner_user_id', parentTable: 'users', parentColumn: 'id', onDelete: 'SET NULL', constraint: 'fk_agents_owner_user' },
+  { table: 'projects', column: 'default_agent_id', parentTable: 'agents', parentColumn: 'id', onDelete: 'SET NULL', constraint: 'fk_projects_default_agent' },
+  { table: 'agent_keys', column: 'agent_id', parentTable: 'agents', parentColumn: 'id', onDelete: 'CASCADE', constraint: 'fk_agent_keys_agent' },
+  { table: 'sprints', column: 'project_id', parentTable: 'projects', parentColumn: 'id', onDelete: 'SET NULL', constraint: 'fk_sprints_project' },
+  { table: 'tasks', column: 'project_id', parentTable: 'projects', parentColumn: 'id', onDelete: 'SET NULL', constraint: 'fk_tasks_project' },
+  { table: 'tasks', column: 'sprint_id', parentTable: 'sprints', parentColumn: 'id', onDelete: 'SET NULL', constraint: 'fk_tasks_sprint' },
+  { table: 'tasks', column: 'assigned_agent_id', parentTable: 'agents', parentColumn: 'id', onDelete: 'SET NULL', constraint: 'fk_tasks_assigned_agent' },
+  { table: 'tasks', column: 'preferred_agent_id', parentTable: 'agents', parentColumn: 'id', onDelete: 'SET NULL', constraint: 'fk_tasks_preferred_agent' },
+  { table: 'deliverables', column: 'task_id', parentTable: 'tasks', parentColumn: 'id', onDelete: 'CASCADE', constraint: 'fk_deliverables_task' },
+  { table: 'deliverables', column: 'project_id', parentTable: 'projects', parentColumn: 'id', onDelete: 'SET NULL', constraint: 'fk_deliverables_project' },
+  { table: 'deliverables', column: 'agent_id', parentTable: 'agents', parentColumn: 'id', onDelete: 'SET NULL', constraint: 'fk_deliverables_agent' },
+  { table: 'deliverables', column: 'submitted_by_user_id', parentTable: 'users', parentColumn: 'id', onDelete: 'SET NULL', constraint: 'fk_deliverables_submitted_user' },
+  { table: 'deliverables', column: 'parent_id', parentTable: 'deliverables', parentColumn: 'id', onDelete: 'SET NULL', constraint: 'fk_deliverables_parent' },
+  { table: 'knowledge', column: 'project_id', parentTable: 'projects', parentColumn: 'id', onDelete: 'CASCADE', constraint: 'fk_knowledge_project' },
+  { table: 'webhooks', column: 'agent_id', parentTable: 'agents', parentColumn: 'id', onDelete: 'CASCADE', constraint: 'fk_webhooks_agent' },
+  { table: 'webhook_deliveries', column: 'webhook_id', parentTable: 'webhooks', parentColumn: 'id', onDelete: 'CASCADE', constraint: 'fk_webhook_deliveries_webhook' },
+  { table: 'webhook_deliveries', column: 'agent_id', parentTable: 'agents', parentColumn: 'id', onDelete: 'CASCADE', constraint: 'fk_webhook_deliveries_agent' },
+  { table: 'agent_activity', column: 'agent_id', parentTable: 'agents', parentColumn: 'id', onDelete: 'CASCADE', constraint: 'fk_agent_activity_agent' },
+  { table: 'task_progress', column: 'task_id', parentTable: 'tasks', parentColumn: 'id', onDelete: 'CASCADE', constraint: 'fk_task_progress_task' },
+  { table: 'task_progress', column: 'agent_id', parentTable: 'agents', parentColumn: 'id', onDelete: 'CASCADE', constraint: 'fk_task_progress_agent' },
+  { table: 'sessions', column: 'user_id', parentTable: 'users', parentColumn: 'id', onDelete: 'CASCADE', constraint: 'fk_sessions_user' },
+  { table: 'user_keys', column: 'user_id', parentTable: 'users', parentColumn: 'id', onDelete: 'CASCADE', constraint: 'fk_user_keys_user' },
+  { table: 'routes', column: 'project_id', parentTable: 'projects', parentColumn: 'id', onDelete: 'CASCADE', constraint: 'fk_routes_project' },
+  { table: 'delivery_logs', column: 'route_id', parentTable: 'routes', parentColumn: 'id', onDelete: 'CASCADE', constraint: 'fk_delivery_logs_route' },
+  { table: 'delivery_logs', column: 'deliverable_id', parentTable: 'deliverables', parentColumn: 'id', onDelete: 'SET NULL', constraint: 'fk_delivery_logs_deliverable' },
+  { table: 'storage_connections', column: 'created_by', parentTable: 'users', parentColumn: 'id', onDelete: 'SET NULL', constraint: 'fk_storage_connections_created_by' },
+  { table: 'skill_invocations', column: 'task_id', parentTable: 'tasks', parentColumn: 'id', onDelete: 'SET NULL', constraint: 'fk_skill_invocations_task' },
+  { table: 'skill_invocation_artifacts', column: 'skill_invocation_id', parentTable: 'skill_invocations', parentColumn: 'id', onDelete: 'CASCADE', constraint: 'fk_skill_invocation_artifacts_invocation' }
+];
+
 export function splitSqlStatements(sql) {
   const statements = [];
   let current = '';
@@ -55,6 +86,89 @@ async function mysqlIndexExists(db, tableName, indexName) {
   `, [tableName, indexName]);
 
   return Boolean(row);
+}
+
+async function mysqlForeignKeyExists(db, spec) {
+  const row = await db.one(`
+    SELECT CONSTRAINT_NAME
+    FROM information_schema.KEY_COLUMN_USAGE
+    WHERE TABLE_SCHEMA = DATABASE()
+      AND TABLE_NAME = ?
+      AND COLUMN_NAME = ?
+      AND REFERENCED_TABLE_NAME = ?
+      AND REFERENCED_COLUMN_NAME = ?
+    LIMIT 1
+  `, [spec.table, spec.column, spec.parentTable, spec.parentColumn]);
+
+  return Boolean(row);
+}
+
+function buildMysqlOrphanCleanupSql(spec) {
+  const child = `\`${spec.table}\``;
+  const parent = `\`${spec.parentTable}\``;
+  const childColumn = `\`${spec.column}\``;
+  const parentColumn = `\`${spec.parentColumn}\``;
+
+  if (spec.onDelete === 'SET NULL') {
+    return `
+      UPDATE ${child} c
+      LEFT JOIN ${parent} p ON p.${parentColumn} = c.${childColumn}
+      SET c.${childColumn} = NULL
+      WHERE c.${childColumn} IS NOT NULL
+        AND p.${parentColumn} IS NULL
+    `;
+  }
+
+  return `
+    DELETE c
+    FROM ${child} c
+    LEFT JOIN ${parent} p ON p.${parentColumn} = c.${childColumn}
+    WHERE c.${childColumn} IS NOT NULL
+      AND p.${parentColumn} IS NULL
+  `;
+}
+
+function buildMysqlAddForeignKeySql(spec) {
+  return `
+    ALTER TABLE \`${spec.table}\`
+    ADD CONSTRAINT \`${spec.constraint}\`
+    FOREIGN KEY (\`${spec.column}\`) REFERENCES \`${spec.parentTable}\`(\`${spec.parentColumn}\`)
+    ON DELETE ${spec.onDelete}
+  `;
+}
+
+export async function ensureMySqlForeignKeys(db) {
+  if (db.dialect !== 'mysql') return 0;
+
+  const tables = await db.many(`
+    SELECT table_name
+    FROM information_schema.tables
+    WHERE table_schema = DATABASE()
+  `);
+  const tableSet = new Set(tables.map((row) => row.table_name));
+
+  let repaired = 0;
+  for (const spec of MYSQL_FOREIGN_KEYS) {
+    if (!tableSet.has(spec.table) || !tableSet.has(spec.parentTable)) {
+      continue;
+    }
+    if (await mysqlForeignKeyExists(db, spec)) {
+      continue;
+    }
+
+    await db.run(buildMysqlOrphanCleanupSql(spec));
+    try {
+      await db.run(buildMysqlAddForeignKeySql(spec));
+      repaired += 1;
+    } catch (err) {
+      if (await mysqlForeignKeyExists(db, spec)) {
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  return repaired;
 }
 
 export async function coreTableExists(db, tableName) {
@@ -136,6 +250,13 @@ export async function initializeDatabase(db) {
       await applyMySqlSchema(db, schema);
     } else {
       await db.run(schema);
+    }
+  }
+
+  if (db.dialect === 'mysql') {
+    const repairedForeignKeys = await ensureMySqlForeignKeys(db);
+    if (repairedForeignKeys > 0) {
+      console.log(`[MySQL] Repaired ${repairedForeignKeys} missing foreign key constraint(s)`);
     }
   }
 

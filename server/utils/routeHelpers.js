@@ -34,6 +34,46 @@ export function toISOTimestamp(timestamp) {
 }
 
 /**
+ * Build a dialect-safe SQL expression that returns a YYYY-MM-DD string.
+ * @param {string} column - SQL column/expression
+ * @param {'sqlite'|'postgres'|'mysql'} dialect
+ * @returns {string}
+ */
+export function dateBucketExpression(column, dialect) {
+  if (dialect === 'postgres') {
+    return `TO_CHAR(${column}, 'YYYY-MM-DD')`;
+  }
+  if (dialect === 'mysql') {
+    return `DATE_FORMAT(${column}, '%Y-%m-%d')`;
+  }
+  return `date(${column})`;
+}
+
+/**
+ * Normalize a date bucket value to YYYY-MM-DD.
+ * Handles strings and Date-like values returned by DB drivers.
+ * @param {unknown} value
+ * @returns {string|null}
+ */
+export function normalizeDateBucket(value) {
+  if (!value) return null;
+  if (value instanceof Date) return value.toISOString().split('T')[0];
+  if (typeof value !== 'string') {
+    if (typeof value?.toISOString === 'function') {
+      try {
+        return value.toISOString().split('T')[0];
+      } catch {
+        return String(value);
+      }
+    }
+    return String(value);
+  }
+  if (value.includes('T')) return value.split('T')[0];
+  if (value.includes(' ')) return value.split(' ')[0];
+  return value;
+}
+
+/**
  * Safely parse JSON with fallback
  * @param {string} str - JSON string to parse
  * @param {any} defaultValue - Default value if parsing fails

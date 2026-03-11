@@ -3,7 +3,7 @@ CREATE TABLE IF NOT EXISTS skill_invocations (
   actor_type VARCHAR(32) NOT NULL,
   actor_id VARCHAR(255) NOT NULL,
   workspace_id BIGINT,
-  task_id BIGINT REFERENCES tasks(id) ON DELETE SET NULL,
+  task_id BIGINT,
   workflow_run_id VARCHAR(255),
   workflow_step_id VARCHAR(255),
   provider VARCHAR(64) NOT NULL DEFAULT 'http_worker',
@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS skill_invocations (
     (actor_type = 'user' AND actor_id LIKE 'user:%') OR
     (actor_type = 'system' AND actor_id LIKE 'system:%')
   ),
+  CONSTRAINT fk_skill_invocations_task
+    FOREIGN KEY (task_id) REFERENCES tasks(id)
+    ON DELETE SET NULL,
   UNIQUE KEY uq_skill_invocations_actor_idempotency (actor_type, actor_id, idempotency_key)
 );
 

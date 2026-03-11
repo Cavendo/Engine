@@ -24,5 +24,6 @@ describe('runtime skills migrations', () => {
     expect(base).toMatch(/idx_runtime_skill_policies_unique_ws/);
     expect(base).toMatch(/idx_runtime_skill_policies_unique_global/);
     expect(mysql).toMatch(/idx_runtime_skill_policies_unique/);
+    expect(mysql).toMatch(/FOREIGN KEY \(task_id\) REFERENCES tasks\(id\)/);
   });
 });

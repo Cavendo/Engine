@@ -380,6 +380,39 @@ CREATE TABLE IF NOT EXISTS runtime_skill_policies (
 );
 
 -- ============================================
+-- Foreign Keys
+-- ============================================
+
+ALTER TABLE agents ADD CONSTRAINT fk_agents_owner_user FOREIGN KEY (owner_user_id) REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE projects ADD CONSTRAINT fk_projects_default_agent FOREIGN KEY (default_agent_id) REFERENCES agents(id) ON DELETE SET NULL;
+ALTER TABLE agent_keys ADD CONSTRAINT fk_agent_keys_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE;
+ALTER TABLE sprints ADD CONSTRAINT fk_sprints_project FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL;
+ALTER TABLE tasks ADD CONSTRAINT fk_tasks_project FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL;
+ALTER TABLE tasks ADD CONSTRAINT fk_tasks_sprint FOREIGN KEY (sprint_id) REFERENCES sprints(id) ON DELETE SET NULL;
+ALTER TABLE tasks ADD CONSTRAINT fk_tasks_assigned_agent FOREIGN KEY (assigned_agent_id) REFERENCES agents(id) ON DELETE SET NULL;
+ALTER TABLE tasks ADD CONSTRAINT fk_tasks_preferred_agent FOREIGN KEY (preferred_agent_id) REFERENCES agents(id) ON DELETE SET NULL;
+ALTER TABLE deliverables ADD CONSTRAINT fk_deliverables_task FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE;
+ALTER TABLE deliverables ADD CONSTRAINT fk_deliverables_project FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL;
+ALTER TABLE deliverables ADD CONSTRAINT fk_deliverables_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE SET NULL;
+ALTER TABLE deliverables ADD CONSTRAINT fk_deliverables_submitted_user FOREIGN KEY (submitted_by_user_id) REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE deliverables ADD CONSTRAINT fk_deliverables_parent FOREIGN KEY (parent_id) REFERENCES deliverables(id) ON DELETE SET NULL;
+ALTER TABLE knowledge ADD CONSTRAINT fk_knowledge_project FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE webhooks ADD CONSTRAINT fk_webhooks_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE;
+ALTER TABLE webhook_deliveries ADD CONSTRAINT fk_webhook_deliveries_webhook FOREIGN KEY (webhook_id) REFERENCES webhooks(id) ON DELETE CASCADE;
+ALTER TABLE webhook_deliveries ADD CONSTRAINT fk_webhook_deliveries_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE;
+ALTER TABLE agent_activity ADD CONSTRAINT fk_agent_activity_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE;
+ALTER TABLE task_progress ADD CONSTRAINT fk_task_progress_task FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE;
+ALTER TABLE task_progress ADD CONSTRAINT fk_task_progress_agent FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE;
+ALTER TABLE sessions ADD CONSTRAINT fk_sessions_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+ALTER TABLE user_keys ADD CONSTRAINT fk_user_keys_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+ALTER TABLE routes ADD CONSTRAINT fk_routes_project FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+ALTER TABLE delivery_logs ADD CONSTRAINT fk_delivery_logs_route FOREIGN KEY (route_id) REFERENCES routes(id) ON DELETE CASCADE;
+ALTER TABLE delivery_logs ADD CONSTRAINT fk_delivery_logs_deliverable FOREIGN KEY (deliverable_id) REFERENCES deliverables(id) ON DELETE SET NULL;
+ALTER TABLE storage_connections ADD CONSTRAINT fk_storage_connections_created_by FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE skill_invocations ADD CONSTRAINT fk_skill_invocations_task FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE SET NULL;
+ALTER TABLE skill_invocation_artifacts ADD CONSTRAINT fk_skill_invocation_artifacts_invocation FOREIGN KEY (skill_invocation_id) REFERENCES skill_invocations(id) ON DELETE CASCADE;
+
+-- ============================================
 -- Indexes
 -- ============================================
 

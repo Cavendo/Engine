@@ -2,7 +2,11 @@ import { Router } from 'express';
 import db from '../db/adapter.js';
 import * as response from '../utils/response.js';
 import { userAuth } from '../middleware/userAuth.js';
-import { toISOTimestamp as formatTimestamp } from '../utils/routeHelpers.js';
+import {
+  toISOTimestamp as formatTimestamp,
+  dateBucketExpression,
+  normalizeDateBucket
+} from '../utils/routeHelpers.js';
 
 const router = Router();
 
@@ -48,6 +52,10 @@ function normalizeStatsTimestamps(stats) {
     first_activity: toISOTimestamp(stats.first_activity),
     last_activity: toISOTimestamp(stats.last_activity)
   };
+}
+
+function activityDateBucket(column) {
+  return dateBucketExpression(column, db.dialect);
 }
 
 /**
@@ -169,12 +177,13 @@ router.get('/stats', userAuth, async (req, res) => {
     `, [since, ...(agentId ? [parseInt(agentId)] : [])]);
 
     // Actions over time (by day)
+    const dateExpr = activityDateBucket('created_at');
     const actionsOverTime = await db.many(`
       SELECT
-        date(created_at) as date,
+        ${dateExpr} as date,
         COUNT(*) as count
       ${baseQuery}
-      GROUP BY date(created_at)
+      GROUP BY ${dateExpr}
       ORDER BY date ASC
     `, baseParams);
 
@@ -183,7 +192,10 @@ router.get('/stats', userAuth, async (req, res) => {
       totalActions,
       actionsByType,
       actionsByAgent,
-      actionsOverTime
+      actionsOverTime: actionsOverTime.map((row) => ({
+        ...row,
+        date: normalizeDateBucket(row.date)
+      }))
     });
   } catch (err) {
     console.error('Error getting activity stats:', err);

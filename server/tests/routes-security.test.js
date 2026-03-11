@@ -7,7 +7,15 @@
  */
 
 import { describe, it, expect } from '@jest/globals';
-import { sanitizeDestinationConfig, formatDeliveryLog, safeJsonParse, sanitizeUrl, toISOTimestamp } from '../utils/routeHelpers.js';
+import {
+  sanitizeDestinationConfig,
+  formatDeliveryLog,
+  safeJsonParse,
+  sanitizeUrl,
+  toISOTimestamp,
+  dateBucketExpression,
+  normalizeDateBucket
+} from '../utils/routeHelpers.js';
 
 // Mock data simulating what formatRoute and formatDeliveryLog receive
 const mockWebhookConfig = {
@@ -288,6 +296,21 @@ describe('Route Security - Non-Admin Data Redaction', () => {
     it('converts SQLite timestamp strings to ISO strings', () => {
       expect(toISOTimestamp('2026-03-11 17:44:47')).toBe('2026-03-11T17:44:47.000Z');
       expect(toISOTimestamp('2026-03-11 17:44:47.123')).toBe('2026-03-11T17:44:47.123Z');
+    });
+  });
+
+  describe('date bucket helpers', () => {
+    it('builds dialect-safe date bucket expressions', () => {
+      expect(dateBucketExpression('created_at', 'sqlite')).toBe('date(created_at)');
+      expect(dateBucketExpression('created_at', 'postgres')).toBe("TO_CHAR(created_at, 'YYYY-MM-DD')");
+      expect(dateBucketExpression('created_at', 'mysql')).toBe("DATE_FORMAT(created_at, '%Y-%m-%d')");
+    });
+
+    it('normalizes date bucket values to YYYY-MM-DD', () => {
+      expect(normalizeDateBucket(new Date('2026-03-11T17:44:47.000Z'))).toBe('2026-03-11');
+      expect(normalizeDateBucket('2026-03-11T17:44:47.000Z')).toBe('2026-03-11');
+      expect(normalizeDateBucket('2026-03-11 17:44:47')).toBe('2026-03-11');
+      expect(normalizeDateBucket('2026-03-11')).toBe('2026-03-11');
     });
   });
 
