@@ -24,6 +24,7 @@ import routesRouter from './routes/routes.js';
 import connectionsRouter from './routes/connections.js';
 import settingsRouter from './routes/settings.js';
 import skillsRuntimeRouter from './routes/skillsRuntime.js';
+import internalProvisioningRouter from './routes/internalProvisioning.js';
 
 // Import services
 import { processPendingDeliveries } from './services/webhooks.js';
@@ -139,6 +140,7 @@ export function createApp(options = {}) {
     app.use('/api/storage-connections', connectionsRouter);
     app.use('/api/settings', settingsRouter);
     app.use('/api/skills-runtime', skillsRuntimeRouter);
+    app.use('/api/internal/provisioning', internalProvisioningRouter);
 
     // Serve uploaded files (deliverable attachments) with authentication
     const uploadsPath = join(__dirname, '../data/uploads');

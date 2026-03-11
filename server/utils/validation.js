@@ -9,6 +9,12 @@ export const idParamSchema = z.object({
   id: z.string().regex(/^\d+$/, 'ID must be a number').transform(Number)
 });
 
+const externalKeyRegex = /^[a-z0-9][a-z0-9:_-]{0,199}$/;
+
+export const externalKeyParamSchema = z.object({
+  externalKey: z.string().regex(externalKeyRegex, 'Invalid external key')
+});
+
 export const paginationSchema = z.object({
   limit: z.string().regex(/^\d+$/).transform(Number).default('100'),
   offset: z.string().regex(/^\d+$/).transform(Number).default('0')
@@ -311,6 +317,13 @@ export const updateProjectSchema = z.object({
   message: 'At least one field must be provided'
 });
 
+export const ensureProjectSchema = z.object({
+  externalKey: z.string().regex(externalKeyRegex, 'Invalid external key'),
+  name: z.string().min(1, 'Name is required').max(255),
+  description: z.string().max(2000).optional().nullable(),
+  status: z.enum(['active', 'archived', 'completed']).optional()
+});
+
 // ============================================
 // Sprint Schemas
 // ============================================
@@ -414,6 +427,11 @@ const routingRuleSchema = z.object({
 export const routingRulesSchema = z.object({
   task_routing_rules: z.array(routingRuleSchema).optional().default([]),
   default_agent_id: z.number().int().positive().optional().nullable()
+});
+
+export const ensureProjectRoutingSchema = z.object({
+  taskRoutingRules: z.array(routingRuleSchema).optional().default([]),
+  defaultAgentId: z.number().int().positive().optional().nullable()
 });
 
 export const routingTestSchema = z.object({

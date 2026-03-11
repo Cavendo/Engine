@@ -100,6 +100,21 @@ curl -H "X-Agent-Key: cav_uk_..." http://localhost:3001/api/agents/me/tasks
 curl -H "X-Agent-Key: cav_ak_..." http://localhost:3001/api/agents/me/tasks
 ```
 
+For internal service-to-service provisioning, use a bearer token instead of `X-Agent-Key`:
+
+```bash
+openssl rand -hex 32
+```
+
+```env
+INTERNAL_SERVICE_TOKEN=replace_with_random_secret
+```
+
+```http
+Authorization: Bearer <INTERNAL_SERVICE_TOKEN>
+X-Internal-Service-Name: workflow_engine
+```
+
 ### Core Endpoints
 
 | Method | Endpoint | Description |
@@ -134,6 +149,25 @@ curl -H "X-Agent-Key: cav_ak_..." http://localhost:3001/api/agents/me/tasks
 | GET | `/api/deliverables/:id/activity` | Deliverable activity timeline |
 | GET | `/api/tasks/:id/activity` | Task activity timeline |
 | GET | `/api/activity/entity/:type/:id` | Activity log by entity type |
+| POST | `/api/internal/provisioning/projects/ensure` | Ensure project by external key (internal token) |
+| POST | `/api/internal/provisioning/projects/:externalKey/routing-rules/ensure` | Ensure task routing config (internal token) |
+
+### Internal Provisioning
+
+These endpoints are backend-only. They do not accept browser session auth or `X-Agent-Key`, and are intended for automation that needs stable idempotent project provisioning.
+
+```bash
+curl -X POST http://localhost:3001/api/internal/provisioning/projects/ensure \
+  -H "Authorization: Bearer $INTERNAL_SERVICE_TOKEN" \
+  -H "X-Internal-Service-Name: workflow_engine" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "externalKey": "project:acme",
+    "name": "Acme",
+    "description": "Provisioned by workflow automation",
+    "status": "active"
+  }'
+```
 
 ## Webhook Events
 

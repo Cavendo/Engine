@@ -18,6 +18,23 @@ Use `X-Agent-Key` header with either:
 curl -H "X-Agent-Key: cav_uk_..." http://localhost:3001/api/agents/me/tasks
 ```
 
+### Internal Service Token
+
+Internal-only provisioning endpoints accept a bearer token instead of session or agent auth.
+
+Required headers:
+- `Authorization: Bearer <INTERNAL_SERVICE_TOKEN>`
+- `X-Internal-Service-Name: <service_name>` (optional but recommended; defaults to `internal`)
+
+Example:
+```bash
+curl -X POST http://localhost:3001/api/internal/provisioning/projects/ensure \
+  -H "Authorization: Bearer $INTERNAL_SERVICE_TOKEN" \
+  -H "X-Internal-Service-Name: workflow_engine" \
+  -H "Content-Type: application/json" \
+  -d '{"externalKey":"project:acme","name":"Acme"}'
+```
+
 ## Users Endpoints
 
 ### GET /api/users/me
@@ -1141,6 +1158,61 @@ Dry-run routing rules without creating a task.
   "decision": "Assigned via rule \"Urgent Code Tasks\" to agent 1"
 }
 ```
+
+## Internal Provisioning Endpoints
+
+These endpoints are service-token-only and intended for backend automation. They do not accept `X-Agent-Key`.
+
+### POST /api/internal/provisioning/projects/ensure
+
+Create or update a project by stable `externalKey`.
+
+**Auth**: `Authorization: Bearer <INTERNAL_SERVICE_TOKEN>`
+
+**Body**:
+```json
+{
+  "externalKey": "project:acme",
+  "name": "Acme",
+  "description": "Provisioned by workflow automation",
+  "status": "active"
+}
+```
+
+**Behavior**:
+- Existing `externalKey` updates the project and returns `created: false`
+- New `externalKey` creates the project and returns `created: true`
+- Creating a new `externalKey` with a name already used by another project returns `409 PROJECT_NAME_CONFLICT`
+
+### POST /api/internal/provisioning/projects/:externalKey/routing-rules/ensure
+
+Replace the full task-routing configuration for a provisioned project.
+
+**Auth**: `Authorization: Bearer <INTERNAL_SERVICE_TOKEN>`
+
+**Body**:
+```json
+{
+  "taskRoutingRules": [
+    {
+      "id": "priority-high",
+      "name": "Priority High",
+      "conditions": {
+        "priority": { "eq": 1 }
+      },
+      "assign_to": 1,
+      "fallback_to": 2,
+      "enabled": true
+    }
+  ],
+  "defaultAgentId": 3
+}
+```
+
+**Behavior**:
+- Replaces `task_routing_rules` and `default_agent_id` exactly with the payload
+- Validates referenced agent IDs before saving
+- Returns `404 PROJECT_NOT_FOUND` when `externalKey` does not exist
 
 ## Routes Endpoints
 

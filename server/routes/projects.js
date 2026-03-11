@@ -38,8 +38,9 @@ function toISOTimestamp(timestamp) {
  * Normalize timestamp fields on a project object
  */
 function normalizeProjectTimestamps(project) {
+  const { external_key, ...publicProject } = project;
   return {
-    ...project,
+    ...publicProject,
     created_at: toISOTimestamp(project.created_at),
     updated_at: toISOTimestamp(project.updated_at)
   };

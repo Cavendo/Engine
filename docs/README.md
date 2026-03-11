@@ -13,6 +13,7 @@ Welcome to the Cavendo Engine documentation. Cavendo Engine is an open-source ag
 - [Authentication](./api/authentication.md) - API authentication methods
 - [Agents API](./api/agents.md) - Agent management endpoints
 - [Tasks API](./api/tasks.md) - Task management endpoints
+- Internal provisioning endpoints are documented in [API Overview](./api.md)
 - [Sprints API](./api/sprints.md) - Sprint/milestone management
 - [Deliverables API](./api/deliverables.md) - Deliverable submission endpoints
 - [Comments API](./api/comments.md) - Discussion threads on tasks/deliverables

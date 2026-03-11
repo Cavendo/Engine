@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS agents (
 CREATE TABLE IF NOT EXISTS projects (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(255) NOT NULL,
+    external_key VARCHAR(200),
     description TEXT,
     status VARCHAR(32) DEFAULT 'active' CHECK (status IN ('active', 'archived', 'completed')),
     task_routing_rules LONGTEXT,
@@ -436,6 +437,7 @@ CREATE INDEX idx_tasks_tags ON tasks(tags(255));
 CREATE INDEX idx_tasks_task_type ON tasks(task_type);
 CREATE INDEX idx_tasks_preferred_agent ON tasks(preferred_agent_id);
 CREATE INDEX idx_projects_default_agent ON projects(default_agent_id);
+CREATE UNIQUE INDEX idx_projects_external_key ON projects(external_key);
 
 CREATE INDEX idx_agents_agent_type ON agents(agent_type);
 CREATE INDEX idx_agents_specialization ON agents(specialization);

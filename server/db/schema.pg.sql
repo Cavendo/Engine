@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS agents (
 CREATE TABLE IF NOT EXISTS projects (
     id SERIAL PRIMARY KEY,
     name TEXT NOT NULL,
+    external_key TEXT,
     description TEXT,
     status TEXT DEFAULT 'active' CHECK (status IN ('active', 'archived', 'completed')),
     task_routing_rules TEXT,
@@ -441,6 +442,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_tags ON tasks(tags);
 CREATE INDEX IF NOT EXISTS idx_tasks_task_type ON tasks(task_type);
 CREATE INDEX IF NOT EXISTS idx_tasks_preferred_agent ON tasks(preferred_agent_id);
 CREATE INDEX IF NOT EXISTS idx_projects_default_agent ON projects(default_agent_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_external_key ON projects(external_key) WHERE external_key IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_agents_agent_type ON agents(agent_type);
 CREATE INDEX IF NOT EXISTS idx_agents_specialization ON agents(specialization);

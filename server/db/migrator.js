@@ -6,6 +6,23 @@ import { isDuplicateColumn, isDuplicateIndex, isUniqueViolation } from './errors
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_DIR = join(__dirname, 'migrations');
 
+async function recordAppliedMigration(db, version) {
+  if (db.dialect === 'postgres') {
+    await db.exec(
+      'INSERT INTO schema_migrations (version) VALUES (?) ON CONFLICT (version) DO NOTHING',
+      [version]
+    );
+    return;
+  }
+
+  if (db.dialect === 'mysql') {
+    await db.exec('INSERT IGNORE INTO schema_migrations (version) VALUES (?)', [version]);
+    return;
+  }
+
+  await db.exec('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)', [version]);
+}
+
 /**
  * Lightweight migration runner for Cavendo Engine.
  * Owns the schema_migrations table exclusively (not in schema.sql).
@@ -72,10 +89,10 @@ export async function runMigrations(db) {
       // ALTER TABLE ADD COLUMN fails if column already exists — treat as idempotent
       if (isDuplicateColumn(err)) {
         console.log(`[Migrator] Skipped (columns already exist): ${file}`);
-        await db.exec('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)', [version]);
+        await recordAppliedMigration(db, version);
       } else if (isDuplicateIndex(err)) {
         console.log(`[Migrator] Skipped (index already exists): ${file}`);
-        await db.exec('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)', [version]);
+        await recordAppliedMigration(db, version);
       } else if (version === '003_deliverables_task_version_unique' &&
                  isUniqueViolation(err)) {
         console.error(`[Migrator] Migration ${file} cannot be applied: existing duplicate (task_id, version) rows in deliverables.`);
