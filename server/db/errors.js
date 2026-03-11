@@ -21,6 +21,9 @@ export function isUniqueViolation(err) {
   // PostgreSQL: pg sets err.code to SQLSTATE '23505' (unique_violation)
   if (err.code === '23505') return true;
 
+  // MySQL
+  if (err.code === 'ER_DUP_ENTRY' || err.code === '23000') return true;
+
   // Fallback: check error message patterns
   if (typeof err.message === 'string') {
     if (err.message.includes('UNIQUE constraint failed')) return true;
@@ -44,6 +47,9 @@ export function isForeignKeyViolation(err) {
   // PostgreSQL: SQLSTATE 23503
   if (err.code === '23503') return true;
 
+  // MySQL
+  if (err.code === 'ER_NO_REFERENCED_ROW_2' || err.code === 'ER_ROW_IS_REFERENCED_2') return true;
+
   return false;
 }
 
@@ -62,5 +68,22 @@ export function isDuplicateColumn(err) {
   // PostgreSQL
   if (err.message.includes('already exists')) return true;
 
+  // MySQL
+  if (err.code === 'ER_DUP_FIELDNAME') return true;
+
+  return false;
+}
+
+/**
+ * Check if an error indicates a duplicate index creation attempt.
+ * @param {Error} err
+ * @returns {boolean}
+ */
+export function isDuplicateIndex(err) {
+  if (!err) return false;
+  if (err.code === 'ER_DUP_KEYNAME') return true; // MySQL
+  if (typeof err.message === 'string') {
+    if (err.message.includes('already exists')) return true;
+  }
   return false;
 }

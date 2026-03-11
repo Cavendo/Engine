@@ -4,7 +4,7 @@
  * Covers:
  * - sqlRewriter: placeholder rewriting, datetime('now'), INSERT OR IGNORE
  * - sqliteAdapter: one/many/exec/insert/tx/run/close against in-memory DB
- * - errors: isUniqueViolation, isForeignKeyViolation, isDuplicateColumn
+ * - errors: isUniqueViolation, isForeignKeyViolation, isDuplicateColumn, isDuplicateIndex
  */
 
 import { jest } from '@jest/globals';
@@ -175,6 +175,32 @@ WHERE a = $1 AND b = '?' /* block ? */ AND c = $2`;
       const result = rewriteSQL('SELECT id, name FROM tasks WHERE status = ?');
       expect(result).toBe('SELECT id, name FROM tasks WHERE status = $1');
     });
+
+    test("mysql target keeps '?' placeholders and rewrites INSERT OR IGNORE", () => {
+      const result = rewriteSQL('INSERT OR IGNORE INTO t (a) VALUES (?)', 'mysql');
+      expect(result).toBe('INSERT IGNORE INTO t (a) VALUES (?)');
+    });
+
+    test("mysql target rewrites datetime('now') to NOW()", () => {
+      const result = rewriteSQL("SELECT * FROM t WHERE created_at > datetime('now')", 'mysql');
+      expect(result).toBe('SELECT * FROM t WHERE created_at > NOW()');
+    });
+
+    test("mysql target rewrites datetime modifier to DATE_SUB", () => {
+      const result = rewriteSQL("SELECT * FROM t WHERE updated_at >= datetime('now', '-7 days')", 'mysql');
+      expect(result).toBe('SELECT * FROM t WHERE updated_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)');
+    });
+
+    test("mysql target rewrites positive datetime modifier to DATE_ADD", () => {
+      const result = rewriteSQL("SELECT * FROM t WHERE due_at <= datetime('now', '+2 hours')", 'mysql');
+      expect(result).toBe('SELECT * FROM t WHERE due_at <= DATE_ADD(NOW(), INTERVAL 2 HOUR)');
+    });
+
+    test("mysql target handles mixed modifier + bare datetime in same SQL", () => {
+      const sql = "SELECT * FROM t WHERE a >= datetime('now', '-1 hour') AND b < datetime('now')";
+      const result = rewriteSQL(sql, 'mysql');
+      expect(result).toBe('SELECT * FROM t WHERE a >= DATE_SUB(NOW(), INTERVAL 1 HOUR) AND b < NOW()');
+    });
   });
 });
 
@@ -182,7 +208,7 @@ WHERE a = $1 AND b = '?' /* block ? */ AND c = $2`;
 // Error Helpers Tests
 // ============================================
 
-const { isUniqueViolation, isForeignKeyViolation, isDuplicateColumn } = await import('../db/errors.js');
+const { isUniqueViolation, isForeignKeyViolation, isDuplicateColumn, isDuplicateIndex } = await import('../db/errors.js');
 
 describe('error helpers', () => {
   describe('isUniqueViolation', () => {
@@ -216,6 +242,12 @@ describe('error helpers', () => {
       expect(isUniqueViolation(null)).toBe(false);
       expect(isUniqueViolation(undefined)).toBe(false);
     });
+
+    test('detects MySQL duplicate entry (ER_DUP_ENTRY)', () => {
+      const err = new Error('Duplicate entry');
+      err.code = 'ER_DUP_ENTRY';
+      expect(isUniqueViolation(err)).toBe(true);
+    });
   });
 
   describe('isForeignKeyViolation', () => {
@@ -234,6 +266,12 @@ describe('error helpers', () => {
     test('returns false for unrelated error', () => {
       expect(isForeignKeyViolation(new Error('syntax error'))).toBe(false);
     });
+
+    test('detects MySQL FK violation (ER_NO_REFERENCED_ROW_2)', () => {
+      const err = new Error('Cannot add or update a child row');
+      err.code = 'ER_NO_REFERENCED_ROW_2';
+      expect(isForeignKeyViolation(err)).toBe(true);
+    });
   });
 
   describe('isDuplicateColumn', () => {
@@ -247,6 +285,24 @@ describe('error helpers', () => {
 
     test('returns false for null', () => {
       expect(isDuplicateColumn(null)).toBe(false);
+    });
+
+    test('detects MySQL duplicate column (ER_DUP_FIELDNAME)', () => {
+      const err = new Error('Duplicate column name');
+      err.code = 'ER_DUP_FIELDNAME';
+      expect(isDuplicateColumn(err)).toBe(true);
+    });
+  });
+
+  describe('isDuplicateIndex', () => {
+    test('detects MySQL duplicate index (ER_DUP_KEYNAME)', () => {
+      const err = new Error('Duplicate key name');
+      err.code = 'ER_DUP_KEYNAME';
+      expect(isDuplicateIndex(err)).toBe(true);
+    });
+
+    test('returns false for unrelated error', () => {
+      expect(isDuplicateIndex(new Error('some other error'))).toBe(false);
     });
   });
 });

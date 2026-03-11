@@ -804,7 +804,9 @@ router.get('/:id/metrics', userAuth, async (req, res) => {
     // Average completion time (only for tasks with both started_at and completed_at)
     const avgExpr = db.dialect === 'postgres'
       ? 'AVG(EXTRACT(EPOCH FROM (completed_at - started_at)) / 60)'
-      : 'AVG((julianday(completed_at) - julianday(started_at)) * 24 * 60)';
+      : db.dialect === 'mysql'
+        ? 'AVG(TIMESTAMPDIFF(MINUTE, started_at, completed_at))'
+        : 'AVG((julianday(completed_at) - julianday(started_at)) * 24 * 60)';
     const avgCompletionTime = await db.one(`
       SELECT ${avgExpr} as avg_minutes
       FROM tasks t

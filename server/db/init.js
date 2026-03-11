@@ -24,11 +24,17 @@ export async function initializeDatabase(db) {
   // Read and execute schema
   // Note: schema.sql is the canonical baseline schema.
   // For upgrades, use the migrator (server/db/migrator.js) which runs after this.
-  const schemaFile = db.dialect === 'postgres' ? 'schema.pg.sql' : 'schema.sql';
+  const schemaFile = db.dialect === 'postgres'
+    ? 'schema.pg.sql'
+    : (db.dialect === 'mysql' ? 'schema.mysql.sql' : 'schema.sql');
   const schema = readFileSync(join(__dirname, schemaFile), 'utf-8');
   await db.run(schema);
 
-  console.log('Database initialized at:', db.dialect === 'postgres' ? process.env.DATABASE_URL?.replace(/\/\/[^@]+@/, '//***@') : DB_PATH);
+  console.log('Database initialized at:',
+    (db.dialect === 'postgres' || db.dialect === 'mysql')
+      ? process.env.DATABASE_URL?.replace(/\/\/[^@]+@/, '//***@')
+      : DB_PATH
+  );
 
   // Backfill users.force_password_change for existing databases
   if (db.dialect === 'sqlite') {
@@ -40,11 +46,22 @@ export async function initializeDatabase(db) {
         ADD COLUMN force_password_change INTEGER DEFAULT 0 CHECK (force_password_change IN (0, 1))
       `);
     }
-  } else {
+  } else if (db.dialect === 'postgres') {
     // PostgreSQL: check information_schema
     const col = await db.one(`
       SELECT column_name FROM information_schema.columns
       WHERE table_name = 'users' AND column_name = 'force_password_change'
+    `);
+    if (!col) {
+      await db.run(`
+        ALTER TABLE users
+        ADD COLUMN force_password_change INTEGER DEFAULT 0 CHECK (force_password_change IN (0, 1))
+      `);
+    }
+  } else if (db.dialect === 'mysql') {
+    const col = await db.one(`
+      SELECT COLUMN_NAME AS column_name FROM information_schema.columns
+      WHERE table_schema = DATABASE() AND table_name = 'users' AND column_name = 'force_password_change'
     `);
     if (!col) {
       await db.run(`

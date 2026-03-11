@@ -79,7 +79,7 @@ export function createPgAdapter(pool) {
      */
     async one(sql, params) {
       guardOuterCall('one');
-      const pgSql = rewriteSQL(sql);
+      const pgSql = rewriteSQL(sql, 'postgres');
       const result = await pool.query(pgSql, params || []);
       return result.rows[0] || undefined;
     },
@@ -92,7 +92,7 @@ export function createPgAdapter(pool) {
      */
     async many(sql, params) {
       guardOuterCall('many');
-      const pgSql = rewriteSQL(sql);
+      const pgSql = rewriteSQL(sql, 'postgres');
       const result = await pool.query(pgSql, params || []);
       return result.rows;
     },
@@ -105,7 +105,7 @@ export function createPgAdapter(pool) {
      */
     async exec(sql, params) {
       guardOuterCall('exec');
-      const pgSql = rewriteSQL(sql);
+      const pgSql = rewriteSQL(sql, 'postgres');
       const result = await pool.query(pgSql, params || []);
       return { changes: result.rowCount };
     },
@@ -123,7 +123,7 @@ export function createPgAdapter(pool) {
     async insert(sql, params) {
       guardOuterCall('insert');
       assertSingleInsert(sql);
-      let pgSql = rewriteSQL(sql);
+      let pgSql = rewriteSQL(sql, 'postgres');
       pgSql = appendReturningId(pgSql);
       const result = await pool.query(pgSql, params || []);
       const id = result.rows[0]?.id ?? null;
@@ -197,26 +197,26 @@ function createPgTxProxy(client) {
     dialect: 'postgres',
 
     async one(sql, params) {
-      const pgSql = rewriteSQL(sql);
+      const pgSql = rewriteSQL(sql, 'postgres');
       const result = await client.query(pgSql, params || []);
       return result.rows[0] || undefined;
     },
 
     async many(sql, params) {
-      const pgSql = rewriteSQL(sql);
+      const pgSql = rewriteSQL(sql, 'postgres');
       const result = await client.query(pgSql, params || []);
       return result.rows;
     },
 
     async exec(sql, params) {
-      const pgSql = rewriteSQL(sql);
+      const pgSql = rewriteSQL(sql, 'postgres');
       const result = await client.query(pgSql, params || []);
       return { changes: result.rowCount };
     },
 
     async insert(sql, params) {
       assertSingleInsert(sql);
-      let pgSql = rewriteSQL(sql);
+      let pgSql = rewriteSQL(sql, 'postgres');
       pgSql = appendReturningId(pgSql);
       const result = await client.query(pgSql, params || []);
       const id = result.rows[0]?.id ?? null;

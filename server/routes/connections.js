@@ -17,6 +17,8 @@ const router = express.Router();
 // Dialect-aware JSON extraction for connection_id lookups
 const jsonExtractConnectionId = db.dialect === 'postgres'
   ? "(r.destination_config::jsonb->>'connection_id')"
+  : db.dialect === 'mysql'
+    ? "JSON_UNQUOTE(JSON_EXTRACT(r.destination_config, '$.connection_id'))"
   : "json_extract(r.destination_config, '$.connection_id')";
 
 // ============================================
@@ -203,6 +205,8 @@ router.delete('/:id', userAuth, requireRoles('admin'), validateParams(idParamSch
     // Check if any routes reference this connection
     const jsonExtractDirect = db.dialect === 'postgres'
       ? "(destination_config::jsonb->>'connection_id')"
+      : db.dialect === 'mysql'
+        ? "JSON_UNQUOTE(JSON_EXTRACT(destination_config, '$.connection_id'))"
       : "json_extract(destination_config, '$.connection_id')";
     const routes = await db.many(`
       SELECT id, name FROM routes

@@ -474,6 +474,36 @@ export async function claimDueInvocations(ownerId, limit = 20) {
     return rows.map(normalizeInvocationRow);
   }
 
+  if (db.dialect === 'mysql') {
+    return db.tx(async (tx) => {
+      const candidates = await tx.many(`
+        SELECT *
+        FROM skill_invocations
+        WHERE status IN ('queued', 'running')
+          AND next_poll_at <= ?
+          AND (poll_claimed_until IS NULL OR poll_claimed_until < ?)
+        ORDER BY next_poll_at ASC
+        LIMIT ?
+        FOR UPDATE SKIP LOCKED
+      `, [now, now, limit]);
+
+      const claimed = [];
+      for (const candidate of candidates) {
+        const result = await tx.exec(`
+          UPDATE skill_invocations
+          SET poll_claimed_by = ?, poll_claimed_until = ?, updated_at = ?
+          WHERE id = ?
+            AND (poll_claimed_until IS NULL OR poll_claimed_until < ?)
+        `, [ownerId, claimedUntil, now, candidate.id, now]);
+        if (result.changes > 0) {
+          claimed.push({ ...candidate, poll_claimed_by: ownerId, poll_claimed_until: claimedUntil });
+        }
+      }
+
+      return claimed.map(normalizeInvocationRow);
+    });
+  }
+
   return db.tx(async (tx) => {
     const candidates = await tx.many(`
       SELECT *

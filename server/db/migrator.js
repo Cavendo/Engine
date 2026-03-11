@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import { isDuplicateColumn, isUniqueViolation } from './errors.js';
+import { isDuplicateColumn, isDuplicateIndex, isUniqueViolation } from './errors.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_DIR = join(__dirname, 'migrations');
@@ -14,11 +14,20 @@ const MIGRATIONS_DIR = join(__dirname, 'migrations');
  * @param {object} db - Database adapter (one/many/exec/insert/run/tx/dialect)
  */
 export async function runMigrations(db) {
+  const migrationVersionType = db.dialect === 'mysql' ? 'VARCHAR(255)' : 'TEXT';
+  const migrationAppliedType = db.dialect === 'mysql' ? 'DATETIME(3)' : 'TEXT';
+  const migrationAppliedDefault = db.dialect === 'postgres'
+    ? 'NOW()'
+    : (db.dialect === 'mysql' ? 'CURRENT_TIMESTAMP(3)' : "datetime('now')");
+  const migrationAppliedDefaultSql = db.dialect === 'mysql'
+    ? migrationAppliedDefault
+    : `(${migrationAppliedDefault})`;
+
   // Ensure schema_migrations table exists
   await db.run(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
-      version TEXT PRIMARY KEY,
-      applied_at TEXT DEFAULT (${db.dialect === 'postgres' ? 'NOW()' : "datetime('now')"})
+      version ${migrationVersionType} PRIMARY KEY,
+      applied_at ${migrationAppliedType} DEFAULT ${migrationAppliedDefaultSql}
     )
   `);
 
@@ -29,6 +38,8 @@ export async function runMigrations(db) {
   // Determine migration directory based on dialect
   const migrationsDir = db.dialect === 'postgres'
     ? join(MIGRATIONS_DIR, 'pg')
+    : db.dialect === 'mysql'
+      ? join(MIGRATIONS_DIR, 'mysql')
     : MIGRATIONS_DIR;
 
   // Read migration files sorted lexicographically
@@ -61,6 +72,9 @@ export async function runMigrations(db) {
       // ALTER TABLE ADD COLUMN fails if column already exists — treat as idempotent
       if (isDuplicateColumn(err)) {
         console.log(`[Migrator] Skipped (columns already exist): ${file}`);
+        await db.exec('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)', [version]);
+      } else if (isDuplicateIndex(err)) {
+        console.log(`[Migrator] Skipped (index already exists): ${file}`);
         await db.exec('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)', [version]);
       } else if (version === '003_deliverables_task_version_unique' &&
                  isUniqueViolation(err)) {

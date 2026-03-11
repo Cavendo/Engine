@@ -22,21 +22,41 @@
  * manually at the call site with db.dialect checks.
  */
 
+function rewriteDatetimeForMysql(sql) {
+  let result = sql;
+  result = result.replace(
+    /datetime\(\s*'now'\s*,\s*'([+-])(\d+)\s+(\w+)'\s*\)/gi,
+    (_, sign, n, unitRaw) => {
+      const unit = unitRaw.toUpperCase().replace(/S$/, '');
+      const fn = sign === '-' ? 'DATE_SUB' : 'DATE_ADD';
+      return `${fn}(NOW(), INTERVAL ${n} ${unit})`;
+    }
+  );
+  result = result.replace(/datetime\(\s*'now'\s*\)/gi, 'NOW()');
+  return result;
+}
+
 /**
- * Rewrite SQLite-style SQL for PostgreSQL.
+ * Rewrite SQLite-style SQL for target dialect.
  * @param {string} sql - SQLite-compatible SQL string
- * @returns {string} PostgreSQL-compatible SQL string
+ * @param {'postgres'|'mysql'} [target='postgres']
+ * @returns {string}
  */
-export function rewriteSQL(sql) {
+export function rewriteSQL(sql, target = 'postgres') {
   let result = sql;
 
+  if (target === 'mysql') {
+    // INSERT OR IGNORE -> INSERT IGNORE
+    result = result.replace(/\bINSERT\s+OR\s+IGNORE\b/gi, 'INSERT IGNORE');
+    result = rewriteDatetimeForMysql(result);
+    // MySQL uses '?' placeholders; no positional rewrite needed.
+    return result;
+  }
+
+  // Postgres path
   // 1. INSERT OR IGNORE → INSERT ... ON CONFLICT DO NOTHING
   if (/\bINSERT\s+OR\s+IGNORE\b/i.test(result)) {
-    result = result.replace(
-      /\bINSERT\s+OR\s+IGNORE\b/gi,
-      'INSERT'
-    );
-    // Append ON CONFLICT DO NOTHING before trailing semicolon or at end
+    result = result.replace(/\bINSERT\s+OR\s+IGNORE\b/gi, 'INSERT');
     result = result.replace(/(\s*;?\s*)$/, ' ON CONFLICT DO NOTHING$1');
   }
 
