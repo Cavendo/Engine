@@ -67,4 +67,9 @@ describe('mysql schema safety', () => {
     // MySQL 8 requires expression-form defaults for TEXT/BLOB families.
     expect(schema).not.toMatch(/\b(?:TEXT|LONGTEXT)\s+DEFAULT\s+'[^']*'/i);
   });
+
+  test('initializeDatabase uses statement-wise MySQL schema application', () => {
+    const init = readFileSync('server/db/init.js', 'utf8');
+    expect(init).toMatch(/if \(db\.dialect === 'mysql'\) \{\s*await applyMySqlSchema\(db, schema\);/s);
+  });
 });

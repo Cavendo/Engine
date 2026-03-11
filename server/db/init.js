@@ -5,6 +5,77 @@ import { hashPassword } from '../utils/crypto.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+function stripLeadingSqlComments(sql) {
+  return sql.replace(/^(?:\s*--.*\n)+/g, '').trim();
+}
+
+export function splitSqlStatements(sql) {
+  const statements = [];
+  let current = '';
+  let inSingle = false;
+  let inDouble = false;
+  let inBacktick = false;
+  let prev = '';
+
+  for (const char of sql) {
+    if (char === "'" && !inDouble && !inBacktick && prev !== '\\') {
+      inSingle = !inSingle;
+    } else if (char === '"' && !inSingle && !inBacktick && prev !== '\\') {
+      inDouble = !inDouble;
+    } else if (char === '`' && !inSingle && !inDouble && prev !== '\\') {
+      inBacktick = !inBacktick;
+    }
+
+    if (char === ';' && !inSingle && !inDouble && !inBacktick) {
+      const trimmed = current.trim();
+      if (trimmed) statements.push(trimmed);
+      current = '';
+      prev = '';
+      continue;
+    }
+
+    current += char;
+    prev = char;
+  }
+
+  const tail = current.trim();
+  if (tail) statements.push(tail);
+
+  return statements;
+}
+
+async function mysqlIndexExists(db, tableName, indexName) {
+  const row = await db.one(`
+    SELECT INDEX_NAME
+    FROM information_schema.statistics
+    WHERE table_schema = DATABASE()
+      AND table_name = ?
+      AND index_name = ?
+    LIMIT 1
+  `, [tableName, indexName]);
+
+  return Boolean(row);
+}
+
+export async function applyMySqlSchema(db, schema) {
+  const statements = splitSqlStatements(schema);
+
+  for (const statement of statements) {
+    const normalized = stripLeadingSqlComments(statement);
+    if (!normalized) continue;
+
+    const indexMatch = normalized.match(/^CREATE\s+(?:UNIQUE\s+)?INDEX\s+`?([a-zA-Z0-9_]+)`?\s+ON\s+`?([a-zA-Z0-9_]+)`?/i);
+    if (indexMatch) {
+      const [, indexName, tableName] = indexMatch;
+      if (await mysqlIndexExists(db, tableName, indexName)) {
+        continue;
+      }
+    }
+
+    await db.run(statement);
+  }
+}
+
 /**
  * Initialize database schema and seed data.
  * Accepts the shared db adapter — does NOT open/close its own connection.
@@ -28,7 +99,11 @@ export async function initializeDatabase(db) {
     ? 'schema.pg.sql'
     : (db.dialect === 'mysql' ? 'schema.mysql.sql' : 'schema.sql');
   const schema = readFileSync(join(__dirname, schemaFile), 'utf-8');
-  await db.run(schema);
+  if (db.dialect === 'mysql') {
+    await applyMySqlSchema(db, schema);
+  } else {
+    await db.run(schema);
+  }
 
   console.log('Database initialized at:',
     (db.dialect === 'postgres' || db.dialect === 'mysql')
