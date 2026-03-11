@@ -1,5 +1,5 @@
 import { describe, test, expect, jest } from '@jest/globals';
-import { createMysqlAdapter, shouldUseTextProtocol } from '../db/mysqlAdapter.js';
+import { createMysqlAdapter, shouldUseTextProtocol, normalizeMysqlParamValue } from '../db/mysqlAdapter.js';
 
 describe('mysqlAdapter', () => {
   test('uses text protocol for LIMIT placeholders', async () => {
@@ -38,5 +38,11 @@ describe('mysqlAdapter', () => {
     expect(shouldUseTextProtocol('SELECT * FROM tasks LIMIT ?', [10])).toBe(true);
     expect(shouldUseTextProtocol('SELECT * FROM tasks LIMIT ? OFFSET ?', [10, 20])).toBe(true);
     expect(shouldUseTextProtocol('SELECT * FROM tasks WHERE id = ?', [1])).toBe(false);
+  });
+
+  test('normalizes ISO datetimes for DATETIME columns', () => {
+    expect(normalizeMysqlParamValue('2026-03-18T17:04:11.250Z')).toBe('2026-03-18 17:04:11.250');
+    expect(normalizeMysqlParamValue(new Date('2026-03-18T17:04:11.250Z'))).toBe('2026-03-18 17:04:11.250');
+    expect(normalizeMysqlParamValue('not-a-date')).toBe('not-a-date');
   });
 });

@@ -17,17 +17,47 @@ import { rewriteSQL } from './sqlRewriter.js';
 
 const txStore = new AsyncLocalStorage();
 const txGuardMode = process.env.TX_GUARD_MODE || 'error';
+const ISO_DATETIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
 
 function shouldUseTextProtocol(sql, params) {
   if (!params || params.length === 0) return false;
   return /\bLIMIT\s+\?(?:\s+OFFSET\s+\?)?(?:\s|$)/i.test(sql) || /\bOFFSET\s+\?(?:\s|$)/i.test(sql);
 }
 
-async function runWithParams(executor, sql, params) {
-  if (shouldUseTextProtocol(sql, params)) {
-    return executor.query(sql, params || []);
+function pad(value, width = 2) {
+  return String(value).padStart(width, '0');
+}
+
+function formatMysqlDateTime(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+
+  return [
+    `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}`,
+    `${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}.${pad(date.getUTCMilliseconds(), 3)}`
+  ].join(' ');
+}
+
+function normalizeMysqlParamValue(value) {
+  if (value instanceof Date) {
+    return formatMysqlDateTime(value);
   }
-  return executor.execute(sql, params || []);
+  if (typeof value === 'string' && ISO_DATETIME_RE.test(value)) {
+    return formatMysqlDateTime(value);
+  }
+  return value;
+}
+
+function normalizeMysqlParams(params) {
+  return (params || []).map(normalizeMysqlParamValue);
+}
+
+async function runWithParams(executor, sql, params) {
+  const normalizedParams = normalizeMysqlParams(params);
+  if (shouldUseTextProtocol(sql, normalizedParams)) {
+    return executor.query(sql, normalizedParams);
+  }
+  return executor.execute(sql, normalizedParams);
 }
 
 function guardOuterCall(method) {
@@ -155,3 +185,4 @@ function createMysqlTxProxy(conn) {
 }
 
 export { shouldUseTextProtocol };
+export { normalizeMysqlParamValue };
