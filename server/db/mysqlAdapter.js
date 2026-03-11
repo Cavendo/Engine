@@ -18,6 +18,18 @@ import { rewriteSQL } from './sqlRewriter.js';
 const txStore = new AsyncLocalStorage();
 const txGuardMode = process.env.TX_GUARD_MODE || 'error';
 
+function shouldUseTextProtocol(sql, params) {
+  if (!params || params.length === 0) return false;
+  return /\bLIMIT\s+\?(?:\s+OFFSET\s+\?)?(?:\s|$)/i.test(sql) || /\bOFFSET\s+\?(?:\s|$)/i.test(sql);
+}
+
+async function runWithParams(executor, sql, params) {
+  if (shouldUseTextProtocol(sql, params)) {
+    return executor.query(sql, params || []);
+  }
+  return executor.execute(sql, params || []);
+}
+
 function guardOuterCall(method) {
   if (txStore.getStore()?.inTx) {
     const msg = `db.${method}() called during active transaction. Use tx.${method}() instead.`;
@@ -44,21 +56,21 @@ export function createMysqlAdapter(pool) {
     async one(sql, params) {
       guardOuterCall('one');
       const mysqlSql = rewriteSQL(sql, 'mysql');
-      const [rows] = await pool.execute(mysqlSql, params || []);
+      const [rows] = await runWithParams(pool, mysqlSql, params);
       return rows[0] || undefined;
     },
 
     async many(sql, params) {
       guardOuterCall('many');
       const mysqlSql = rewriteSQL(sql, 'mysql');
-      const [rows] = await pool.execute(mysqlSql, params || []);
+      const [rows] = await runWithParams(pool, mysqlSql, params);
       return rows;
     },
 
     async exec(sql, params) {
       guardOuterCall('exec');
       const mysqlSql = rewriteSQL(sql, 'mysql');
-      const [result] = await pool.execute(mysqlSql, params || []);
+      const [result] = await runWithParams(pool, mysqlSql, params);
       return { changes: result.affectedRows || 0 };
     },
 
@@ -66,7 +78,7 @@ export function createMysqlAdapter(pool) {
       guardOuterCall('insert');
       assertSingleInsert(sql);
       const mysqlSql = rewriteSQL(sql, 'mysql');
-      const [result] = await pool.execute(mysqlSql, params || []);
+      const [result] = await runWithParams(pool, mysqlSql, params);
       return {
         lastInsertRowid: result.insertId ?? null,
         changes: result.affectedRows || 0
@@ -110,26 +122,26 @@ function createMysqlTxProxy(conn) {
 
     async one(sql, params) {
       const mysqlSql = rewriteSQL(sql, 'mysql');
-      const [rows] = await conn.execute(mysqlSql, params || []);
+      const [rows] = await runWithParams(conn, mysqlSql, params);
       return rows[0] || undefined;
     },
 
     async many(sql, params) {
       const mysqlSql = rewriteSQL(sql, 'mysql');
-      const [rows] = await conn.execute(mysqlSql, params || []);
+      const [rows] = await runWithParams(conn, mysqlSql, params);
       return rows;
     },
 
     async exec(sql, params) {
       const mysqlSql = rewriteSQL(sql, 'mysql');
-      const [result] = await conn.execute(mysqlSql, params || []);
+      const [result] = await runWithParams(conn, mysqlSql, params);
       return { changes: result.affectedRows || 0 };
     },
 
     async insert(sql, params) {
       assertSingleInsert(sql);
       const mysqlSql = rewriteSQL(sql, 'mysql');
-      const [result] = await conn.execute(mysqlSql, params || []);
+      const [result] = await runWithParams(conn, mysqlSql, params);
       return {
         lastInsertRowid: result.insertId ?? null,
         changes: result.affectedRows || 0
@@ -141,3 +153,5 @@ function createMysqlTxProxy(conn) {
     }
   };
 }
+
+export { shouldUseTextProtocol };
