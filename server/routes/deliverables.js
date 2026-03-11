@@ -16,6 +16,7 @@ import {
 } from '../utils/validation.js';
 import { insertDeliverableWithRetry } from '../utils/deliverableVersioning.js';
 import { detectDeliverableContentType } from '../utils/detectDeliverableContentType.js';
+import { toISOTimestamp as formatTimestamp } from '../utils/routeHelpers.js';
 import {
   getMimeType,
   sanitizeFilename,
@@ -51,14 +52,7 @@ function safeJsonParse(jsonString, defaultValue = null) {
  * @returns {string|null} ISO 8601 timestamp with Z suffix, or null
  */
 function toISOTimestamp(timestamp) {
-  if (!timestamp) return null;
-  // If already has Z or timezone offset, return as-is
-  if (timestamp.endsWith('Z') || /[+-]\d{2}:\d{2}$/.test(timestamp)) {
-    return timestamp;
-  }
-  // Convert "YYYY-MM-DD HH:MM:SS" to "YYYY-MM-DDTHH:MM:SS.000Z"
-  const isoString = timestamp.replace(' ', 'T');
-  return isoString.includes('.') ? `${isoString}Z` : `${isoString}.000Z`;
+  return formatTimestamp(timestamp);
 }
 
 /**

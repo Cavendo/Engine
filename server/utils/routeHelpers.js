@@ -4,12 +4,33 @@
  */
 
 /**
- * Normalize SQLite timestamps to ISO 8601 format
+ * Normalize database timestamps to ISO 8601 format.
+ * Supports SQLite-style strings and MySQL Date objects.
  */
-function toISOTimestamp(timestamp) {
+export function toISOTimestamp(timestamp) {
   if (!timestamp) return null;
-  if (timestamp.includes('T')) return timestamp;
-  return timestamp.replace(' ', 'T') + '.000Z';
+
+  if (timestamp instanceof Date) {
+    return timestamp.toISOString();
+  }
+
+  if (typeof timestamp !== 'string') {
+    if (typeof timestamp.toISOString === 'function') {
+      try {
+        return timestamp.toISOString();
+      } catch {
+        return timestamp;
+      }
+    }
+    return timestamp;
+  }
+
+  if (timestamp.endsWith('Z') || /[+-]\d{2}:\d{2}$/.test(timestamp)) {
+    return timestamp;
+  }
+
+  const isoString = timestamp.replace(' ', 'T');
+  return isoString.includes('.') ? `${isoString}Z` : `${isoString}.000Z`;
 }
 
 /**

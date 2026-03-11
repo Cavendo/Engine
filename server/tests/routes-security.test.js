@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect } from '@jest/globals';
-import { sanitizeDestinationConfig, formatDeliveryLog, safeJsonParse, sanitizeUrl } from '../utils/routeHelpers.js';
+import { sanitizeDestinationConfig, formatDeliveryLog, safeJsonParse, sanitizeUrl, toISOTimestamp } from '../utils/routeHelpers.js';
 
 // Mock data simulating what formatRoute and formatDeliveryLog receive
 const mockWebhookConfig = {
@@ -277,6 +277,17 @@ describe('Route Security - Non-Admin Data Redaction', () => {
       const result = formatDeliveryLog(logWithoutDeliverable, false);
 
       expect(result.event_payload.deliverable).toBeUndefined();
+    });
+  });
+
+  describe('toISOTimestamp', () => {
+    it('converts MySQL Date objects to ISO strings', () => {
+      expect(toISOTimestamp(new Date('2026-03-11T17:44:47.000Z'))).toBe('2026-03-11T17:44:47.000Z');
+    });
+
+    it('converts SQLite timestamp strings to ISO strings', () => {
+      expect(toISOTimestamp('2026-03-11 17:44:47')).toBe('2026-03-11T17:44:47.000Z');
+      expect(toISOTimestamp('2026-03-11 17:44:47.123')).toBe('2026-03-11T17:44:47.123Z');
     });
   });
 

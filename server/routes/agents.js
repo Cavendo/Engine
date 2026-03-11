@@ -16,6 +16,7 @@ import {
   updateAgentExecutionSchema
 } from '../utils/validation.js';
 import { validateProviderBaseUrl, resolveBaseUrl } from '../utils/providerEndpoint.js';
+import { toISOTimestamp as formatTimestamp } from '../utils/routeHelpers.js';
 
 const router = Router();
 
@@ -24,12 +25,7 @@ const router = Router();
  * SQLite returns "YYYY-MM-DD HH:MM:SS" but JS needs "YYYY-MM-DDTHH:MM:SS.000Z"
  */
 function toISOTimestamp(timestamp) {
-  if (!timestamp) return null;
-  if (timestamp.endsWith('Z') || /[+-]\d{2}:\d{2}$/.test(timestamp)) {
-    return timestamp;
-  }
-  const isoString = timestamp.replace(' ', 'T');
-  return isoString.includes('.') ? `${isoString}Z` : `${isoString}.000Z`;
+  return formatTimestamp(timestamp);
 }
 
 /**

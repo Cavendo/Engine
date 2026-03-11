@@ -10,7 +10,7 @@ import * as response from '../utils/response.js';
 import { validateBody, validateParams, validateQuery, idParamSchema, TRIGGER_EVENTS, validateEndpoint, validateEndpointWithDns } from '../utils/validation.js';
 import { z } from 'zod';
 import { dispatchRoute, testRoute } from '../services/routeDispatcher.js';
-import { safeJsonParse, sanitizeDestinationConfig, formatDeliveryLog } from '../utils/routeHelpers.js';
+import { safeJsonParse, sanitizeDestinationConfig, formatDeliveryLog, toISOTimestamp as formatTimestamp } from '../utils/routeHelpers.js';
 
 const router = express.Router();
 
@@ -18,11 +18,7 @@ const router = express.Router();
  * Normalize SQLite timestamps to ISO 8601 format
  */
 function toISOTimestamp(timestamp) {
-  if (!timestamp) return null;
-  // Already ISO format
-  if (timestamp.includes('T')) return timestamp;
-  // SQLite format: "2026-02-16 18:04:51" → "2026-02-16T18:04:51.000Z"
-  return timestamp.replace(' ', 'T') + '.000Z';
+  return formatTimestamp(timestamp);
 }
 
 // ============================================
