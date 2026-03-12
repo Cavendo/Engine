@@ -946,7 +946,7 @@ router.delete('/bulk', userAuth, requireRoles('admin'), validateBody(bulkDeleteT
 router.get('/:id', dualAuth, async (req, res) => {
   try {
     // Authorization check
-    const access = canAccessTask(req, req.params.id);
+    const access = await canAccessTask(req, req.params.id);
     if (!access.allowed) {
       return access.reason === 'not_found'
         ? response.notFound(res, 'Task')
@@ -1802,7 +1802,7 @@ router.post('/:id/claim', agentAuth, logAgentActivity('task.claimed', (req, data
 router.get('/:id/activity', dualAuth, async (req, res) => {
   try {
     // Authorization check
-    const access = canAccessTask(req, req.params.id);
+    const access = await canAccessTask(req, req.params.id);
     if (!access.allowed) {
       return access.reason === 'not_found'
         ? response.notFound(res, 'Task')

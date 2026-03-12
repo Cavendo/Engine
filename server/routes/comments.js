@@ -94,7 +94,7 @@ router.get('/tasks/:id/comments', dualAuth, async (req, res) => {
     const taskId = parseInt(req.params.id);
 
     // Authorization check
-    const access = canAccessTask(req, taskId);
+    const access = await canAccessTask(req, taskId);
     if (!access.allowed) {
       return access.reason === 'not_found'
         ? response.notFound(res, 'Task')
@@ -213,7 +213,7 @@ router.get('/deliverables/:id/comments', dualAuth, async (req, res) => {
     const deliverableId = parseInt(req.params.id);
 
     // Authorization check
-    const access = canAccessDeliverable(req, deliverableId);
+    const access = await canAccessDeliverable(req, deliverableId);
     if (!access.allowed) {
       return access.reason === 'not_found'
         ? response.notFound(res, 'Deliverable')
