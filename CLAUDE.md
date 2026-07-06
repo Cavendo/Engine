@@ -80,7 +80,7 @@ server/
 │   └── userAuth.js       # Session validation
 ├── services/
 │   ├── webhooks.js       # Webhook delivery
-│   ├── agentExecutor.js  # AI provider execution (Anthropic/OpenAI/OpenAI-compatible)
+│   ├── agentExecutor.js  # AI provider execution, direct prompts, optional token streaming
 │   ├── taskDispatcher.js # Background auto-execution polling service
 │   ├── taskRouter.js     # Task routing rule evaluation + agent matching
 │   ├── activityLogger.js # Universal activity log (fire-and-forget)
@@ -91,6 +91,7 @@ server/
     ├── validation.js     # Zod schemas for routing rules
     ├── response.js       # API response helpers + route formatting
     ├── networkUtils.js   # Shared IP classification (private/local detection)
+    ├── sse.js            # Server-sent events parser for provider token streams
     └── providerEndpoint.js # Provider base URL validation + security
 ```
 
@@ -216,11 +217,12 @@ execution_mode         -- 'manual', 'auto', 'polling', 'human'
 - `server/middleware/agentAuth.js` - Agent + user key authentication
 - `server/routes/users.js` - User CRUD + API keys (creating a user auto-creates a linked human agent)
 - `server/routes/agents.js` - Agent CRUD + execution endpoints
-- `server/services/agentExecutor.js` - AI provider execution
+- `server/services/agentExecutor.js` - AI provider execution, direct prompts, optional token streaming
 - `server/utils/crypto.js` - Encryption utilities
 - `server/services/taskDispatcher.js` - Background auto-execution service (polling, capacity, retry)
 - `server/utils/providerEndpoint.js` - Provider base URL validation + endpoint security
 - `server/utils/networkUtils.js` - Shared IP/hostname classification
+- `server/utils/sse.js` - Shared SSE parser for streamed provider responses
 - `server/services/webhooks.js` - Webhook delivery with retry
 - `server/services/activityLogger.js` - Universal activity logging
 - `server/services/routeDispatcher.js` - Delivery route dispatch + logging

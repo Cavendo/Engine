@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `POST /api/internal/provisioning/projects/ensure` upserts projects by `externalKey`
   - `POST /api/internal/provisioning/projects/:externalKey/routing-rules/ensure` replaces task routing config
   - `projects.external_key` added with cross-dialect uniqueness for automation-safe identity
+- Agent executor direct prompts with optional provider-native token streaming
+  - Added `executeDirectAgentPrompt(agent, options)` for one-off prompt execution without DB writes or deliverables
+  - Added `onDelta(text)` streaming support for Anthropic, OpenAI/OpenAI-compatible, and Google Gemini providers
+  - Added a shared SSE parser for streamed provider responses
 
 ## [0.1.1] - 2026-02-20
 

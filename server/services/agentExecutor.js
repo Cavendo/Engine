@@ -9,6 +9,7 @@ import db from '../db/adapter.js';
 import { decrypt } from '../utils/crypto.js';
 import { dispatchEvent } from './routeDispatcher.js';
 import { resolveBaseUrl } from '../utils/providerEndpoint.js';
+import { parseSSEStream } from '../utils/sse.js';
 import { detectDeliverableContentType } from '../utils/detectDeliverableContentType.js';
 import { parseAgentDeliverableEnvelope } from '../utils/agentDeliverableEnvelope.js';
 import {
@@ -31,6 +32,180 @@ function parseTags(raw) {
     return raw.split(',').map(s => s.trim()).filter(Boolean);
   }
   return [];
+}
+
+function createExecutionError(message, category = 'unknown', retryable = false, status = null) {
+  const err = new Error(message);
+  err.category = category;
+  err.retryable = retryable;
+  if (status !== null && status !== undefined) err.status = status;
+  return err;
+}
+
+function ensureSupportedProvider(provider) {
+  if (!['anthropic', 'google', 'openai', 'openai_compatible'].includes(provider)) {
+    throw createExecutionError(`Unsupported provider: ${provider}`, 'config_error', false);
+  }
+}
+
+function resolveProviderApiKey(agent) {
+  if (agent.provider_api_key_encrypted) {
+    let apiKey = null;
+    try {
+      apiKey = decrypt(agent.provider_api_key_encrypted, agent.provider_api_key_iv, agent.encryption_key_version);
+    } catch {
+      apiKey = null;
+    }
+
+    if (apiKey) return apiKey;
+
+    if (agent.provider === 'openai_compatible') {
+      // For openai_compatible, API key is optional — continue without it
+      console.warn('[AgentExecutor] Could not decrypt API key for openai_compatible agent, proceeding without key');
+      return null;
+    }
+
+    throw createExecutionError(
+      'Failed to decrypt provider API key — check ENCRYPTION_KEY and re-save the key in agent settings',
+      'config_error',
+      true
+    );
+  }
+
+  if (agent.provider !== 'openai_compatible') {
+    throw createExecutionError('Provider API key not configured', 'config_error', true);
+  }
+
+  return null;
+}
+
+function getDefaultProviderModel(provider) {
+  if (provider === 'anthropic') return 'claude-sonnet-4-5-20250929';
+  if (provider === 'google') return 'gemini-2.5-pro';
+  return 'gpt-4o';
+}
+
+async function executeProviderPrompt(agent, apiKey, systemPrompt, userPrompt, maxTokens, options = {}) {
+  ensureSupportedProvider(agent.provider);
+
+  if (agent.provider === 'anthropic') {
+    return await executeAnthropic(apiKey, agent.provider_model, systemPrompt, userPrompt, maxTokens, agent.temperature, options);
+  }
+  if (agent.provider === 'google') {
+    return await executeGoogle(apiKey, agent.provider_model, systemPrompt, userPrompt, maxTokens, agent.temperature, options);
+  }
+
+  const baseUrl = resolveBaseUrl(agent);
+  return await executeOpenAI(apiKey, agent.provider_model, systemPrompt, userPrompt, maxTokens, agent.temperature, baseUrl, options);
+}
+
+function stringifyDirectContext(context) {
+  if (context === null || context === undefined) return null;
+
+  if (typeof context === 'string') {
+    try {
+      JSON.parse(context);
+      return context;
+    } catch {
+      return JSON.stringify({ context });
+    }
+  }
+
+  return JSON.stringify(context);
+}
+
+function createDirectPromptTask(options) {
+  return {
+    id: 0,
+    title: options.title || 'Direct prompt',
+    description: options.description || '',
+    project_id: options.projectId ?? options.project_id ?? null,
+    context: stringifyDirectContext(options.context)
+  };
+}
+
+function safeCallDelta(options, text) {
+  if (!text || typeof options.onDelta !== 'function') return;
+  try {
+    options.onDelta(text);
+  } catch (err) {
+    console.warn('[AgentExecutor] onDelta callback failed:', err?.message || err);
+  }
+}
+
+function hasDeltaCallback(options) {
+  return typeof options?.onDelta === 'function';
+}
+
+function parseStreamJson(data, provider) {
+  try {
+    return JSON.parse(data);
+  } catch {
+    throw createExecutionError(`[${provider}] malformed stream JSON`, 'unknown', true);
+  }
+}
+
+function createUnexpectedStreamEndError(provider) {
+  return createExecutionError(`[${provider}] stream ended unexpectedly`, 'unknown', true);
+}
+
+function isAbortError(error) {
+  return error?.name === 'AbortError' || error?.code === 'ABORT_ERR';
+}
+
+function createStreamingAbortController(options = {}) {
+  const controller = new AbortController();
+  let abortReason = null;
+  let timeout = null;
+
+  const resetIdleTimeout = () => {
+    if (timeout) clearTimeout(timeout);
+    timeout = setTimeout(() => {
+      if (!controller.signal.aborted) {
+        abortReason = 'timeout';
+        controller.abort();
+      }
+    }, EXECUTION_TIMEOUT_MS);
+  };
+
+  resetIdleTimeout();
+
+  const externalSignal = options.signal;
+  let externalAbortHandler = null;
+  if (externalSignal) {
+    externalAbortHandler = () => {
+      if (!controller.signal.aborted) {
+        abortReason = 'cancelled';
+        controller.abort();
+      }
+    };
+
+    if (externalSignal.aborted) {
+      externalAbortHandler();
+    } else {
+      externalSignal.addEventListener('abort', externalAbortHandler, { once: true });
+    }
+  }
+
+  return {
+    signal: controller.signal,
+    resetIdleTimeout,
+    getAbortReason: () => abortReason,
+    cleanup: () => {
+      if (timeout) clearTimeout(timeout);
+      if (externalSignal && externalAbortHandler) {
+        externalSignal.removeEventListener('abort', externalAbortHandler);
+      }
+    }
+  };
+}
+
+function normalizeStreamingAbort(error, provider, abortReason) {
+  if (!isAbortError(error)) return error;
+  if (abortReason === 'cancelled') {
+    return createExecutionError(`[${provider}] stream cancelled`, 'cancelled', false);
+  }
+  return createExecutionError(`[${provider}] stream timed out`, 'timeout', true);
 }
 
 /**
@@ -94,54 +269,26 @@ async function gatherTaskContext(task) {
  * @returns {Promise<Object>} Execution result
  */
 export async function executeTask(agent, task) {
-  // Decrypt API key (optional for openai_compatible)
-  let apiKey = null;
-  if (agent.provider_api_key_encrypted) {
-    try {
-      apiKey = decrypt(agent.provider_api_key_encrypted, agent.provider_api_key_iv, agent.encryption_key_version);
-    } catch (decryptErr) {
-      if (agent.provider !== 'openai_compatible') {
-        const err = new Error('Failed to decrypt provider API key — check ENCRYPTION_KEY and re-save the key in agent settings');
-        err.category = 'config_error';
-        err.retryable = true;
-        throw err;
-      }
-      // For openai_compatible, API key is optional — continue without it
-      console.warn('[AgentExecutor] Could not decrypt API key for openai_compatible agent, proceeding without key');
-    }
-  } else if (agent.provider !== 'openai_compatible') {
-    const err = new Error('Provider API key not configured');
-    err.category = 'config_error';
-    err.retryable = true;
-    throw err;
-  }
-
-  // Update task status to in_progress
-  await db.exec(`
-    UPDATE tasks
-    SET status = 'in_progress', started_at = datetime('now'), updated_at = datetime('now')
-    WHERE id = ?
-  `, [task.id]);
-
-  // Gather full context — same data MCP agents get via cavendo_get_task_context
-  const context = await gatherTaskContext(task);
-
-  // Build the prompt with full context
-  const systemPrompt = agent.system_prompt || getDefaultSystemPrompt(agent);
-  const userPrompt = buildTaskPrompt(task, context);
-
   let result;
   try {
-    if (agent.provider === 'anthropic') {
-      result = await executeAnthropic(apiKey, agent.provider_model, systemPrompt, userPrompt, agent.max_tokens, agent.temperature);
-    } else if (agent.provider === 'google') {
-      result = await executeGoogle(apiKey, agent.provider_model, systemPrompt, userPrompt, agent.max_tokens, agent.temperature);
-    } else if (agent.provider === 'openai' || agent.provider === 'openai_compatible') {
-      const baseUrl = resolveBaseUrl(agent);
-      result = await executeOpenAI(apiKey, agent.provider_model, systemPrompt, userPrompt, agent.max_tokens, agent.temperature, baseUrl);
-    } else {
-      throw new Error(`Unsupported provider: ${agent.provider}`);
-    }
+    ensureSupportedProvider(agent.provider);
+    const apiKey = resolveProviderApiKey(agent);
+
+    // Update task status to in_progress
+    await db.exec(`
+      UPDATE tasks
+      SET status = 'in_progress', started_at = datetime('now'), updated_at = datetime('now')
+      WHERE id = ?
+    `, [task.id]);
+
+    // Gather full context — same data MCP agents get via cavendo_get_task_context
+    const context = await gatherTaskContext(task);
+
+    // Build the prompt with full context
+    const systemPrompt = agent.system_prompt || getDefaultSystemPrompt(agent);
+    const userPrompt = buildTaskPrompt(task, context);
+
+    result = await executeProviderPrompt(agent, apiKey, systemPrompt, userPrompt, agent.max_tokens);
 
     // Parse envelope or detect content type
     const envelope = parseAgentDeliverableEnvelope(result.content);
@@ -207,6 +354,50 @@ export async function executeTask(agent, task) {
       success: false,
       error: error.message,
       category: error.category || null
+    };
+  }
+}
+
+/**
+ * Execute a one-off prompt through an agent's configured provider.
+ *
+ * `options.onDelta`, when provided, is called synchronously for each text
+ * fragment and is not awaited. Callers must not rely on it for backpressure.
+ * Callback errors are logged and ignored so generation can continue.
+ *
+ * @param {Object} agent - Agent record from database
+ * @param {Object} options - {title, description, projectId, context, maxTokens|max_tokens, onDelta, signal}
+ * @returns {Promise<Object>} Direct prompt execution result
+ */
+export async function executeDirectAgentPrompt(agent, options = {}) {
+  try {
+    ensureSupportedProvider(agent.provider);
+    const apiKey = resolveProviderApiKey(agent);
+    const task = createDirectPromptTask(options);
+    const context = await gatherTaskContext(task);
+    const systemPrompt = agent.system_prompt || getDefaultSystemPrompt(agent);
+    const userPrompt = buildTaskPrompt(task, context);
+    const maxTokens = options.maxTokens ?? options.max_tokens ?? agent.max_tokens ?? 4096;
+
+    const result = await executeProviderPrompt(agent, apiKey, systemPrompt, userPrompt, maxTokens, {
+      onDelta: options.onDelta,
+      signal: options.signal
+    });
+
+    return {
+      success: true,
+      content: result.content,
+      usage: result.usage,
+      provider: agent.provider,
+      model: agent.provider_model || getDefaultProviderModel(agent.provider)
+    };
+  } catch (error) {
+    console.error('[AgentExecutor] Direct prompt failed:', error);
+    return {
+      success: false,
+      error: error.message,
+      category: error.category || null,
+      retryable: Boolean(error.retryable)
     };
   }
 }
@@ -318,7 +509,11 @@ function classifyApiError(status, errorBody, provider) {
 /**
  * Execute using Anthropic API
  */
-async function executeAnthropic(apiKey, model, systemPrompt, userPrompt, maxTokens, temperature) {
+async function executeAnthropic(apiKey, model, systemPrompt, userPrompt, maxTokens, temperature, options = {}) {
+  if (hasDeltaCallback(options)) {
+    return await executeAnthropicStream(apiKey, model, systemPrompt, userPrompt, maxTokens, temperature, options);
+  }
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), EXECUTION_TIMEOUT_MS);
   try {
@@ -358,11 +553,102 @@ async function executeAnthropic(apiKey, model, systemPrompt, userPrompt, maxToke
   }
 }
 
+async function executeAnthropicStream(apiKey, model, systemPrompt, userPrompt, maxTokens, temperature, options) {
+  const stream = createStreamingAbortController(options);
+
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      signal: stream.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: model || 'claude-sonnet-4-5-20250929',
+        max_tokens: maxTokens || 4096,
+        temperature: temperature ?? 0.7,
+        system: systemPrompt,
+        messages: [{ role: 'user', content: userPrompt }],
+        stream: true
+      })
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw classifyApiError(response.status, error, 'anthropic');
+    }
+
+    let content = '';
+    let sawStop = false;
+    const usage = { inputTokens: undefined, outputTokens: undefined };
+
+    for await (const event of parseSSEStream(response.body, { onChunk: stream.resetIdleTimeout })) {
+      if (!event.data.trim()) continue;
+      const data = parseStreamJson(event.data, 'anthropic');
+      const eventType = event.event || data.type;
+
+      if (eventType === 'error' || data.type === 'error') {
+        throw classifyApiError(0, data, 'anthropic');
+      }
+
+      if (eventType === 'message_start' || data.type === 'message_start') {
+        if (data.message?.usage?.input_tokens !== undefined) {
+          usage.inputTokens = data.message.usage.input_tokens;
+        }
+        if (data.message?.usage?.output_tokens !== undefined) {
+          usage.outputTokens = data.message.usage.output_tokens;
+        }
+        continue;
+      }
+
+      if (eventType === 'content_block_delta' || data.type === 'content_block_delta') {
+        if (data.delta?.type === 'text_delta') {
+          const text = data.delta.text || '';
+          content += text;
+          safeCallDelta(options, text);
+        }
+        continue;
+      }
+
+      if (eventType === 'message_delta' || data.type === 'message_delta') {
+        if (data.usage?.output_tokens !== undefined) {
+          usage.outputTokens = data.usage.output_tokens;
+        }
+        if (data.usage?.input_tokens !== undefined) {
+          usage.inputTokens = data.usage.input_tokens;
+        }
+        continue;
+      }
+
+      if (eventType === 'message_stop' || data.type === 'message_stop') {
+        sawStop = true;
+        break;
+      }
+    }
+
+    if (!sawStop) {
+      throw createUnexpectedStreamEndError('anthropic');
+    }
+
+    return { content, usage };
+  } catch (error) {
+    throw normalizeStreamingAbort(error, 'anthropic', stream.getAbortReason());
+  } finally {
+    stream.cleanup();
+  }
+}
+
 /**
  * Execute using OpenAI API
  */
-async function executeOpenAI(apiKey, model, systemPrompt, userPrompt, maxTokens, temperature, baseUrl) {
-  const base = baseUrl || 'https://api.openai.com';
+async function executeOpenAI(apiKey, model, systemPrompt, userPrompt, maxTokens, temperature, baseUrl, options = {}) {
+  if (hasDeltaCallback(options)) {
+    return await executeOpenAIStream(apiKey, model, systemPrompt, userPrompt, maxTokens, temperature, baseUrl, options);
+  }
+
+  const base = (baseUrl || 'https://api.openai.com').replace(/\/+$/, '');
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), EXECUTION_TIMEOUT_MS);
   try {
@@ -403,10 +689,90 @@ async function executeOpenAI(apiKey, model, systemPrompt, userPrompt, maxTokens,
   }
 }
 
+async function executeOpenAIStream(apiKey, model, systemPrompt, userPrompt, maxTokens, temperature, baseUrl, options) {
+  const base = (baseUrl || 'https://api.openai.com').replace(/\/+$/, '');
+  const stream = createStreamingAbortController(options);
+
+  try {
+    const headers = { 'Content-Type': 'application/json' };
+    if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+    const body = {
+      model: model || 'gpt-4o',
+      max_tokens: maxTokens || 4096,
+      temperature: temperature ?? 0.7,
+      stream: true,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ]
+    };
+
+    if (base === 'https://api.openai.com') {
+      body.stream_options = { include_usage: true };
+    }
+
+    const response = await fetch(`${base}/v1/chat/completions`, {
+      method: 'POST',
+      signal: stream.signal,
+      headers,
+      body: JSON.stringify(body)
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw classifyApiError(response.status, error, 'openai');
+    }
+
+    let content = '';
+    let sawDone = false;
+    const usage = { inputTokens: undefined, outputTokens: undefined };
+
+    for await (const event of parseSSEStream(response.body, { onChunk: stream.resetIdleTimeout })) {
+      const raw = event.data.trim();
+      if (!raw) continue;
+      if (raw === '[DONE]') {
+        sawDone = true;
+        break;
+      }
+
+      const data = parseStreamJson(raw, 'openai');
+      if (data.error) {
+        throw classifyApiError(0, data, 'openai');
+      }
+
+      if (data.usage) {
+        usage.inputTokens = data.usage.prompt_tokens;
+        usage.outputTokens = data.usage.completion_tokens;
+      }
+
+      const text = data.choices?.[0]?.delta?.content;
+      if (typeof text === 'string' && text.length > 0) {
+        content += text;
+        safeCallDelta(options, text);
+      }
+    }
+
+    if (!sawDone) {
+      throw createUnexpectedStreamEndError('openai');
+    }
+
+    return { content, usage };
+  } catch (error) {
+    throw normalizeStreamingAbort(error, 'openai', stream.getAbortReason());
+  } finally {
+    stream.cleanup();
+  }
+}
+
 /**
  * Execute using Google Gemini API
  */
-async function executeGoogle(apiKey, model, systemPrompt, userPrompt, maxTokens, temperature) {
+async function executeGoogle(apiKey, model, systemPrompt, userPrompt, maxTokens, temperature, options = {}) {
+  if (hasDeltaCallback(options)) {
+    return await executeGoogleStream(apiKey, model, systemPrompt, userPrompt, maxTokens, temperature, options);
+  }
+
   const modelId = model || 'gemini-2.5-pro';
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), EXECUTION_TIMEOUT_MS);
@@ -450,6 +816,75 @@ async function executeGoogle(apiKey, model, systemPrompt, userPrompt, maxTokens,
     };
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+async function executeGoogleStream(apiKey, model, systemPrompt, userPrompt, maxTokens, temperature, options) {
+  const modelId = model || 'gemini-2.5-pro';
+  const stream = createStreamingAbortController(options);
+
+  try {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelId)}:streamGenerateContent?alt=sse&key=${encodeURIComponent(apiKey)}`, {
+      method: 'POST',
+      signal: stream.signal,
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        contents: [
+          {
+            role: 'user',
+            parts: [{ text: `${systemPrompt}\n\n${userPrompt}` }]
+          }
+        ],
+        generationConfig: {
+          maxOutputTokens: maxTokens || 4096,
+          temperature: temperature ?? 0.7
+        }
+      })
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw classifyApiError(response.status, error, 'google');
+    }
+
+    let content = '';
+    let usageMetadata = null;
+
+    for await (const event of parseSSEStream(response.body, { onChunk: stream.resetIdleTimeout })) {
+      const raw = event.data.trim();
+      if (!raw) continue;
+      const data = parseStreamJson(raw, 'google');
+
+      if (data.error) {
+        throw classifyApiError(data.error.code || 0, data, 'google');
+      }
+
+      const text = data?.candidates?.[0]?.content?.parts
+        ?.map(p => p?.text || '')
+        .join('') || '';
+      if (text) {
+        content += text;
+        safeCallDelta(options, text);
+      }
+
+      if (data.usageMetadata) {
+        usageMetadata = data.usageMetadata;
+      }
+    }
+
+    return {
+      content,
+      usage: {
+        inputTokens: usageMetadata?.promptTokenCount,
+        outputTokens: usageMetadata?.candidatesTokenCount
+      }
+    };
+  } catch (error) {
+    throw normalizeStreamingAbort(error, 'google', stream.getAbortReason());
+  } finally {
+    stream.cleanup();
   }
 }
 

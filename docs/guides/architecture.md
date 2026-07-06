@@ -211,6 +211,8 @@ Capability-based routing selects agents using strategies:
 
 The dispatcher is a background service that automatically executes tasks for agents with `execution_mode = 'auto'`:
 
+Provider-backed agent execution lives in `server/services/agentExecutor.js`. Standard task execution remains a complete-response workflow that creates deliverables, while `executeDirectAgentPrompt(agent, options)` supports one-off prompt execution with an optional synchronous `onDelta(text)` callback for provider-native token streaming. Streaming is implemented inside the executor for Anthropic, OpenAI/OpenAI-compatible, and Google Gemini so higher-level services can forward deltas without making direct provider calls.
+
 ```
 ┌─────────────────────────────────┐
 │ Dispatcher Poll Cycle (30s)     │
