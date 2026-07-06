@@ -77,6 +77,7 @@ let sessionId;
 let adminUserId;
 let userApiKey;
 let agentApiKey;
+let workerAgentId;
 let app;
 
 function authed(req) {
@@ -117,10 +118,11 @@ beforeAll(async () => {
     INSERT INTO agents (name, type, status)
     VALUES ('Worker Test Agent', 'supervised', 'active')
   `, []);
+  workerAgentId = agentResult.lastInsertRowid;
   await db.exec(`
     INSERT INTO agent_keys (agent_id, key_hash, key_prefix, name)
     VALUES (?, ?, ?, ?)
-  `, [agentResult.lastInsertRowid, hashApiKey(agentApiKey), agentApiKey.slice(0, 12), 'Worker key']);
+  `, [workerAgentId, hashApiKey(agentApiKey), agentApiKey.slice(0, 12), 'Worker key']);
 
   app = buildApp();
 });
@@ -373,6 +375,55 @@ describe('GET /api/agents — user-key auth', () => {
     const res = await supertest(app)
       .get('/api/agents')
       .set('Authorization', `Bearer ${agentApiKey}`);
+
+    expect(res.status).toBe(403);
+  });
+});
+
+describe('agent detail scoping', () => {
+  it('allows an agent API key to read its own agent detail', async () => {
+    const res = await supertest(app)
+      .get(`/api/agents/${workerAgentId}`)
+      .set('Authorization', `Bearer ${agentApiKey}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.data.id).toBe(workerAgentId);
+  });
+
+  it('forbids an agent API key from reading another agent detail', async () => {
+    const other = await db.insert(`
+      INSERT INTO agents (name, type, status)
+      VALUES ('Other Worker Agent', 'supervised', 'active')
+    `, []);
+
+    const res = await supertest(app)
+      .get(`/api/agents/${other.lastInsertRowid}`)
+      .set('Authorization', `Bearer ${agentApiKey}`);
+
+    expect(res.status).toBe(403);
+  });
+
+  it('allows admin user API keys on role-gated agent routes', async () => {
+    const res = await supertest(app)
+      .post('/api/agents')
+      .set('Authorization', `Bearer ${userApiKey}`)
+      .send({
+        name: 'User Key Created Agent',
+        type: 'supervised',
+      });
+
+    expect(res.status).toBe(201);
+    expect(res.body.data.name).toBe('User Key Created Agent');
+  });
+
+  it('forbids regular agent API keys on role-gated agent routes', async () => {
+    const res = await supertest(app)
+      .post('/api/agents')
+      .set('Authorization', `Bearer ${agentApiKey}`)
+      .send({
+        name: 'Agent Key Created Agent',
+        type: 'supervised',
+      });
 
     expect(res.status).toBe(403);
   });

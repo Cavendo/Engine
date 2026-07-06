@@ -1,6 +1,7 @@
 import db from '../db/adapter.js';
 import * as response from '../utils/response.js';
 import { hashSessionToken } from '../utils/crypto.js';
+import { authenticatedApiLimiter } from './security.js';
 
 async function resolveUserSession(req) {
   const sessionToken = String(req.cookies?.session || '');
@@ -109,7 +110,7 @@ export async function userAuth(req, res, next) {
   };
   req.session = { id: result.sessionId };
 
-  next();
+  return authenticatedApiLimiter(req, res, next);
 }
 
 /**
@@ -123,6 +124,31 @@ export function requireRoles(...allowedRoles) {
     }
 
     if (!allowedRoles.includes(req.user.role)) {
+      return response.forbidden(res, 'Insufficient permissions');
+    }
+
+    next();
+  };
+}
+
+/**
+ * Middleware for routes that represent human privileges but may be called
+ * through either a browser session or a user API key. Regular agent keys are
+ * intentionally not mapped to roles here.
+ * @param {...string} allowedRoles - Allowed user roles
+ */
+export function requireUserOrUserKeyRoles(...allowedRoles) {
+  return (req, res, next) => {
+    const role = req.user?.role || (req.agent?.isUserKey ? req.agent.userRole : null);
+
+    if (!role) {
+      if (req.agent && !req.agent.isUserKey) {
+        return response.forbidden(res, 'User session or user API key required');
+      }
+      return response.unauthorized(res, 'Authentication required');
+    }
+
+    if (!allowedRoles.includes(role)) {
       return response.forbidden(res, 'Insufficient permissions');
     }
 

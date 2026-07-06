@@ -2,7 +2,7 @@ import { Router } from 'express';
 import db from '../db/adapter.js';
 import { generateApiKey, generateWebhookSecret, encrypt, decrypt } from '../utils/crypto.js';
 import * as response from '../utils/response.js';
-import { requireRoles } from '../middleware/userAuth.js';
+import { requireUserOrUserKeyRoles } from '../middleware/userAuth.js';
 import { agentAuth, dualAuth } from '../middleware/agentAuth.js';
 import { keyGenLimiter } from '../middleware/security.js';
 import { dispatchEvent } from '../services/routeDispatcher.js';
@@ -27,12 +27,23 @@ import {
 
 const router = Router();
 
-async function resolvePublicScope() {
-  return null;
-}
+async function requireScopedAgent(req, res, agentId) {
+  const requestedAgentId = Number.parseInt(agentId, 10);
+  if (!Number.isInteger(requestedAgentId) || requestedAgentId <= 0) {
+    response.validationError(res, 'Invalid agent ID');
+    return null;
+  }
 
-async function requireScopedAgent() {
-  return { scope: null, scoped: false };
+  if (req.user || req.agent?.isUserKey) {
+    return { scoped: false, agentId: requestedAgentId };
+  }
+
+  if (req.agent?.id && Number(req.agent.id) === requestedAgentId) {
+    return { scoped: true, agentId: requestedAgentId };
+  }
+
+  response.forbidden(res, 'Access denied');
+  return null;
 }
 
 /**
@@ -722,6 +733,7 @@ router.post('/me/tasks/:taskId/claim', agentAuth, validateBody(claimTaskLeaseSch
     }
     const claimantId = buildTaskClaimantId(runtime.authActor);
     const now = new Date();
+    const nowIso = now.toISOString();
     const leaseSeconds = getAgentLeaseSeconds(agent, req.body?.leaseSeconds);
     const expiresAt = new Date(now.getTime() + (leaseSeconds * 1000)).toISOString();
     const currentClaimant = String(task.agent_claimed_by || '').trim();
@@ -749,7 +761,15 @@ router.post('/me/tasks/:taskId/claim', agentAuth, validateBody(claimTaskLeaseSch
       nextContext.externalExecution.externalRunId = req.body.externalRunId;
     }
 
-    await db.exec(`
+    const allowedClaimants = [claimantId];
+    const claimantPrefixPatterns = [];
+    if (runtime.authActor?.isUserKey) {
+      allowedClaimants.push(`agent:${agent.id}`);
+      claimantPrefixPatterns.push(`agent:${agent.id}:%`);
+    }
+    const claimantPlaceholders = allowedClaimants.map(() => '?').join(', ');
+    const claimantPrefixSql = claimantPrefixPatterns.map(() => 'OR agent_claimed_by LIKE ?').join('\n          ');
+    const claimResult = await db.exec(`
       UPDATE tasks
       SET agent_claimed_by = ?,
           agent_claimed_at = ?,
@@ -760,15 +780,38 @@ router.post('/me/tasks/:taskId/claim', agentAuth, validateBody(claimTaskLeaseSch
           context = ?,
           updated_at = datetime('now')
       WHERE id = ?
+        AND assigned_agent_id = ?
+        AND (
+          agent_claimed_by IS NULL
+          OR TRIM(agent_claimed_by) = ''
+          OR agent_claim_expires_at IS NULL
+          OR agent_claim_expires_at <= ?
+          OR agent_claimed_by IN (${claimantPlaceholders})
+          ${claimantPrefixSql}
+        )
     `, [
       claimantId,
-      now.toISOString(),
+      nowIso,
       expiresAt,
-      now.toISOString(),
+      nowIso,
       req.body?.externalRunId || null,
       JSON.stringify(nextContext),
-      taskId
+      taskId,
+      agent.id,
+      nowIso,
+      ...allowedClaimants,
+      ...claimantPrefixPatterns
     ]);
+
+    if (claimResult.changes === 0) {
+      return res.status(409).json({
+        success: false,
+        error: {
+          code: 'TASK_ALREADY_CLAIMED',
+          message: 'Task is already claimed by another worker.'
+        }
+      });
+    }
 
     await updateExternalAgentMetadata(agent.id, (external) => {
       external.status = 'connected';
@@ -1142,7 +1185,7 @@ router.get('/', dualAuth, async (req, res) => {
  * POST /api/agents
  * Register a new agent
  */
-router.post('/', dualAuth, requireRoles('admin'), validateBody(createAgentSchema), async (req, res) => {
+router.post('/', dualAuth, requireUserOrUserKeyRoles('admin'), validateBody(createAgentSchema), async (req, res) => {
   try {
     const {
       name, type, description, capabilities, specializations, metadata, maxConcurrentTasks,
@@ -1509,7 +1552,7 @@ router.get('/:id/metrics', dualAuth, async (req, res) => {
  * PATCH /api/agents/:id
  * Update agent
  */
-router.patch('/:id', dualAuth, requireRoles('admin'), validateBody(updateAgentSchema), async (req, res) => {
+router.patch('/:id', dualAuth, requireUserOrUserKeyRoles('admin'), validateBody(updateAgentSchema), async (req, res) => {
   try {
     const scoped = await requireScopedAgent(req, res, req.params.id);
     if (scoped === null) return;
@@ -1623,7 +1666,7 @@ router.patch('/:id', dualAuth, requireRoles('admin'), validateBody(updateAgentSc
  * DELETE /api/agents/:id
  * Delete agent
  */
-router.delete('/:id', dualAuth, requireRoles('admin'), async (req, res) => {
+router.delete('/:id', dualAuth, requireUserOrUserKeyRoles('admin'), async (req, res) => {
   try {
     const scoped = await requireScopedAgent(req, res, req.params.id);
     if (scoped === null) return;
@@ -1658,7 +1701,7 @@ router.delete('/:id', dualAuth, requireRoles('admin'), async (req, res) => {
  * POST /api/agents/:id/keys
  * Generate a new API key for an agent
  */
-router.post('/:id/keys', dualAuth, requireRoles('admin'), keyGenLimiter, validateBody(generateKeySchema), async (req, res) => {
+router.post('/:id/keys', dualAuth, requireUserOrUserKeyRoles('admin'), keyGenLimiter, validateBody(generateKeySchema), async (req, res) => {
   try {
     const scoped = await requireScopedAgent(req, res, req.params.id);
     if (scoped === null) return;
@@ -1702,7 +1745,7 @@ router.post('/:id/keys', dualAuth, requireRoles('admin'), keyGenLimiter, validat
  * DELETE /api/agents/:id/keys/:keyId
  * Revoke an API key
  */
-router.delete('/:id/keys/:keyId', dualAuth, requireRoles('admin'), async (req, res) => {
+router.delete('/:id/keys/:keyId', dualAuth, requireUserOrUserKeyRoles('admin'), async (req, res) => {
   try {
     const scoped = await requireScopedAgent(req, res, req.params.id);
     if (scoped === null) return;
@@ -1729,7 +1772,7 @@ router.delete('/:id/keys/:keyId', dualAuth, requireRoles('admin'), async (req, r
  * POST /api/agents/:id/webhook-secret
  * Generate a new webhook secret for an agent
  */
-router.post('/:id/webhook-secret', dualAuth, requireRoles('admin'), async (req, res) => {
+router.post('/:id/webhook-secret', dualAuth, requireUserOrUserKeyRoles('admin'), async (req, res) => {
   try {
     const scoped = await requireScopedAgent(req, res, req.params.id);
     if (scoped === null) return;
@@ -1763,7 +1806,7 @@ router.post('/:id/webhook-secret', dualAuth, requireRoles('admin'), async (req, 
  * PUT /api/agents/:id/owner
  * Link or unlink an agent to a user
  */
-router.put('/:id/owner', dualAuth, requireRoles('admin'), validateBody(updateAgentOwnerSchema), async (req, res) => {
+router.put('/:id/owner', dualAuth, requireUserOrUserKeyRoles('admin'), validateBody(updateAgentOwnerSchema), async (req, res) => {
   try {
     const scoped = await requireScopedAgent(req, res, req.params.id);
     if (scoped === null) return;
@@ -1797,7 +1840,7 @@ router.put('/:id/owner', dualAuth, requireRoles('admin'), validateBody(updateAge
  * POST /api/agents/:id/test-connection
  * Test provider API key connectivity
  */
-router.post('/:id/test-connection', dualAuth, requireRoles('admin'), async (req, res) => {
+router.post('/:id/test-connection', dualAuth, requireUserOrUserKeyRoles('admin'), async (req, res) => {
   try {
     const scoped = await requireScopedAgent(req, res, req.params.id);
     if (scoped === null) return;
@@ -1869,7 +1912,7 @@ router.post('/:id/test-connection', dualAuth, requireRoles('admin'), async (req,
  * POST /api/agents/:id/execute
  * Trigger task execution for an agent
  */
-router.post('/:id/execute', dualAuth, requireRoles('admin'), async (req, res) => {
+router.post('/:id/execute', dualAuth, requireUserOrUserKeyRoles('admin'), async (req, res) => {
   try {
     const scoped = await requireScopedAgent(req, res, req.params.id);
     if (scoped === null) return;
@@ -1916,7 +1959,7 @@ router.post('/:id/execute', dualAuth, requireRoles('admin'), async (req, res) =>
  * PATCH /api/agents/:id/execution
  * Update agent execution configuration
  */
-router.patch('/:id/execution', dualAuth, requireRoles('admin'), validateBody(updateAgentExecutionSchema), async (req, res) => {
+router.patch('/:id/execution', dualAuth, requireUserOrUserKeyRoles('admin'), validateBody(updateAgentExecutionSchema), async (req, res) => {
   try {
     const scoped = await requireScopedAgent(req, res, req.params.id);
     if (scoped === null) return;

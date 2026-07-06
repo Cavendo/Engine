@@ -1,4 +1,5 @@
-import { generateWebhookSignature, verifyWebhookSignature, encrypt, decrypt, canDecrypt, testEncryption, runCryptoHealthCheck, _resetKeyringCache } from '../utils/crypto.js';
+import { jest } from '@jest/globals';
+import { generateWebhookSignature, verifyWebhookSignature, encrypt, decrypt, canDecrypt, testEncryption, runCryptoHealthCheck, hashSessionToken, _resetKeyringCache } from '../utils/crypto.js';
 import { createSqliteAdapter } from '../db/sqliteAdapter.js';
 
 // Helper: set env vars and reset cache
@@ -44,6 +45,68 @@ describe('crypto webhook signature verification', () => {
     const badSignature = '0'.repeat(64);
 
     expect(verifyWebhookSignature(payload, badSignature, secret)).toBe(false);
+  });
+});
+
+describe('session token hashing', () => {
+  it('uses ENCRYPTION_KEY as a production fallback when session hash secrets are unset', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+
+    try {
+      await withEnv({
+        NODE_ENV: 'production',
+        SESSION_HASH_SECRET: undefined,
+        SESSION_SECRET: undefined,
+        JWT_SECRET: undefined,
+        ENCRYPTION_KEY: 'c'.repeat(64),
+        ENCRYPTION_KEYRING: undefined
+      }, async () => {
+        expect(() => hashSessionToken('session-token')).not.toThrow();
+        expect(hashSessionToken('session-token')).toMatch(/^[a-f0-9]{64}$/);
+      });
+
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('SESSION_HASH_SECRET'));
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('uses a stable keyring entry for session hash fallback across rotations', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const keyV1 = 'a'.repeat(64);
+    const keyV2 = 'b'.repeat(64);
+
+    try {
+      let beforeRotation;
+      await withEnv({
+        NODE_ENV: 'production',
+        SESSION_HASH_SECRET: undefined,
+        SESSION_SECRET: undefined,
+        JWT_SECRET: undefined,
+        ENCRYPTION_KEY: undefined,
+        ENCRYPTION_KEYRING: JSON.stringify({ '1': { key: keyV1, salt: 'salt-1' } }),
+        ENCRYPTION_KEY_VERSION_CURRENT: '1'
+      }, async () => {
+        beforeRotation = hashSessionToken('session-token');
+      });
+
+      await withEnv({
+        NODE_ENV: 'production',
+        SESSION_HASH_SECRET: undefined,
+        SESSION_SECRET: undefined,
+        JWT_SECRET: undefined,
+        ENCRYPTION_KEY: undefined,
+        ENCRYPTION_KEYRING: JSON.stringify({
+          '1': { key: keyV1, salt: 'salt-1' },
+          '2': { key: keyV2, salt: 'salt-2' }
+        }),
+        ENCRYPTION_KEY_VERSION_CURRENT: '2'
+      }, async () => {
+        expect(hashSessionToken('session-token')).toBe(beforeRotation);
+      });
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 });
 

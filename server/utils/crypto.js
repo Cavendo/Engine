@@ -10,11 +10,47 @@ const ENCRYPTION_ALGORITHM = 'aes-256-gcm';
 const KEY_LENGTH = 32;
 const IV_LENGTH = 16;
 const AUTH_TAG_LENGTH = 16;
-const SESSION_HASH_SECRET =
-  process.env.SESSION_HASH_SECRET ||
-  process.env.SESSION_SECRET ||
-  process.env.JWT_SECRET ||
-  (process.env.NODE_ENV === 'production' ? null : 'cavendo-dev-session-hash-secret');
+let warnedSessionHashFallback = false;
+
+function getSessionHashSecret() {
+  const explicit =
+    process.env.SESSION_HASH_SECRET ||
+    process.env.SESSION_SECRET ||
+    process.env.JWT_SECRET;
+  if (explicit) return explicit;
+
+  const encryptionFallback = getSessionHashEncryptionFallback();
+  if (encryptionFallback) {
+    if (process.env.NODE_ENV === 'production' && !warnedSessionHashFallback) {
+      console.warn('[Crypto] SESSION_HASH_SECRET/SESSION_SECRET/JWT_SECRET is not set; deriving session hash secret from encryption key material. Set SESSION_HASH_SECRET in production to separate session hashing from encryption.');
+      warnedSessionHashFallback = true;
+    }
+    return `session-hash:${encryptionFallback}`;
+  }
+
+  return process.env.NODE_ENV === 'production' ? null : 'cavendo-dev-session-hash-secret';
+}
+
+function getSessionHashEncryptionFallback() {
+  if (process.env.ENCRYPTION_KEYRING) {
+    const keyring = loadKeyring();
+    // Keep session hashes stable when new keyring versions are added.
+    // Removing this oldest entry intentionally rotates sessions unless SESSION_HASH_SECRET is set.
+    const versions = Object.keys(keyring).sort((a, b) => {
+      const aNum = Number(a);
+      const bNum = Number(b);
+      if (Number.isFinite(aNum) && Number.isFinite(bNum)) return aNum - bNum;
+      return String(a).localeCompare(String(b));
+    });
+    const stableVersion = versions[0];
+    const stableEntry = stableVersion ? keyring[stableVersion] : null;
+    if (stableEntry?.key) {
+      return `keyring:${stableVersion}:${stableEntry.key}:${stableEntry.salt || ''}`;
+    }
+  }
+
+  return process.env.ENCRYPTION_KEY || null;
+}
 
 /**
  * Generate a new API key with prefix
@@ -90,10 +126,11 @@ export function generateSessionToken() {
  * @returns {string}
  */
 export function hashSessionToken(token) {
-  if (!SESSION_HASH_SECRET) {
-    throw new Error('SESSION_HASH_SECRET (or SESSION_SECRET/JWT_SECRET) is required for session hashing');
+  const sessionHashSecret = getSessionHashSecret();
+  if (!sessionHashSecret) {
+    throw new Error('SESSION_HASH_SECRET (or SESSION_SECRET/JWT_SECRET/ENCRYPTION_KEY) is required for session hashing');
   }
-  return crypto.createHmac('sha256', SESSION_HASH_SECRET).update(String(token || ''), 'utf8').digest('hex');
+  return crypto.createHmac('sha256', sessionHashSecret).update(String(token || ''), 'utf8').digest('hex');
 }
 
 /**
@@ -295,6 +332,7 @@ export function _resetKeyringCache() {
   _keyringCache = null;
   _currentVersionCache = null;
   _derivedKeyCache = new Map();
+  warnedSessionHashFallback = false;
 }
 
 // ============================================

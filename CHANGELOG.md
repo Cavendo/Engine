@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-06
+
+### Fixed
+- Prevented SQLite table-rebuild migrations from cascading dependent task/user
+  rows during upgrades, with foreign-key integrity checks after rebuilds.
+- Restored the public Engine SQLite default and removed the production
+  `ALLOW_SQLITE` gate.
+- Restored production session hashing fallback to encryption key material when
+  dedicated session hash secrets are not configured.
+- Closed pre-auth rate-limit bypasses by keying the API limiter only by client IP.
+- Scoped regular agent API keys to their own agent, task, and deliverable
+  surfaces while preserving user API key access to human/admin routes.
+- Made external task claim leases atomic so concurrent workers cannot both
+  claim the same task.
+- Restored generic project knowledge in task context bundles and removed stale
+  Cloud-only context fields.
+- Restored dispatcher eligibility to explicit auto-execution mode plus runnable
+  provider configuration, without inferring execution from client task context.
+- Corrected transient provider error classification so 429/503/529 remain
+  retryable instead of being treated as quota exhaustion.
+- Preserved the default all-project agent access for nullish project access
+  metadata while denying malformed present values.
+- Added defensive `project_access` migrations for older databases and restored
+  terminal payment-method provider errors to quota classification.
+
 ## [0.2.0] - 2026-07-06
 
 ### Added

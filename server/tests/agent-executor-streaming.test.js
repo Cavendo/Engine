@@ -263,6 +263,65 @@ describe('executeDirectAgentPrompt streaming providers', () => {
     });
   });
 
+  test('OpenAI HTTP 429 stays retryable even when provider text mentions payment', async () => {
+    global.fetch = jest.fn(async () => jsonResponse(429, {
+      error: {
+        type: 'rate_limit_exceeded',
+        message: 'Rate limit reached. Add a payment method to increase your limit.'
+      }
+    }));
+
+    const result = await executeDirectAgentPrompt(makeAgent('openai'), {
+      title: 'Payment wording',
+      onDelta: () => {}
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      category: 'rate_limited',
+      retryable: true
+    });
+  });
+
+  test('OpenAI HTTP 429 with insufficient_quota is classified as terminal quota', async () => {
+    global.fetch = jest.fn(async () => jsonResponse(429, {
+      error: {
+        code: 'insufficient_quota',
+        message: 'You exceeded your current quota.'
+      }
+    }));
+
+    const result = await executeDirectAgentPrompt(makeAgent('openai'), {
+      title: 'Out of credits',
+      onDelta: () => {}
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      category: 'quota_exceeded',
+      retryable: false
+    });
+  });
+
+  test('OpenAI terminal payment errors without quota code are classified as quota', async () => {
+    global.fetch = jest.fn(async () => jsonResponse(402, {
+      error: {
+        message: 'Add a payment method to continue using this model.'
+      }
+    }));
+
+    const result = await executeDirectAgentPrompt(makeAgent('openai'), {
+      title: 'Payment required',
+      onDelta: () => {}
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      category: 'quota_exceeded',
+      retryable: false
+    });
+  });
+
   test('OpenAI mid-stream errors are classified', async () => {
     global.fetch = jest.fn(async () => sseResponse([
       'data: {"error":{"type":"rate_limit_exceeded","message":"Slow down"}}\n\n'

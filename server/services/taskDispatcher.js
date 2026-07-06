@@ -60,7 +60,7 @@ async function logActivity(entityType, entityId, eventType, actorName, detail) {
 /**
  * Find tasks eligible for automatic execution
  */
-async function findEligibleTasks() {
+export async function findEligibleTasks() {
   return await db.many(`
     SELECT
       t.id as task_id,
@@ -72,24 +72,22 @@ async function findEligibleTasks() {
       a.name as agent_name,
       a.provider,
       a.provider_api_key_encrypted,
+      a.provider_base_url,
       a.active_task_count,
       a.max_concurrent_tasks
     FROM tasks t
     JOIN agents a ON a.id = t.assigned_agent_id
     WHERE t.status IN ('pending', 'assigned')
-      -- Workflow-owned tasks must keep running even when the selected AI employee
-      -- is configured as manual (common for existing employees reused in workflows).
+      AND a.execution_mode = 'auto'
+      AND a.status = 'active'
       AND (
-        a.execution_mode = 'auto'
+        a.provider_api_key_encrypted IS NOT NULL
         OR (
-          a.execution_mode IN ('manual', 'polling')
-          AND (
-            t.context LIKE '%"workflow_run_id"%'
-            OR t.context LIKE '%"workflowRunId"%'
-          )
+          a.provider = 'openai_compatible'
+          AND a.provider_base_url IS NOT NULL
+          AND TRIM(a.provider_base_url) <> ''
         )
       )
-      AND a.status = 'active'
       AND (a.max_concurrent_tasks IS NULL OR a.active_task_count < a.max_concurrent_tasks)
       -- due_date is a deadline, not a start schedule; do not gate auto-dispatch on it
     ORDER BY t.priority ASC, t.created_at ASC
@@ -285,7 +283,7 @@ async function clearTaskExecutionError(taskId) {
 /**
  * Classify an error message string into a category (fallback when category not available)
  */
-function classifyErrorMessage(msg) {
+export function classifyErrorMessage(msg) {
   if (!msg) return 'unknown';
   const lower = msg.toLowerCase();
   if (lower.includes('model not found') || lower.includes('unknown model') || (lower.includes('404') && lower.includes('model'))) {
@@ -300,10 +298,11 @@ function classifyErrorMessage(msg) {
     return 'token_overlimit';
   }
   if (lower.includes('invalid_api_key') || lower.includes('authentication') || lower.includes('401')) return 'auth_error';
-  if (lower.includes('insufficient_quota') || lower.includes('payment') || lower.includes('plan') || lower.includes('quota')) return 'quota_exceeded';
+  if (lower.includes('insufficient_quota') || lower.includes('billing') || lower.includes('quota')) return 'quota_exceeded';
   if (lower.includes('rate limit') || lower.includes('429')) return 'rate_limited';
-  if (lower.includes('timeout') || lower.includes('aborted')) return 'timeout';
   if (lower.includes('overloaded') || lower.includes('529') || lower.includes('503')) return 'overloaded';
+  if (lower.includes('payment') || lower.includes('add a payment method')) return 'quota_exceeded';
+  if (lower.includes('timeout') || lower.includes('aborted')) return 'timeout';
   if (lower.includes('decrypt') || lower.includes('encryption_key') || lower.includes('config')) return 'config_error';
   return 'unknown';
 }

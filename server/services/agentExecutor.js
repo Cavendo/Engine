@@ -485,16 +485,22 @@ export async function testConnection(provider, apiKey, model, baseUrl) {
 function classifyApiError(status, errorBody, provider) {
   const message = errorBody?.error?.message || 'Unknown API error';
   const code = errorBody?.error?.code || errorBody?.error?.type || '';
+  const lowerMessage = message.toLowerCase();
 
   let category = 'unknown';
   if (status === 401 || code === 'invalid_api_key' || code === 'authentication_error') {
     category = 'auth_error';
-  } else if (status === 403 || code === 'insufficient_quota' || message.toLowerCase().includes('payment') || message.toLowerCase().includes('plan')) {
+  } else if (code === 'insufficient_quota') {
     category = 'quota_exceeded';
   } else if (status === 429 || code === 'rate_limit_exceeded') {
     category = 'rate_limited';
   } else if (status === 529 || status === 503 || code === 'overloaded_error') {
     category = 'overloaded';
+  } else if (status === 403
+      || lowerMessage.includes('billing')
+      || lowerMessage.includes('payment')
+      || lowerMessage.includes('add a payment method')) {
+    category = 'quota_exceeded';
   } else if (status === 400) {
     category = 'bad_request';
   }

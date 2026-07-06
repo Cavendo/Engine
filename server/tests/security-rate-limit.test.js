@@ -6,6 +6,8 @@ const express = (await import('express')).default;
 const cookieParser = (await import('cookie-parser')).default;
 const {
   createApiLimiter,
+  createAuthenticatedApiLimiter,
+  getAuthenticatedRateLimitKey,
   getApiRateLimitKey,
   isApiRateLimitAllowlisted,
 } = await import('../middleware/security.js');
@@ -24,7 +26,7 @@ function createTestApp(limit = 1) {
 }
 
 describe('API rate limiting', () => {
-  test('keys authenticated API requests by Cavendo API key', () => {
+  test('keys pre-auth API requests by client IP even with an API key', () => {
     const req = {
       ip: '203.0.113.10',
       headers: {
@@ -32,7 +34,7 @@ describe('API rate limiting', () => {
       }
     };
 
-    expect(getApiRateLimitKey(req)).toMatch(/^api:[a-f0-9]{64}$/);
+    expect(getApiRateLimitKey(req)).toBe('ip:203.0.113.10');
   });
 
   test('falls back to IP for anonymous requests', () => {
@@ -115,7 +117,7 @@ describe('API rate limiting', () => {
     expect(isApiRateLimitAllowlisted(req, '203.0.113.10')).toBe(false);
   });
 
-  test('keys logged-in browser requests by session token', () => {
+  test('keys pre-auth browser requests by client IP even with a session cookie', () => {
     const req = {
       ip: '203.0.113.10',
       headers: {},
@@ -124,10 +126,27 @@ describe('API rate limiting', () => {
       }
     };
 
-    expect(getApiRateLimitKey(req)).toMatch(/^session:[a-f0-9]{64}$/);
+    expect(getApiRateLimitKey(req)).toBe('ip:203.0.113.10');
   });
 
-  test('different API keys do not share the same limit bucket', async () => {
+  test('keys post-auth API requests by verified identity', () => {
+    expect(getAuthenticatedRateLimitKey({
+      ip: '203.0.113.10',
+      agent: { id: 7, keyId: 101 }
+    })).toBe('agent-key:101');
+
+    expect(getAuthenticatedRateLimitKey({
+      ip: '203.0.113.10',
+      agent: { isUserKey: true, userId: 3, keyId: 202 }
+    })).toBe('user-key:202');
+
+    expect(getAuthenticatedRateLimitKey({
+      ip: '203.0.113.10',
+      user: { id: 4 }
+    })).toBe('user:4');
+  });
+
+  test('distinct forged API keys from one IP share the same limit bucket', async () => {
     const app = createTestApp(1);
     const { default: supertest } = await import('supertest');
 
@@ -140,7 +159,8 @@ describe('API rate limiting', () => {
       .set('Authorization', 'Bearer cav_uk_second');
 
     expect(first.status).toBe(200);
-    expect(second.status).toBe(200);
+    expect(second.status).toBe(429);
+    expect(second.body.error?.code).toBe('RATE_LIMIT_EXCEEDED');
   });
 
   test('repeated requests with the same API key are rate limited together', async () => {
@@ -160,7 +180,7 @@ describe('API rate limiting', () => {
     expect(second.body.error?.code).toBe('RATE_LIMIT_EXCEEDED');
   });
 
-  test('different browser sessions do not share the same limit bucket', async () => {
+  test('distinct forged browser sessions from one IP share the same limit bucket', async () => {
     const app = createTestApp(1);
     const { default: supertest } = await import('supertest');
 
@@ -173,7 +193,8 @@ describe('API rate limiting', () => {
       .set('Cookie', 'session=session_two');
 
     expect(first.status).toBe(200);
-    expect(second.status).toBe(200);
+    expect(second.status).toBe(429);
+    expect(second.body.error?.code).toBe('RATE_LIMIT_EXCEEDED');
   });
 
   test('repeated requests with the same browser session are rate limited together', async () => {
@@ -201,6 +222,31 @@ describe('API rate limiting', () => {
 
     expect(first.status).toBe(200);
     expect(second.status).toBe(429);
+  });
+
+  test('post-auth limiter separates verified identities behind one IP', async () => {
+    const app = express();
+    app.use('/api', (req, _res, next) => {
+      const actor = req.headers['x-test-actor'];
+      req.agent = { id: actor === 'two' ? 2 : 1, keyId: actor === 'two' ? 22 : 11 };
+      next();
+    });
+    app.use('/api', createAuthenticatedApiLimiter({
+      windowMs: 60 * 1000,
+      max: 1,
+    }));
+    app.get('/api/test', (_req, res) => {
+      res.json({ ok: true });
+    });
+
+    const { default: supertest } = await import('supertest');
+    const first = await supertest(app).get('/api/test').set('X-Test-Actor', 'one');
+    const second = await supertest(app).get('/api/test').set('X-Test-Actor', 'two');
+    const third = await supertest(app).get('/api/test').set('X-Test-Actor', 'one');
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(third.status).toBe(429);
   });
 
   test('allowlisted IPs bypass the API rate limiter', async () => {

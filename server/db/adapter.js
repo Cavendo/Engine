@@ -2,16 +2,16 @@
  * Database Adapter Factory
  *
  * Returns the appropriate adapter based on DB_DRIVER env var.
- * Runtime requires PostgreSQL.
+ * Default is 'sqlite' for backward compatibility.
  *
  * Usage:
  *   import db from './db/adapter.js';
  *   const row = await db.one('SELECT * FROM tasks WHERE id = ?', [id]);
  *
  * Environment:
+ *   DB_DRIVER=sqlite (default) — uses better-sqlite3
  *   DB_DRIVER=postgres — uses pg Pool
  *   DB_DRIVER=mysql — uses mysql2/promise Pool
- *   DB_DRIVER=sqlite — only allowed when ALLOW_SQLITE=true (local tooling/tests)
  */
 
 import { createSqliteAdapter } from './sqliteAdapter.js';
@@ -42,10 +42,7 @@ function parseMysqlDatabaseUrl(databaseUrl) {
   };
 }
 
-const DB_DRIVER = String(
-  process.env.DB_DRIVER || (process.env.NODE_ENV === 'test' ? 'sqlite' : 'postgres')
-).toLowerCase();
-const ALLOW_SQLITE = process.env.ALLOW_SQLITE === 'true' || process.env.NODE_ENV === 'test';
+const DB_DRIVER = String(process.env.DB_DRIVER || 'sqlite').toLowerCase();
 
 function sanitizeConnectionStringForManagedSsl(raw) {
   try {
@@ -137,9 +134,6 @@ if (DB_DRIVER === 'postgres') {
 
   adapter = createMysqlAdapter(pool);
 } else if (DB_DRIVER === 'sqlite') {
-  if (!ALLOW_SQLITE) {
-    throw new Error('DB_DRIVER=sqlite is disabled for runtime. Use DB_DRIVER=postgres (set ALLOW_SQLITE=true only for local tooling/tests).');
-  }
   // Import the existing connection singleton
   const { default: rawDb } = await import('./connection.js');
   adapter = createSqliteAdapter(rawDb);

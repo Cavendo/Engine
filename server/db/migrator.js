@@ -5,6 +5,17 @@ import { isDuplicateColumn, isDuplicateIndex, isUniqueViolation } from './errors
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_DIR = join(__dirname, 'migrations');
+const SQLITE_FK_REBUILD_MIGRATIONS = new Set([
+  '006_task_status_blocked_deferred',
+  '008_user_operator_role',
+  '012_external_task_completed_status',
+]);
+
+function formatForeignKeyViolations(rows) {
+  return rows
+    .map((row) => `${row.table || row[0]} row ${row.rowid || row[1]} -> ${row.parent || row[2]}`)
+    .join('; ');
+}
 
 async function recordAppliedMigration(db, version) {
   if (db.dialect === 'postgres') {
@@ -21,6 +32,35 @@ async function recordAppliedMigration(db, version) {
   }
 
   await db.exec('INSERT OR IGNORE INTO schema_migrations (version) VALUES (?)', [version]);
+}
+
+async function runMigrationSql(db, version, sql) {
+  const needsForeignKeyRebuildMode = db.dialect === 'sqlite' && SQLITE_FK_REBUILD_MIGRATIONS.has(version);
+
+  if (needsForeignKeyRebuildMode) {
+    await db.run('PRAGMA foreign_keys = OFF');
+  }
+
+  try {
+    await db.tx(async (tx) => {
+      // Execute migration SQL (may contain multiple statements).
+      // tx.run() uses raw exec for multi-statement support.
+      await tx.run(sql);
+
+      if (needsForeignKeyRebuildMode) {
+        const violations = await tx.many('PRAGMA foreign_key_check');
+        if (violations.length > 0) {
+          throw new Error(`Foreign key check failed after ${version}: ${formatForeignKeyViolations(violations)}`);
+        }
+      }
+
+      await tx.exec('INSERT INTO schema_migrations (version) VALUES (?)', [version]);
+    });
+  } finally {
+    if (needsForeignKeyRebuildMode) {
+      await db.run('PRAGMA foreign_keys = ON');
+    }
+  }
 }
 
 /**
@@ -78,12 +118,7 @@ export async function runMigrations(db) {
     console.log(`[Migrator] Applying migration: ${file}`);
 
     try {
-      await db.tx(async (tx) => {
-        // Execute migration SQL (may contain multiple statements).
-        // tx.run() uses raw exec for multi-statement support.
-        await tx.run(sql);
-        await tx.exec('INSERT INTO schema_migrations (version) VALUES (?)', [version]);
-      });
+      await runMigrationSql(db, version, sql);
       console.log(`[Migrator] Applied: ${file}`);
     } catch (err) {
       // ALTER TABLE ADD COLUMN fails if column already exists — treat as idempotent

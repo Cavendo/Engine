@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { randomUUID } from 'crypto';
 import db from '../db/adapter.js';
 import * as response from '../utils/response.js';
-import { requireRoles } from '../middleware/userAuth.js';
+import { requireUserOrUserKeyRoles } from '../middleware/userAuth.js';
 import { agentAuth, dualAuth, logAgentActivity } from '../middleware/agentAuth.js';
 import { triggerWebhook } from '../services/webhooks.js';
 import { dispatchEvent } from '../services/routeDispatcher.js';
@@ -117,16 +117,20 @@ function appendRevisionContext(baseContext, feedback, source, requestedBy) {
   return next;
 }
 
-async function resolveProjectScope() {
-  return { enabled: false, allowedProjectIds: [] };
+function getReviewerActor(req) {
+  const id = req.user?.id || req.agent?.userId || null;
+  const email = req.user?.email || req.agent?.userEmail || null;
+  const name = req.user?.name || req.agent?.userName || email || (id ? `user:${id}` : 'reviewer');
+  return {
+    id,
+    email,
+    name,
+    reviewedBy: email || name || (id ? `user:${id}` : 'reviewer')
+  };
 }
 
 function applyTaskContextPlan(rawContext) {
   return rawContext && typeof rawContext === 'object' ? rawContext : {};
-}
-
-async function syncApprovedDeliverableToKnowledge() {
-  return null;
 }
 
 function getSubmissionClientLabel(metadata) {
@@ -221,20 +225,6 @@ router.get('/', dualAuth, async (req, res) => {
     const { status, taskId, agentId, projectId } = req.query;
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
     const offset = Math.max(0, parseInt(req.query.offset) || 0);
-    const scope = await resolveProjectScope(req);
-    const scopedProjectIds = Array.isArray(scope?.allowedProjectIds)
-      ? scope.allowedProjectIds
-          .map((id) => Number.parseInt(id, 10))
-          .filter((id) => Number.isInteger(id) && id > 0)
-      : [];
-
-    if (scope.enabled && scopedProjectIds.length === 0) {
-      return response.success(res, []);
-    }
-
-    if (scope.enabled && projectId && !scopedProjectIds.includes(parseInt(projectId, 10))) {
-      return response.success(res, []);
-    }
 
     let query = `
       SELECT
@@ -255,10 +245,12 @@ router.get('/', dualAuth, async (req, res) => {
     `;
     const params = [];
 
-    if (scope.enabled) {
-      const placeholders = scopedProjectIds.map(() => '?').join(',');
-      query += ` AND COALESCE(d.project_id, t.project_id) IN (${placeholders})`;
-      params.push(...scopedProjectIds);
+    if (req.agent && !req.agent.isUserKey) {
+      if (agentId && Number.parseInt(agentId, 10) !== Number(req.agent.id)) {
+        return response.success(res, []);
+      }
+      query += ' AND (d.agent_id = ? OR t.assigned_agent_id = ?)';
+      params.push(req.agent.id, req.agent.id);
     }
 
     if (status) {
@@ -269,7 +261,7 @@ router.get('/', dualAuth, async (req, res) => {
       query += ' AND d.task_id = ?';
       params.push(parseInt(taskId));
     }
-    if (agentId) {
+    if (agentId && !(req.agent && !req.agent.isUserKey)) {
       query += ' AND COALESCE(d.agent_id, t.assigned_agent_id) = ?';
       params.push(parseInt(agentId));
     }
@@ -310,17 +302,6 @@ router.get('/', dualAuth, async (req, res) => {
  */
 router.get('/pending', dualAuth, async (req, res) => {
   try {
-    const scope = await resolveProjectScope(req);
-    const scopedProjectIds = Array.isArray(scope?.allowedProjectIds)
-      ? scope.allowedProjectIds
-          .map((id) => Number.parseInt(id, 10))
-          .filter((id) => Number.isInteger(id) && id > 0)
-      : [];
-
-    if (scope.enabled && scopedProjectIds.length === 0) {
-      return response.success(res, []);
-    }
-
     let query = `
       SELECT
         d.*,
@@ -340,10 +321,9 @@ router.get('/pending', dualAuth, async (req, res) => {
     `;
     const params = [];
 
-    if (scope.enabled) {
-      const placeholders = scopedProjectIds.map(() => '?').join(',');
-      query += ` AND COALESCE(d.project_id, t.project_id) IN (${placeholders})`;
-      params.push(...scopedProjectIds);
+    if (req.agent && !req.agent.isUserKey) {
+      query += ' AND (d.agent_id = ? OR t.assigned_agent_id = ?)';
+      params.push(req.agent.id, req.agent.id);
     }
 
     query += ' ORDER BY d.created_at ASC';
@@ -602,7 +582,7 @@ router.get('/:id/feedback', dualAuth, async (req, res) => {
  * Review a deliverable (approve/revise/reject)
  * Works for both task-linked and standalone deliverables
  */
-router.patch('/:id/review', dualAuth, requireRoles('admin', 'reviewer'), validateBody(reviewDeliverableSchema), async (req, res) => {
+router.patch('/:id/review', dualAuth, requireUserOrUserKeyRoles('admin', 'reviewer'), validateBody(reviewDeliverableSchema), async (req, res) => {
   try {
     const deliverable = await db.one(`
       SELECT d.*, t.assigned_agent_id
@@ -620,6 +600,7 @@ router.patch('/:id/review', dualAuth, requireRoles('admin', 'reviewer'), validat
     }
 
     const { decision, feedback } = req.body;
+    const reviewer = getReviewerActor(req);
 
     const reviewSourceMetadata = extractHostedMcpReviewSource(req);
     const mergedMetadata = {
@@ -631,12 +612,12 @@ router.patch('/:id/review', dualAuth, requireRoles('admin', 'reviewer'), validat
       UPDATE deliverables
       SET status = ?, feedback = ?, reviewed_by = ?, reviewed_at = datetime('now'), updated_at = datetime('now'), metadata = ?
       WHERE id = ?
-    `, [decision, feedback || null, req.user.email, JSON.stringify(mergedMetadata), req.params.id]);
+    `, [decision, feedback || null, reviewer.reviewedBy, JSON.stringify(mergedMetadata), req.params.id]);
 
     // Log activity
-    logActivity('deliverable', parseInt(req.params.id), 'status_changed', req.user.name || req.user.email, { from: 'pending', to: decision });
+    logActivity('deliverable', parseInt(req.params.id), 'status_changed', reviewer.name, { from: 'pending', to: decision });
     if (decision === 'revision_requested' && feedback) {
-      logActivity('deliverable', parseInt(req.params.id), 'revision_requested', req.user.name || req.user.email, { feedback: feedback.substring(0, 200) });
+      logActivity('deliverable', parseInt(req.params.id), 'revision_requested', reviewer.name, { feedback: feedback.substring(0, 200) });
     }
 
     // Update task status based on review decision
@@ -649,7 +630,7 @@ router.patch('/:id/review', dualAuth, requireRoles('admin', 'reviewer'), validat
         `, [deliverable.task_id]);
 
         // Log task completion in activity trail
-        logActivity('task', deliverable.task_id, 'completed', req.user.name || req.user.email, {
+        logActivity('task', deliverable.task_id, 'completed', reviewer.name, {
           completedVia: 'deliverable_approval',
           deliverableId: parseInt(req.params.id)
         });
@@ -664,7 +645,7 @@ router.patch('/:id/review', dualAuth, requireRoles('admin', 'reviewer'), validat
           deliverable.task_id,
           feedback || '',
           'deliverable_review',
-          req.user?.email || req.user?.id || null
+          reviewer.email || reviewer.id || null
         );
       } else if (decision === 'rejected') {
         await db.exec(`
@@ -673,7 +654,7 @@ router.patch('/:id/review', dualAuth, requireRoles('admin', 'reviewer'), validat
           WHERE id = ? AND status IN ('pending', 'assigned', 'in_progress', 'review')
         `, [deliverable.task_id]);
 
-        logActivity('task', deliverable.task_id, 'cancelled', req.user.name || req.user.email, {
+        logActivity('task', deliverable.task_id, 'cancelled', reviewer.name, {
           cancelledVia: 'deliverable_rejection',
           deliverableId: parseInt(req.params.id, 10)
         });
@@ -683,21 +664,11 @@ router.patch('/:id/review', dualAuth, requireRoles('admin', 'reviewer'), validat
     const updated = await db.one('SELECT * FROM deliverables WHERE id = ?', [req.params.id]);
 
     if (decision === 'approved') {
-      try {
-        await syncApprovedDeliverableToKnowledge({
-          deliverableId: Number(req.params.id),
-          approvedBy: req.user?.id || req.user?.email || null,
-          trigger: 'deliverable_review'
-        });
-      } catch (syncErr) {
-        console.error(`[Deliverables] Failed to sync approved deliverable #${req.params.id} to KB:`, syncErr);
-      }
-
       if (deliverable.task_id) {
         await maybeSendInboundTaskCompletionUpdate({
           taskId: deliverable.task_id,
           deliverable: updated,
-          reviewerUserId: req.user?.id || null,
+          reviewerUserId: reviewer.id,
         });
       }
     }
@@ -742,7 +713,7 @@ router.patch('/:id/review', dualAuth, requireRoles('admin', 'reviewer'), validat
           files: safeJsonParse(updated.files, []),
           metadata: safeJsonParse(updated.metadata, {}),
           submitted_by: agent ? { id: agent.id, name: agent.name } : null,
-          approved_by: { id: req.user.id, name: req.user.name || req.user.email },
+          approved_by: { id: reviewer.id, name: reviewer.name },
           approved_at: updated.reviewed_at
         },
         feedback: feedback || null,

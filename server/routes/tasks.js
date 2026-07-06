@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import db from '../db/adapter.js';
 import * as response from '../utils/response.js';
-import { requireRoles } from '../middleware/userAuth.js';
+import { requireUserOrUserKeyRoles } from '../middleware/userAuth.js';
 import { agentAuth, dualAuth, logAgentActivity } from '../middleware/agentAuth.js';
 import { triggerWebhook } from '../services/webhooks.js';
 import { dispatchEvent } from '../services/routeDispatcher.js';
@@ -142,27 +142,39 @@ function normalizeActivityForTaskContext(activity) {
   };
 }
 
-function usesHumanProjectScope(req) {
-  return Boolean(req.user || req.agent?.isUserKey);
+function isRegularAgentKey(req) {
+  return Boolean(req.agent && !req.agent.isUserKey);
 }
 
-async function resolveProjectScope() {
-  return { enabled: false, allowedProjectIds: [] };
+function parseAgentProjectAccess(rawValue) {
+  if (rawValue === null || rawValue === undefined) return ['*'];
+  if (Array.isArray(rawValue)) return rawValue.map(String);
+  if (typeof rawValue !== 'string') return [];
+  if (rawValue.trim() === '') return ['*'];
+
+  try {
+    const parsed = JSON.parse(rawValue);
+    return Array.isArray(parsed) ? parsed.map(String) : [];
+  } catch {
+    return [];
+  }
 }
 
 async function ensureProjectAccess(req, projectId) {
-  if (!projectId || !usesHumanProjectScope(req)) {
+  if (!projectId || !isRegularAgentKey(req)) {
     return { allowed: true, scope: null };
   }
 
-  const scope = await resolveProjectScope(req);
-  if (!scope.enabled) {
-    return { allowed: true, scope };
+  const projectAccess = await db.one('SELECT project_access FROM agents WHERE id = ?', [req.agent.id]);
+  const allowedProjects = parseAgentProjectAccess(projectAccess?.project_access);
+  if (allowedProjects.includes('*')) {
+    return { allowed: true, scope: { type: 'agent_project_access', all: true } };
   }
 
+  const requestedProjectId = String(projectId);
   return {
-    allowed: scope.allowedProjectIds.includes(String(projectId)),
-    scope
+    allowed: allowedProjects.map(String).includes(requestedProjectId),
+    scope: { type: 'agent_project_access', allowedProjectIds: allowedProjects.map(String) }
   };
 }
 
@@ -170,8 +182,23 @@ function applyTaskContextPlan(rawContext) {
   return rawContext && typeof rawContext === 'object' ? rawContext : {};
 }
 
-async function retrieveWeightedKnowledgeForTask() {
-  return { chunks: [] };
+async function retrieveWeightedKnowledgeForTask(task) {
+  if (!task?.project_id) return { chunks: [] };
+
+  const rows = await db.many(`
+    SELECT id, title, content, content_type, category, tags
+    FROM knowledge
+    WHERE project_id = ?
+    ORDER BY created_at DESC
+    LIMIT 50
+  `, [task.project_id]);
+
+  return {
+    chunks: rows.map((row) => ({
+      ...row,
+      tags: safeJsonParse(row.tags, [])
+    }))
+  };
 }
 
 function buildTaskClaimantId(agentActor) {
@@ -313,21 +340,6 @@ router.get('/', dualAuth, async (req, res) => {
     const { status, priority, projectId, agentId, sprintId } = req.query;
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
     const offset = Math.max(0, parseInt(req.query.offset) || 0);
-    const scope = await resolveProjectScope(req);
-    const scopedProjectIds = Array.isArray(scope?.allowedProjectIds)
-      ? scope.allowedProjectIds
-          .map((id) => Number.parseInt(id, 10))
-          .filter((id) => Number.isInteger(id) && id > 0)
-      : [];
-
-    if (scope.enabled && scopedProjectIds.length === 0) {
-      return response.success(res, []);
-    }
-
-    if (scope.enabled && projectId && !scopedProjectIds.includes(parseInt(projectId, 10))) {
-      return response.success(res, []);
-    }
-
     let query = `
       SELECT
         t.*,
@@ -342,10 +354,12 @@ router.get('/', dualAuth, async (req, res) => {
     `;
     const params = [];
 
-    if (scope.enabled) {
-      const placeholders = scopedProjectIds.map(() => '?').join(',');
-      query += ` AND t.project_id IN (${placeholders})`;
-      params.push(...scopedProjectIds);
+    if (isRegularAgentKey(req)) {
+      if (agentId && Number.parseInt(agentId, 10) !== Number(req.agent.id)) {
+        return response.success(res, []);
+      }
+      query += ' AND t.assigned_agent_id = ?';
+      params.push(req.agent.id);
     }
 
     if (status) {
@@ -360,7 +374,7 @@ router.get('/', dualAuth, async (req, res) => {
       query += ' AND t.project_id = ?';
       params.push(parseInt(projectId));
     }
-    if (agentId) {
+    if (agentId && !isRegularAgentKey(req)) {
       query += ' AND t.assigned_agent_id = ?';
       params.push(parseInt(agentId));
     }
@@ -662,7 +676,7 @@ router.post('/', dualAuth, validateBody(createTaskSchema), async (req, res) => {
  * Bulk create tasks (max 50 per request)
  * Supports automatic routing when no assignedAgentId is provided
  */
-router.post('/bulk', dualAuth, requireRoles('admin'), validateBody(bulkCreateTasksSchema), async (req, res) => {
+router.post('/bulk', dualAuth, requireUserOrUserKeyRoles('admin'), validateBody(bulkCreateTasksSchema), async (req, res) => {
   const { tasks } = req.body;
   const results = [];
   const errors = [];
@@ -855,7 +869,7 @@ router.post('/bulk', dualAuth, requireRoles('admin'), validateBody(bulkCreateTas
  * Bulk update tasks (max 100 per request)
  * Handles agent task count management when reassigning or completing tasks
  */
-router.patch('/bulk', dualAuth, requireRoles('admin'), validateBody(bulkUpdateTasksSchema), async (req, res) => {
+router.patch('/bulk', dualAuth, requireUserOrUserKeyRoles('admin'), validateBody(bulkUpdateTasksSchema), async (req, res) => {
   const { taskIds, updates } = req.body;
   let updatedCount = 0;
   const errors = [];
@@ -1130,7 +1144,7 @@ router.patch('/bulk', dualAuth, requireRoles('admin'), validateBody(bulkUpdateTa
  * Bulk delete tasks (max 100 per request)
  * Decrements agent task counts for active assigned tasks
  */
-router.delete('/bulk', dualAuth, requireRoles('admin'), validateBody(bulkDeleteTasksSchema), async (req, res) => {
+router.delete('/bulk', dualAuth, requireUserOrUserKeyRoles('admin'), validateBody(bulkDeleteTasksSchema), async (req, res) => {
   const { taskIds } = req.body;
   let deletedCount = 0;
   const errors = [];
@@ -1289,7 +1303,7 @@ router.get('/:id', dualAuth, async (req, res) => {
 router.get('/:id/context', dualAuth, async (req, res) => {
   try {
     const task = await db.one(`
-      SELECT t.*, p.id as project_id, p.name as project_name, p.description as project_description, p.type as project_type, s.id as sprint_id, s.name as sprint_name
+      SELECT t.*, p.id as project_id, p.name as project_name, p.description as project_description, s.id as sprint_id, s.name as sprint_name
       FROM tasks t
       LEFT JOIN projects p ON p.id = t.project_id
       LEFT JOIN sprints s ON s.id = t.sprint_id
@@ -1407,30 +1421,15 @@ router.get('/:id/context', dualAuth, async (req, res) => {
       project: task.project_id ? {
         id: task.project_id,
         name: task.project_name,
-        description: task.project_description || '',
-        type: task.project_type || 'project'
+        description: task.project_description || ''
       } : null,
       sprint: task.sprint_id ? {
         id: task.sprint_id,
         name: task.sprint_name
       } : null,
-      contextPlan: retrieval?.contextPlan || null,
-      taskMaterials: retrieval?.taskMaterials || {
-        sourceDocuments: [],
-        sourceUrls: [],
-        inboundAttachments: [],
-      },
       projectCollectionsContext: taskContext?.project_collections_context
         || taskContext?.projectCollectionsContext
         || null,
-      contextBuckets: {
-        taskMaterials: retrieval?.buckets?.taskMaterials || [],
-        projectContext: retrieval?.buckets?.projectContext || [],
-        projectCollections: retrieval?.buckets?.projectCollections || [],
-        priorOutputs: retrieval?.buckets?.priorOutputs || [],
-        systemReferences: retrieval?.buckets?.systemReferences || [],
-      },
-      retrievalAudit: retrieval?.audit || null,
       knowledge,
       deliverables,
       relatedTasks,
@@ -1789,7 +1788,7 @@ router.patch('/:id', dualAuth, validateBody(updateTaskSchema), async (req, res) 
  * DELETE /api/tasks/:id
  * Delete task
  */
-router.delete('/:id', dualAuth, requireRoles('admin'), async (req, res) => {
+router.delete('/:id', dualAuth, requireUserOrUserKeyRoles('admin'), async (req, res) => {
   try {
     const task = await db.one('SELECT id, title, description, assigned_agent_id, status, priority, project_id, tags FROM tasks WHERE id = ?', [req.params.id]);
     if (!task) {
@@ -2536,7 +2535,7 @@ router.get('/:id/activity', dualAuth, async (req, res) => {
  * POST /api/tasks/:id/execute
  * Manually trigger execution for a task (admin only)
  */
-router.post('/:id/execute', dualAuth, requireRoles('admin'), async (req, res) => {
+router.post('/:id/execute', dualAuth, requireUserOrUserKeyRoles('admin'), async (req, res) => {
   try {
     const { executeTaskNow } = await import('../services/taskDispatcher.js');
     const result = await executeTaskNow(parseInt(req.params.id));
@@ -2558,7 +2557,7 @@ router.post('/:id/execute', dualAuth, requireRoles('admin'), async (req, res) =>
  * Clear execution error from a task so the dispatcher will pick it up again.
  * Also allows resetting status to 'assigned' if currently stuck.
  */
-router.post('/:id/retry', dualAuth, requireRoles('admin'), async (req, res) => {
+router.post('/:id/retry', dualAuth, requireUserOrUserKeyRoles('admin'), async (req, res) => {
   try {
     const task = await db.one('SELECT id, context, status, assigned_agent_id FROM tasks WHERE id = ?', [req.params.id]);
     if (!task) return response.notFound(res, 'Task');

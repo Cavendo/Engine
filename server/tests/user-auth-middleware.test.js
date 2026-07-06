@@ -9,6 +9,7 @@ const mockResponse = {
   unauthorized: jest.fn((res, msg) => res.status(401).json({ error: msg })),
   forbidden: jest.fn((res, msg) => res.status(403).json({ error: msg }))
 };
+const mockAuthenticatedApiLimiter = jest.fn((req, res, next) => next());
 
 jest.unstable_mockModule('../db/adapter.js', () => ({
   default: mockDb
@@ -19,6 +20,10 @@ jest.unstable_mockModule('../utils/crypto.js', () => ({
 }));
 
 jest.unstable_mockModule('../utils/response.js', () => mockResponse);
+
+jest.unstable_mockModule('../middleware/security.js', () => ({
+  authenticatedApiLimiter: mockAuthenticatedApiLimiter
+}));
 
 function mockRes() {
   return {

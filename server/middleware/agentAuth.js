@@ -5,6 +5,7 @@ import { getClientIp } from '../utils/clientIp.js';
 import * as response from '../utils/response.js';
 import { extractApiKeyFromRequest } from '../utils/apiKeyHeaders.js';
 import { userAuth } from './userAuth.js';
+import { authenticatedApiLimiter } from './security.js';
 
 function safeJsonParse(val, fallback) {
   if (val === null || val === undefined) return fallback;
@@ -209,7 +210,7 @@ export async function agentAuth(req, res, next) {
 
   try {
     req.agent = await resolveApiKeyActor(apiKey);
-    next();
+    return authenticatedApiLimiter(req, res, next);
   } catch (err) {
     if (err?.status === 401) {
       return response.unauthorized(res, err.message || 'Invalid API key');

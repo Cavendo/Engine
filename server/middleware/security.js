@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import net from 'net';
 import rateLimit from 'express-rate-limit';
-import { generateCsrfToken, hashApiKey, hashSessionToken } from '../utils/crypto.js';
+import { generateCsrfToken } from '../utils/crypto.js';
 import { extractApiKeyFromRequest } from '../utils/apiKeyHeaders.js';
 import { getClientIp, normalizeIpAddress } from '../utils/clientIp.js';
 import * as response from '../utils/response.js';
@@ -11,8 +11,8 @@ import * as response from '../utils/response.js';
 // ============================================
 
 /**
- * General API rate limiter
- * Default: 300 requests per minute per authenticated API key, or per IP when anonymous
+ * General pre-auth API rate limiter.
+ * Default: 300 requests per minute per resolved client IP
  * (configurable via RATE_LIMIT_API env var)
  */
 function parseRateLimitAllowlist(raw = process.env.RATE_LIMIT_API_ALLOWLIST || '') {
@@ -62,18 +62,24 @@ export function isApiRateLimitAllowlisted(req, rawAllowlist = process.env.RATE_L
 }
 
 export function getApiRateLimitKey(req) {
-  const apiKey = extractApiKeyFromRequest(req);
-  if (apiKey) {
-    return `api:${hashApiKey(apiKey)}`;
-  }
-
-  const sessionToken = String(req?.cookies?.session || '');
-  if (sessionToken) {
-    return `session:${hashSessionToken(sessionToken)}`;
-  }
-
   const clientIp = getClientIp(req);
   return `ip:${clientIp}`;
+}
+
+export function getAuthenticatedRateLimitKey(req) {
+  if (req.agent?.isUserKey && req.agent.keyId) {
+    return `user-key:${req.agent.keyId}`;
+  }
+  if (req.agent?.keyId) {
+    return `agent-key:${req.agent.keyId}`;
+  }
+  if (req.agent?.id) {
+    return `agent:${req.agent.id}`;
+  }
+  if (req.user?.id) {
+    return `user:${req.user.id}`;
+  }
+  return getApiRateLimitKey(req);
 }
 
 export function createApiLimiter(overrides = {}) {
@@ -105,6 +111,34 @@ export function createApiLimiter(overrides = {}) {
 }
 
 export const apiLimiter = createApiLimiter();
+
+export function createAuthenticatedApiLimiter(overrides = {}) {
+  const { skip: customSkip, ...restOverrides } = overrides;
+  return rateLimit({
+    windowMs: 60 * 1000,
+    max: parseInt(process.env.RATE_LIMIT_AUTHENTICATED || '3000', 10),
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: getAuthenticatedRateLimitKey,
+    skip: async (req, res) => {
+      if (!req.agent && !req.user) return true;
+      if (typeof customSkip === 'function') {
+        return await customSkip(req, res);
+      }
+      return false;
+    },
+    message: {
+      success: false,
+      error: {
+        code: 'RATE_LIMIT_EXCEEDED',
+        message: 'Too many authenticated requests, please try again later'
+      }
+    },
+    ...restOverrides
+  });
+}
+
+export const authenticatedApiLimiter = createAuthenticatedApiLimiter();
 
 /**
  * Strict rate limiter for authentication endpoints

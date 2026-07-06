@@ -554,7 +554,7 @@ data/cavendo.db
 
 All configuration is via environment variables in `.env`. See [`.env.example`](.env.example) for a ready-to-copy template.
 
-> **Production security:** Always set strong, unique values for `JWT_SECRET` and encryption key material (`ENCRYPTION_KEY` or `ENCRYPTION_KEYRING`). If `SESSION_SECRET` is not set, the server falls back to `JWT_SECRET` for key derivation — set it explicitly in production to separate concerns.
+> **Production security:** Always set strong, unique values for `JWT_SECRET`, `SESSION_SECRET`, `SESSION_HASH_SECRET`, and encryption key material (`ENCRYPTION_KEY` or `ENCRYPTION_KEYRING`). If `SESSION_SECRET` is not set, the server falls back to `JWT_SECRET` for key derivation; session token hashing falls back through those secrets and then stable encryption key material. Set these explicitly in production to separate concerns.
 
 ### Core
 
@@ -572,11 +572,13 @@ All configuration is via environment variables in `.env`. See [`.env.example`](.
 |----------|---------|---------|----------|
 | `JWT_SECRET` | Server secret used as fallback entropy for encryption key derivation | Auto-generated on first run | Yes (prod) |
 | `SESSION_SECRET` | Preferred secret for encryption key derivation (takes priority over `JWT_SECRET`) | Falls back to `JWT_SECRET` | Recommended (prod) |
+| `SESSION_HASH_SECRET` | Dedicated HMAC secret for stored session token hashes | Falls back to session/JWT/encryption key material | Recommended (prod) |
 | `API_KEY_PREFIX` | Prefix for agent API keys | `cav_ak` | No |
-| `RATE_LIMIT_API` | Max API requests per minute | `300` | No |
+| `RATE_LIMIT_API` | Pre-auth API requests per minute, keyed by resolved client IP | `300` | No |
+| `RATE_LIMIT_AUTHENTICATED` | Post-auth API requests per minute, keyed by verified user or agent identity | `3000` | No |
 | `RATE_LIMIT_API_ALLOWLIST` | Comma-separated client IPs or CIDR ranges that bypass the general API limiter | — | No |
 
-> `RATE_LIMIT_API_ALLOWLIST` uses the resolved client IP, so set `TRUST_PROXY` correctly when running behind nginx, Cloudflare, or another reverse proxy. When proxy trust is enabled, Cavendo honors `CF-Connecting-IP`, `True-Client-IP`, and `X-Forwarded-For` in that order. Example: `RATE_LIMIT_API_ALLOWLIST=203.0.113.10,198.51.100.0/24`
+> `RATE_LIMIT_API` is intentionally pre-auth and IP-only. Authenticated routes also apply `RATE_LIMIT_AUTHENTICATED` after a user or agent key has been verified. `RATE_LIMIT_API_ALLOWLIST` uses the resolved client IP, so set `TRUST_PROXY` correctly when running behind nginx, Cloudflare, or another reverse proxy; otherwise all clients can appear as the proxy address and share one bucket. When proxy trust is enabled, Cavendo honors `CF-Connecting-IP`, `True-Client-IP`, and `X-Forwarded-For` in that order. Example: `RATE_LIMIT_API_ALLOWLIST=203.0.113.10,198.51.100.0/24`
 
 ### Encryption
 
