@@ -385,7 +385,10 @@ export async function decrementActiveTaskCount(agentId, _db) {
   const d = _db || db;
   const result = await d.exec(`
     UPDATE agents
-    SET active_task_count = MAX(0, COALESCE(active_task_count, 0) - 1),
+    SET active_task_count = CASE
+          WHEN COALESCE(active_task_count, 0) > 0 THEN COALESCE(active_task_count, 0) - 1
+          ELSE 0
+        END,
         updated_at = datetime('now')
     WHERE id = ?
   `, [agentId]);

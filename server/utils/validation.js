@@ -84,10 +84,28 @@ export const createAgentSchema = z.preprocess((data) => {
   providerModel: z.string().max(100).optional().nullable(),
   providerBaseUrl: z.string().max(500).optional().nullable(),
   providerLabel: z.string().max(100).optional().nullable(),
+  runtimeLock: z.object({
+    primaryProvider: z.enum(['anthropic', 'openai', 'openai_compatible', 'google']),
+    primaryModel: z.string().max(100),
+    fallbackProvider: z.enum(['anthropic', 'openai', 'openai_compatible', 'google']).optional().nullable(),
+    fallbackModel: z.string().max(100).optional().nullable(),
+  }).optional().nullable(),
   systemPrompt: z.string().max(50000).optional().nullable(),
   executionMode: z.enum(['manual', 'auto', 'polling', 'human']).optional(),
   maxTokens: z.number().int().min(1).max(200000).optional(),
   temperature: z.number().min(0).max(2).optional()
+}).superRefine((data, ctx) => {
+  const lock = data.runtimeLock;
+  if (!lock) return;
+  const hasFallbackProvider = Boolean(lock.fallbackProvider);
+  const hasFallbackModel = Boolean(lock.fallbackModel);
+  if (hasFallbackProvider !== hasFallbackModel) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['runtimeLock'],
+      message: 'Fallback provider and model must be provided together',
+    });
+  }
 }));
 
 export const updateAgentSchema = z.object({
@@ -126,27 +144,126 @@ export const updateAgentExecutionSchema = z.object({
   providerModel: z.string().max(100).optional().nullable(),
   providerBaseUrl: z.string().max(500).optional().nullable(),
   providerLabel: z.string().max(100).optional().nullable(),
+  runtimeLock: z.object({
+    primaryProvider: z.enum(['anthropic', 'openai', 'openai_compatible', 'google']),
+    primaryModel: z.string().max(100),
+    fallbackProvider: z.enum(['anthropic', 'openai', 'openai_compatible', 'google']).optional().nullable(),
+    fallbackModel: z.string().max(100).optional().nullable(),
+  }).optional().nullable(),
   systemPrompt: z.string().max(50000).optional().nullable(),
   executionMode: z.enum(['manual', 'auto', 'polling', 'human']).optional(),
   maxTokens: z.number().int().min(1).max(200000).optional(),
   temperature: z.number().min(0).max(2).optional()
+}).superRefine((data, ctx) => {
+  const lock = data.runtimeLock;
+  if (!lock) return;
+  const hasFallbackProvider = Boolean(lock.fallbackProvider);
+  const hasFallbackModel = Boolean(lock.fallbackModel);
+  if (hasFallbackProvider !== hasFallbackModel) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['runtimeLock'],
+      message: 'Fallback provider and model must be provided together',
+    });
+  }
 }).refine(data => Object.keys(data).length > 0, {
   message: 'At least one field must be provided'
 });
 
-export const createUserSchema = z.object({
-  email: z.string().email('Invalid email address'),
-  password: z.string().min(8, 'Password must be at least 8 characters'),
+export const createUserSchema = z.preprocess((data) => {
+  if (data && typeof data === 'object') {
+    const d = { ...data };
+    if (typeof d.email === 'string' && !d.email.trim()) d.email = undefined;
+    if ('send_invite' in d && !('sendInvite' in d)) d.sendInvite = d.send_invite;
+    if ('is_agent_user' in d && !('isAgentUser' in d)) d.isAgentUser = d.is_agent_user;
+    if ('agent_platform' in d && !('agentPlatform' in d)) d.agentPlatform = d.agent_platform;
+    if ('agent_communication_method' in d && !('agentCommunicationMethod' in d)) d.agentCommunicationMethod = d.agent_communication_method;
+    if ('agent_transport' in d && !('agentTransport' in d)) d.agentTransport = d.agent_transport;
+    if ('agent_provider_preset' in d && !('agentProviderPreset' in d)) d.agentProviderPreset = d.agent_provider_preset;
+    if ('external_platform_connection_id' in d && !('externalPlatformConnectionId' in d)) d.externalPlatformConnectionId = d.external_platform_connection_id;
+    if ('project_access' in d && !('projectAccess' in d)) d.projectAccess = d.project_access;
+    delete d.send_invite;
+    delete d.is_agent_user;
+    delete d.agent_platform;
+    delete d.agent_communication_method;
+    delete d.agent_transport;
+    delete d.agent_provider_preset;
+    delete d.external_platform_connection_id;
+    delete d.project_access;
+    return d;
+  }
+  return data;
+}, z.object({
+  email: z.string().email('Invalid email address').optional(),
+  password: z.string().min(8, 'Password must be at least 8 characters').optional(),
   name: z.string().max(100).optional(),
-  role: z.enum(['admin', 'reviewer', 'viewer']).optional().default('reviewer')
+  role: z.enum(['admin', 'operator', 'reviewer', 'viewer']).optional().default('reviewer'),
+  sendInvite: z.boolean().optional().default(false),
+  isAgentUser: z.boolean().optional().default(false),
+  agentPlatform: z.string().max(100).optional(),
+  agentCommunicationMethod: z.enum(['api', 'mcp']).optional().default('api'),
+  agentTransport: z.enum(['polling_api', 'polling_mcp', 'remote_platform_link']).optional(),
+  agentProviderPreset: z.enum(['openclaw', 'lovable', 'replit', 'bolt', 'custom']).optional(),
+  externalPlatformConnectionId: z.number().int().positive().optional().nullable(),
+  projectAccess: z.array(z.string().max(100)).optional().default(['*']),
+})).superRefine((data, ctx) => {
+  if (!data.isAgentUser && !data.email) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['email'],
+      message: 'Email is required'
+    });
+  }
+  if (data.isAgentUser && !String(data.name || '').trim()) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['name'],
+      message: 'Name is required for agent users'
+    });
+  }
+  if (data.isAgentUser && !String(data.agentPlatform || '').trim()) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['agentPlatform'],
+      message: 'Platform is required for agent users'
+    });
+  }
 });
 
-export const updateUserSchema = z.object({
+export const updateUserSchema = z.preprocess((data) => {
+  if (data && typeof data === 'object') {
+    const d = { ...data };
+    if (typeof d.email === 'string' && !d.email.trim()) d.email = undefined;
+    if ('is_agent_user' in d && !('isAgentUser' in d)) d.isAgentUser = d.is_agent_user;
+    if ('agent_platform' in d && !('agentPlatform' in d)) d.agentPlatform = d.agent_platform;
+    if ('agent_communication_method' in d && !('agentCommunicationMethod' in d)) d.agentCommunicationMethod = d.agent_communication_method;
+    if ('agent_transport' in d && !('agentTransport' in d)) d.agentTransport = d.agent_transport;
+    if ('agent_provider_preset' in d && !('agentProviderPreset' in d)) d.agentProviderPreset = d.agent_provider_preset;
+    if ('external_platform_connection_id' in d && !('externalPlatformConnectionId' in d)) d.externalPlatformConnectionId = d.external_platform_connection_id;
+    if ('project_access' in d && !('projectAccess' in d)) d.projectAccess = d.project_access;
+    delete d.is_agent_user;
+    delete d.agent_platform;
+    delete d.agent_communication_method;
+    delete d.agent_transport;
+    delete d.agent_provider_preset;
+    delete d.external_platform_connection_id;
+    delete d.project_access;
+    return d;
+  }
+  return data;
+}, z.object({
   email: z.string().email('Invalid email address').optional(),
   name: z.string().max(100).optional().nullable(),
-  role: z.enum(['admin', 'reviewer', 'viewer']).optional(),
-  status: z.enum(['active', 'inactive']).optional()
-}).refine(data => Object.keys(data).length > 0, {
+  role: z.enum(['admin', 'operator', 'reviewer', 'viewer']).optional(),
+  status: z.enum(['active', 'inactive']).optional(),
+  isAgentUser: z.boolean().optional(),
+  agentPlatform: z.string().max(100).optional().nullable(),
+  agentCommunicationMethod: z.enum(['api', 'mcp']).optional(),
+  agentTransport: z.enum(['polling_api', 'polling_mcp', 'remote_platform_link']).optional(),
+  agentProviderPreset: z.enum(['openclaw', 'lovable', 'replit', 'bolt', 'custom']).optional().nullable(),
+  externalPlatformConnectionId: z.number().int().positive().optional().nullable(),
+  projectAccess: z.array(z.string().max(100)).optional(),
+})).refine(data => Object.keys(data).length > 0, {
   message: 'At least one field must be provided'
 });
 
@@ -168,10 +285,15 @@ export const matchAgentsSchema = z.object({
 // Task Schemas
 // ============================================
 
+const TASK_DESCRIPTION_MAX_CHARS = 100000;
+
 export const createTaskSchema = z.object({
   title: z.string().min(1, 'Title is required').max(500),
-  description: z.string().max(10000).optional().nullable(),
-  projectId: z.number().int().positive().optional().nullable(),
+  description: z.string().max(TASK_DESCRIPTION_MAX_CHARS).optional().nullable(),
+  projectId: z.number({
+    required_error: 'projectId is required',
+    invalid_type_error: 'projectId is required',
+  }).int().positive('projectId is required'),
   sprintId: z.number().int().positive().optional().nullable(),
   assignedAgentId: z.union([z.number().int().positive(), z.literal('auto')]).optional().nullable(),
   priority: z.number().int().min(1).max(4).optional().default(2),
@@ -186,11 +308,11 @@ export const createTaskSchema = z.object({
 
 export const updateTaskSchema = z.object({
   title: z.string().min(1).max(500).optional(),
-  description: z.string().max(10000).optional().nullable(),
-  projectId: z.number().int().positive().optional().nullable(),
+  description: z.string().max(TASK_DESCRIPTION_MAX_CHARS).optional().nullable(),
+  projectId: z.number().int().positive('projectId cannot be cleared').optional(),
   sprintId: z.number().int().positive().optional().nullable(),
   assignedAgentId: z.union([z.number().int().positive(), z.literal('auto')]).optional().nullable(),
-  status: z.enum(['pending', 'assigned', 'in_progress', 'review', 'completed', 'cancelled']).optional(),
+  status: z.enum(['pending', 'assigned', 'in_progress', 'review', 'blocked', 'deferred', 'completed', 'cancelled']).optional(),
   priority: z.number().int().min(1).max(4).optional(),
   context: z.record(z.any()).optional(),
   tags: z.array(z.string().max(50)).max(20).optional(),
@@ -204,11 +326,54 @@ export const updateTaskSchema = z.object({
 });
 
 export const updateTaskStatusSchema = z.object({
-  status: z.enum(['in_progress', 'review'], {
-    errorMap: () => ({ message: 'Status must be in_progress or review' })
+  status: z.enum(['assigned', 'in_progress', 'review', 'completed'], {
+    errorMap: () => ({ message: 'Status must be assigned, in_progress, review, or completed' })
   }),
   progress: z.any().optional()
 });
+
+export const claimTaskLeaseSchema = z.object({
+  externalRunId: z.string().max(255).optional().nullable(),
+  leaseSeconds: z.number().int().min(30).max(3600).optional().nullable()
+});
+
+export const taskLeaseHeartbeatSchema = z.object({
+  externalRunId: z.string().max(255).optional().nullable(),
+  leaseSeconds: z.number().int().min(30).max(3600).optional().nullable(),
+  statusMessage: z.string().max(2000).optional().nullable()
+});
+
+export const releaseTaskLeaseSchema = z.object({
+  reason: z.string().max(2000).optional().nullable(),
+  abandon: z.boolean().optional().default(false)
+});
+
+export const updateExternalTaskExecutionSchema = z.object({
+  status: z.enum(['accepted', 'running', 'blocked', 'needs_input', 'submitted', 'failed', 'canceled'], {
+    errorMap: () => ({ message: 'Status must be accepted, running, blocked, needs_input, submitted, failed, or canceled' })
+  }),
+  message: z.string().max(5000).optional().nullable(),
+  progress: z.any().optional(),
+  externalRunId: z.string().max(255).optional().nullable(),
+  error: z.string().max(5000).optional().nullable()
+});
+
+export const submitExternalTaskResultSchema = z.object({
+  title: z.string().max(500).optional().nullable(),
+  summary: z.string().max(50000).optional(),
+  content: z.string().max(1000000).optional(),
+  contentType: z.enum(['markdown', 'html', 'json', 'text', 'code']).optional(),
+  metadata: z.record(z.any()).optional().default({}),
+  artifacts: z.array(z.record(z.any())).optional().default([]),
+  inputTokens: z.number().int().nonnegative().optional(),
+  outputTokens: z.number().int().nonnegative().optional(),
+  provider: z.string().max(50).optional(),
+  model: z.string().max(100).optional(),
+  requestReview: z.boolean().optional().default(true)
+}).refine(
+  data => data.summary || data.content,
+  { message: 'At least one of summary or content is required' }
+);
 
 // Bulk task schemas
 export const bulkCreateTasksSchema = z.object({
@@ -218,9 +383,9 @@ export const bulkCreateTasksSchema = z.object({
 export const bulkUpdateTasksSchema = z.object({
   taskIds: z.array(z.number().int().positive()).min(1, 'At least one task ID is required').max(100, 'Maximum 100 tasks per request'),
   updates: z.object({
-    status: z.enum(['pending', 'assigned', 'in_progress', 'review', 'completed', 'cancelled']).optional(),
+    status: z.enum(['pending', 'assigned', 'in_progress', 'review', 'blocked', 'deferred', 'completed', 'cancelled']).optional(),
     priority: z.number().int().min(1).max(4).optional(),
-    projectId: z.number().int().positive().optional().nullable(),
+    projectId: z.number().int().positive('projectId cannot be cleared').optional(),
     sprintId: z.number().int().positive().optional().nullable(),
     assignedAgentId: z.number().int().positive().optional().nullable(),
     dueDate: z.union([z.string().date(), z.string().datetime()]).optional().nullable()
@@ -304,18 +469,37 @@ export const reviewDeliverableSchema = z.object({
 // Project Schemas
 // ============================================
 
-export const createProjectSchema = z.object({
-  name: z.string().min(1, 'Name is required').max(255),
-  description: z.string().max(2000).optional().nullable()
-});
+const optionalProjectUrlSchema = z.preprocess((value) => {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  const trimmed = String(value).trim();
+  return trimmed ? trimmed : null;
+}, z.string().url('Primary URL must be a valid URL').nullable().optional());
 
-export const updateProjectSchema = z.object({
+function normalizeProjectPayload(data) {
+  if (data && typeof data === 'object') {
+    const next = { ...data };
+    if ('primary_url' in next && !('primaryUrl' in next)) next.primaryUrl = next.primary_url;
+    delete next.primary_url;
+    return next;
+  }
+  return data;
+}
+
+export const createProjectSchema = z.preprocess(normalizeProjectPayload, z.object({
+  name: z.string().min(1, 'Name is required').max(255),
+  description: z.string().max(2000).optional().nullable(),
+  primaryUrl: optionalProjectUrlSchema,
+}));
+
+export const updateProjectSchema = z.preprocess(normalizeProjectPayload, z.object({
   name: z.string().min(1).max(255).optional(),
   description: z.string().max(2000).optional().nullable(),
+  primaryUrl: optionalProjectUrlSchema,
   status: z.enum(['active', 'archived', 'completed']).optional()
 }).refine(data => Object.keys(data).length > 0, {
   message: 'At least one field must be provided'
-});
+}));
 
 export const ensureProjectSchema = z.object({
   externalKey: z.string().regex(externalKeyRegex, 'Invalid external key'),
@@ -502,6 +686,8 @@ export const createSkillsInvocationSchema = z.object({
   inputs: z.record(z.any()).optional().default({}),
   contextData: z.record(z.any()).optional().default({}),
   connectorBindings: z.record(z.enum(['workspace', 'managed', 'none'])).optional().default({}),
+  connectorBindingDetails: z.record(z.any()).optional().default({}),
+  connectorResolutions: z.record(z.any()).optional().default({}),
   workspaceId: z.number().int().positive().optional().nullable(),
   taskId: z.number().int().positive().optional().nullable(),
   workflowRunId: z.string().max(200).optional().nullable(),

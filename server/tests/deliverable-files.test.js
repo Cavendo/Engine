@@ -41,6 +41,9 @@ describe('getMimeType', () => {
     expect(getMimeType('file.zip')).toBe('application/zip');
     expect(getMimeType('file.docx')).toBe('application/vnd.openxmlformats-officedocument.wordprocessingml.document');
     expect(getMimeType('file.xlsx')).toBe('application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    expect(getMimeType('file.xls')).toBe('application/vnd.ms-excel');
+    expect(getMimeType('file.pptx')).toBe('application/vnd.openxmlformats-officedocument.presentationml.presentation');
+    expect(getMimeType('file.ppt')).toBe('application/vnd.ms-powerpoint');
     expect(getMimeType('file.csv')).toBe('text/csv');
   });
 

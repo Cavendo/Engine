@@ -10,6 +10,29 @@
 import { isAllowedMimeType, getMimeType, validateArtifactPolicy } from './deliverableFiles.js';
 
 const VALID_CONTENT_TYPES = new Set(['markdown', 'html', 'json', 'text', 'code']);
+const TEXT_LIKE_MIME_TYPES = new Set([
+  'text/plain',
+  'text/markdown',
+  'text/html',
+  'text/css',
+  'text/csv',
+  'application/json',
+  'application/xml'
+]);
+
+function inferContentTypeHint(filename, mimeType) {
+  if (mimeType === 'text/html') return 'html';
+  if (mimeType === 'text/markdown') return 'markdown';
+  if (mimeType === 'application/json') return 'json';
+  if (mimeType === 'text/plain' || mimeType === 'text/csv' || mimeType === 'application/xml') return 'text';
+
+  const lowerName = typeof filename === 'string' ? filename.toLowerCase() : '';
+  if (lowerName.endsWith('.html') || lowerName.endsWith('.htm')) return 'html';
+  if (lowerName.endsWith('.md') || lowerName.endsWith('.markdown')) return 'markdown';
+  if (lowerName.endsWith('.json')) return 'json';
+  if (lowerName.endsWith('.txt') || lowerName.endsWith('.csv') || lowerName.endsWith('.xml')) return 'text';
+  return undefined;
+}
 
 /**
  * Check if a string is valid base64.
@@ -72,11 +95,14 @@ export function parseAgentDeliverableEnvelope(raw) {
   // Discriminator: must look like a deliberate envelope, not arbitrary JSON.
   // Option A: has `artifacts` key (the primary signal)
   // Option B: has `content_type` AND at least one of title/summary/content (envelope metadata)
+  // Option C: shorthand single-file envelope with filename + string content
   // This prevents plain JSON payloads with a stray `content_type` field from being misclassified.
   const hasArtifactsKey = 'artifacts' in parsed;
   const hasContentTypeKey = 'content_type' in parsed;
   const hasEnvelopeMetadata = ('title' in parsed || 'summary' in parsed || 'content' in parsed);
-  if (!hasArtifactsKey && !(hasContentTypeKey && hasEnvelopeMetadata)) {
+  const hasSingleFileShape = typeof parsed.filename === 'string' && parsed.filename.trim()
+    && typeof parsed.content === 'string';
+  if (!hasArtifactsKey && !(hasContentTypeKey && hasEnvelopeMetadata) && !hasSingleFileShape) {
     return noEnvelope;
   }
 
@@ -133,6 +159,31 @@ export function parseAgentDeliverableEnvelope(raw) {
   }
 
   const artifactsArray = Array.isArray(parsed.artifacts) ? parsed.artifacts : [];
+  if (hasSingleFileShape) {
+    if (!String(parsed.content || '').length) {
+      errors.push('filename/content shorthand: content must be a non-empty string');
+    }
+    const inferredMimeType = parsed.mime_type || getMimeType(parsed.filename);
+    if (!isAllowedMimeType(inferredMimeType)) {
+      errors.push(`filename/content shorthand: MIME type '${inferredMimeType}' is not allowed`);
+    } else if (errors.length === 0 || !errors.includes('filename/content shorthand: content must be a non-empty string')) {
+      result.artifacts.push({
+        filename: parsed.filename.trim(),
+        mime_type: inferredMimeType,
+        encoding: 'base64',
+        content: Buffer.from(parsed.content, 'utf8').toString('base64')
+      });
+      if (inferredMimeType === 'text/html') {
+        result.content = `Attached file: ${parsed.filename.trim()}`;
+        result.contentTypeHint = 'markdown';
+      } else if (!result.content && TEXT_LIKE_MIME_TYPES.has(inferredMimeType)) {
+        result.content = parsed.content;
+      }
+      if (!result.contentTypeHint) {
+        result.contentTypeHint = inferContentTypeHint(parsed.filename, inferredMimeType);
+      }
+    }
+  }
 
   // Validate each artifact
   for (let i = 0; i < artifactsArray.length; i++) {

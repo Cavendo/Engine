@@ -117,3 +117,24 @@ describe('Startup sequence (upgrade from pre-001 schema)', () => {
     db.close();
   });
 });
+
+describe('Startup sequence (PostgreSQL upgrade safety)', () => {
+  test('initializeDatabase skips baseline schema for existing PostgreSQL databases', async () => {
+    const db = {
+      dialect: 'postgres',
+      one: jest.fn()
+        .mockResolvedValueOnce({ table_name: 'users' })
+        .mockResolvedValueOnce({ column_name: 'force_password_change' })
+        .mockResolvedValueOnce({ id: 1 })
+        .mockResolvedValueOnce({ id: 1 }),
+      many: jest.fn().mockResolvedValueOnce([]),
+      exec: jest.fn().mockResolvedValue({ changes: 0 }),
+      run: jest.fn().mockResolvedValue(undefined),
+    };
+
+    await initializeDatabase(db);
+
+    expect(db.run).not.toHaveBeenCalled();
+    expect(db.one).toHaveBeenCalledWith(expect.stringContaining("table_name = 'users'"));
+  });
+});

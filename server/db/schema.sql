@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS projects (
     name TEXT NOT NULL,
     external_key TEXT,
     description TEXT,
+    primary_url TEXT,
     status TEXT DEFAULT 'active' CHECK (status IN ('active', 'archived', 'completed')),
     -- Task routing configuration
     task_routing_rules TEXT, -- JSON array of routing rules
@@ -90,13 +91,20 @@ CREATE TABLE IF NOT EXISTS tasks (
     title TEXT NOT NULL,
     description TEXT,
     tags TEXT, -- JSON array of tags for routing
-    status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'assigned', 'in_progress', 'review', 'completed', 'cancelled')),
+    status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'assigned', 'in_progress', 'review', 'blocked', 'deferred', 'completed', 'cancelled')),
     priority INTEGER DEFAULT 2 CHECK (priority BETWEEN 1 AND 4), -- 1=critical, 2=high, 3=medium, 4=low
     context TEXT, -- JSON object with additional context
     due_date TEXT,
     assigned_at TEXT,
     started_at TEXT,
     completed_at TEXT,
+    agent_claimed_by TEXT,
+    agent_claimed_at TEXT,
+    agent_claim_expires_at TEXT,
+    agent_last_heartbeat_at TEXT,
+    external_execution_status TEXT CHECK (external_execution_status IN ('queued', 'accepted', 'running', 'blocked', 'needs_input', 'submitted', 'completed', 'failed', 'canceled')),
+    external_run_id TEXT,
+    external_error TEXT,
     -- Routing decision tracking
     routing_rule_id TEXT, -- ID of rule that matched
     routing_decision TEXT, -- Human-readable routing explanation
@@ -104,6 +112,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     task_type TEXT,
     required_capabilities TEXT, -- JSON array of required capability strings
     preferred_agent_id INTEGER REFERENCES agents(id) ON DELETE SET NULL,
+    created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_by_agent_id INTEGER REFERENCES agents(id) ON DELETE SET NULL,
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now'))
 );
@@ -121,7 +131,7 @@ CREATE TABLE IF NOT EXISTS deliverables (
     content_type TEXT DEFAULT 'markdown' CHECK (content_type IN ('markdown', 'html', 'json', 'text', 'code')),
     files TEXT, -- JSON array of file attachments [{filename, path, mimeType, size}]
     actions TEXT, -- JSON array of follow-up actions [{action_text, estimated_time_minutes, notes, completed}]
-    status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'revision_requested', 'revised', 'rejected')),
+    status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'awaiting_client_review', 'approved', 'revision_requested', 'revised', 'rejected', 'dismissed', 'expired')),
     version INTEGER DEFAULT 1,
     parent_id INTEGER REFERENCES deliverables(id) ON DELETE SET NULL, -- For revisions
     reviewed_by TEXT,
@@ -208,7 +218,8 @@ CREATE TABLE IF NOT EXISTS users (
     email TEXT UNIQUE NOT NULL,
     password_hash TEXT NOT NULL,
     name TEXT,
-    role TEXT DEFAULT 'reviewer' CHECK (role IN ('admin', 'reviewer', 'viewer')),
+    role TEXT DEFAULT 'reviewer' CHECK (role IN ('admin', 'operator', 'reviewer', 'viewer')),
+    is_agent_user INTEGER DEFAULT 0 CHECK (is_agent_user IN (0, 1)),
     status TEXT DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
     force_password_change INTEGER DEFAULT 0 CHECK (force_password_change IN (0, 1)),
     last_login_at TEXT,
@@ -220,7 +231,12 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash TEXT,
     expires_at TEXT NOT NULL,
+    last_activity_at TEXT DEFAULT (datetime('now')),
+    user_agent TEXT,
+    ip_address TEXT,
+    revoked_at TEXT,
     created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -259,7 +275,7 @@ CREATE TABLE IF NOT EXISTS routes (
     description TEXT,
     trigger_event TEXT NOT NULL, -- deliverable.approved, deliverable.submitted, task.created, etc.
     trigger_conditions TEXT, -- JSON: optional filters (tags, metadata)
-    destination_type TEXT NOT NULL, -- webhook, email (Cloud adds: slack, wordpress, zapier)
+    destination_type TEXT NOT NULL, -- webhook, email, or extension-provided destination
     destination_config TEXT NOT NULL, -- JSON: destination-specific configuration
     field_mapping TEXT, -- JSON: maps deliverable fields to destination fields
     retry_policy TEXT DEFAULT '{"max_retries": 3, "backoff_type": "exponential", "initial_delay_ms": 1000}',
@@ -404,6 +420,8 @@ CREATE INDEX IF NOT EXISTS idx_agent_activity_agent ON agent_activity(agent_id);
 CREATE INDEX IF NOT EXISTS idx_agent_activity_created ON agent_activity(created_at);
 CREATE INDEX IF NOT EXISTS idx_task_progress_task ON task_progress(task_id);
 CREATE INDEX IF NOT EXISTS idx_task_progress_created ON task_progress(created_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_agent_claim_expires_at ON tasks(agent_claim_expires_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_external_execution_status ON tasks(external_execution_status);
 CREATE INDEX IF NOT EXISTS idx_agents_owner ON agents(owner_user_id);
 CREATE INDEX IF NOT EXISTS idx_user_keys_user ON user_keys(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_keys_hash ON user_keys(key_hash);

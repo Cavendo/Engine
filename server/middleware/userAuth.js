@@ -1,17 +1,22 @@
 import db from '../db/adapter.js';
 import * as response from '../utils/response.js';
+import { hashSessionToken } from '../utils/crypto.js';
 
 async function resolveUserSession(req) {
-  const sessionId = req.cookies?.session;
+  const sessionToken = String(req.cookies?.session || '');
 
-  if (!sessionId) {
+  if (!sessionToken) {
     return { ok: false, reason: 'missing_session' };
   }
+  const sessionTokenHash = hashSessionToken(sessionToken);
 
   const session = await db.one(`
     SELECT
       s.id as session_id,
+      s.token_hash,
       s.expires_at,
+      s.last_activity_at,
+      s.revoked_at,
       u.id as user_id,
       u.email,
       u.name,
@@ -20,21 +25,29 @@ async function resolveUserSession(req) {
       u.force_password_change
     FROM sessions s
     JOIN users u ON u.id = s.user_id
-    WHERE s.id = ?
-  `, [sessionId]);
+    WHERE s.token_hash = ? OR (s.token_hash IS NULL AND s.id = ?)
+  `, [sessionTokenHash, sessionToken]);
 
   if (!session) {
     return { ok: false, reason: 'invalid_session', clearCookie: true };
   }
 
-  if (new Date(session.expires_at) < new Date()) {
-    await db.exec('DELETE FROM sessions WHERE id = ?', [sessionId]);
+  if (session.revoked_at || new Date(session.expires_at) < new Date()) {
+    await db.exec(`
+      DELETE FROM sessions
+      WHERE token_hash = ? OR (token_hash IS NULL AND id = ?)
+    `, [sessionTokenHash, sessionToken]);
     return { ok: false, reason: 'expired_session', clearCookie: true };
   }
 
   if (session.status !== 'active') {
     return { ok: false, reason: 'inactive_account' };
   }
+
+  await db.exec(
+    "UPDATE sessions SET last_activity_at = datetime('now') WHERE id = ?",
+    [session.session_id]
+  );
 
   const user = {
     id: session.user_id,
@@ -44,7 +57,7 @@ async function resolveUserSession(req) {
     forcePasswordChange: Boolean(session.force_password_change)
   };
 
-  return { ok: true, user };
+  return { ok: true, user, sessionId: session.session_id };
 }
 
 /**
@@ -94,6 +107,7 @@ export async function userAuth(req, res, next) {
     actorType: 'user',
     actorId: `user:${result.user.id}`
   };
+  req.session = { id: result.sessionId };
 
   next();
 }
@@ -120,35 +134,15 @@ export function requireRoles(...allowedRoles) {
  * Optional user auth - doesn't fail if no session
  */
 export async function optionalUserAuth(req, res, next) {
-  const sessionId = req.cookies?.session;
-
-  if (!sessionId) {
+  if (!req.cookies?.session) {
     return next();
   }
-
-  const session = await db.one(`
-    SELECT
-      s.id as session_id,
-      s.expires_at,
-      u.id as user_id,
-      u.email,
-      u.name,
-      u.role,
-      u.status,
-      u.force_password_change
-    FROM sessions s
-    JOIN users u ON u.id = s.user_id
-    WHERE s.id = ? AND u.status = 'active'
-  `, [sessionId]);
-
-  if (session && new Date(session.expires_at) >= new Date()) {
-    req.user = {
-      id: session.user_id,
-      email: session.email,
-      name: session.name,
-      role: session.role,
-      forcePasswordChange: Boolean(session.force_password_change)
-    };
+  const result = await resolveUserSession(req);
+  if (result.ok) {
+    req.user = result.user;
+    req.session = { id: result.sessionId };
+  } else if (result.clearCookie) {
+    res.clearCookie('session');
   }
 
   next();

@@ -20,10 +20,52 @@ Manage AI agents, their API keys, and webhook configurations.
 | POST | `/api/agents/:id/execute` | Admin + CSRF | Execute task via provider |
 | POST | `/api/agents/:id/webhook-secret` | Admin + CSRF | Generate webhook secret |
 | GET | `/api/agents/me` | Agent | Get own details |
+| GET | `/api/projects` | Agent | List projects visible to this agent or external employee |
 | GET | `/api/agents/me/tasks` | Agent | List assigned tasks |
 | GET | `/api/agents/me/tasks/next` | Agent | Get next task |
+| POST | `/api/agents/me/tasks/poll` | Agent | Poll assigned work for an external employee |
+| POST | `/api/agents/me/tasks/:taskId/claim` | Agent | Claim an execution lease |
+| POST | `/api/agents/me/tasks/:taskId/heartbeat` | Agent | Renew an external task lease |
+| POST | `/api/agents/me/tasks/:taskId/release` | Agent | Release an external task lease |
 
 > **Note:** All POST/PATCH/PUT/DELETE requests with session auth require the `X-CSRF-Token` header.
+
+## External Employees
+
+Agents with `executionMode: "polling"` can operate as first-class external employees. These are intended for runtimes such as OpenClaw, locally hosted assistants, and custom worker services that run outside Cavendo but still execute inside Cavendo's task and review model.
+
+The runtime contract is:
+
+1. `GET /api/projects`
+2. `POST /api/agents/me/tasks/poll`
+3. `POST /api/agents/me/tasks/:taskId/claim`
+4. `GET /api/tasks/:taskId/context`
+5. `POST /api/agents/me/tasks/:taskId/heartbeat`
+6. `POST /api/tasks/:taskId/progress`
+7. `POST /api/tasks/:taskId/external-status`
+8. `POST /api/tasks/:taskId/result`
+
+Default external employee policy:
+
+- `policy: assigned_only`
+- `allowed_actions: claim, heartbeat, progress, submit_result, request_review`
+- `heartbeat_timeout_seconds: 300`
+
+Note:
+
+- `progress` is task-scoped and uses `POST /api/tasks/:taskId/progress`
+- it is not mounted under `/api/agents/me/tasks/...`
+
+Recommended behavior:
+
+- call `GET /api/projects` if the runtime needs to know which projects it can operate in
+- use an agent key for unattended workers
+- fetch the full context bundle before generating output
+- send heartbeat updates every 60 to 120 seconds
+- publish meaningful lifecycle changes through `external-status`
+- submit results back into Cavendo for review instead of bypassing review
+
+See [External Employees](../external-agents.md) for the full lifecycle and payload examples.
 
 ---
 

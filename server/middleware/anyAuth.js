@@ -11,9 +11,8 @@ export function anyAuth(probes) {
         const result = await probe(req);
         if (result?.ok) {
           req.auth = result.auth;
-          if (req.auth?.type === 'user' && result.user) {
-            req.user = result.user;
-          }
+          if (result.user) req.user = result.user;
+          if (result.agent) req.agent = result.agent;
           return next();
         }
       } catch {

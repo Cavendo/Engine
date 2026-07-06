@@ -21,6 +21,7 @@ import crypto from 'crypto';
 const tempDir = mkdtempSync(join(tmpdir(), 'cavendo-agent-provider-routes-'));
 const tempDbPath = join(tempDir, 'test.db');
 process.env.DATABASE_PATH = tempDbPath;
+process.env.DB_DRIVER = 'sqlite';
 process.env.SESSION_SECRET = 'test-secret-for-agent-provider-routes';
 process.env.NODE_ENV = 'test';
 // Ensure ENCRYPTION_KEY is set for crypto module
@@ -54,6 +55,7 @@ const { initializeDatabase } = await import('../db/init.js');
 const { runMigrations } = await import('../db/migrator.js');
 const { default: agentsRouter } = await import('../routes/agents.js');
 const { default: db } = await import('../db/adapter.js');
+const { hashApiKey } = await import('../utils/crypto.js');
 
 // ============================================
 // Build minimal test app
@@ -73,6 +75,8 @@ function buildApp() {
 
 let sessionId;
 let adminUserId;
+let userApiKey;
+let agentApiKey;
 let app;
 
 function authed(req) {
@@ -101,6 +105,22 @@ beforeAll(async () => {
     INSERT INTO sessions (id, user_id, expires_at)
     VALUES (?, ?, datetime('now', '+1 hour'))
   `, [sessionId, adminUserId]);
+
+  userApiKey = 'cav_uk_test_agents_route_key';
+  await db.exec(`
+    INSERT INTO user_keys (user_id, key_hash, key_prefix, name)
+    VALUES (?, ?, ?, ?)
+  `, [adminUserId, hashApiKey(userApiKey), userApiKey.slice(0, 15), 'Agent route test key']);
+
+  agentApiKey = 'cav_ak_test_agents_route_key';
+  const agentResult = await db.insert(`
+    INSERT INTO agents (name, type, status)
+    VALUES ('Worker Test Agent', 'supervised', 'active')
+  `, []);
+  await db.exec(`
+    INSERT INTO agent_keys (agent_id, key_hash, key_prefix, name)
+    VALUES (?, ?, ?, ?)
+  `, [agentResult.lastInsertRowid, hashApiKey(agentApiKey), agentApiKey.slice(0, 12), 'Worker key']);
 
   app = buildApp();
 });
@@ -336,6 +356,25 @@ describe('GET /api/agents — provider fields in response', () => {
     expect(ollamaAgent).toBeDefined();
     expect(ollamaAgent.providerBaseUrl).toBe('http://localhost:11434');
     expect(ollamaAgent.providerLabel).toBe('Ollama');
+  });
+});
+
+describe('GET /api/agents — user-key auth', () => {
+  it('allows personal user API keys', async () => {
+    const res = await supertest(app)
+      .get('/api/agents')
+      .set('Authorization', `Bearer ${userApiKey}`);
+
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.body.data)).toBe(true);
+  });
+
+  it('rejects agent API keys', async () => {
+    const res = await supertest(app)
+      .get('/api/agents')
+      .set('Authorization', `Bearer ${agentApiKey}`);
+
+    expect(res.status).toBe(403);
   });
 });
 

@@ -10,6 +10,11 @@ const ENCRYPTION_ALGORITHM = 'aes-256-gcm';
 const KEY_LENGTH = 32;
 const IV_LENGTH = 16;
 const AUTH_TAG_LENGTH = 16;
+const SESSION_HASH_SECRET =
+  process.env.SESSION_HASH_SECRET ||
+  process.env.SESSION_SECRET ||
+  process.env.JWT_SECRET ||
+  (process.env.NODE_ENV === 'production' ? null : 'cavendo-dev-session-hash-secret');
 
 /**
  * Generate a new API key with prefix
@@ -76,6 +81,19 @@ export function generateWebhookSecret() {
  */
 export function generateSessionToken() {
   return crypto.randomBytes(32).toString('hex');
+}
+
+/**
+ * Hash a session token for at-rest storage.
+ * Uses HMAC-SHA256 so DB token material cannot be replayed as a cookie.
+ * @param {string} token
+ * @returns {string}
+ */
+export function hashSessionToken(token) {
+  if (!SESSION_HASH_SECRET) {
+    throw new Error('SESSION_HASH_SECRET (or SESSION_SECRET/JWT_SECRET) is required for session hashing');
+  }
+  return crypto.createHmac('sha256', SESSION_HASH_SECRET).update(String(token || ''), 'utf8').digest('hex');
 }
 
 /**

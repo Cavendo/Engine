@@ -4,9 +4,12 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import http from 'http';
 
+const TEST_HOST = '127.0.0.1';
+
 // Point DATABASE_PATH to a temp dir so tests don't touch real data
 const tempDir = mkdtempSync(join(tmpdir(), 'cavendo-factory-'));
 process.env.DATABASE_PATH = join(tempDir, 'test.db');
+process.env.DB_DRIVER = 'sqlite';
 process.env.SESSION_SECRET = 'test-secret-for-factory';
 process.env.NODE_ENV = 'test';
 
@@ -21,6 +24,10 @@ jest.unstable_mockModule('bcrypt', () => ({
 const { createApp } = await import('../app.js');
 const { stopDispatcher } = await import('../services/taskDispatcher.js');
 const { stopRetrySweep } = await import('../services/routeDispatcher.js');
+
+function createTestApp(options = {}) {
+  return createApp({ startBackgroundWorkers: false, ...options });
+}
 
 afterAll(() => {
   // Stop global singletons that may have been started by tests
@@ -50,7 +57,7 @@ describe('createApp factory', () => {
   });
 
   test('createApp returns app, start, stop', () => {
-    const result = createApp();
+    const result = createTestApp();
     expect(result).toHaveProperty('app');
     expect(result).toHaveProperty('start');
     expect(result).toHaveProperty('stop');
@@ -59,12 +66,12 @@ describe('createApp factory', () => {
   });
 
   test('stop() without start() is a safe no-op', async () => {
-    const instance = createApp();
+    const instance = createTestApp();
     await expect(instance.stop()).resolves.toBeUndefined();
   });
 
   test('route assembly failure surfaces clear error', async () => {
-    const instance = createApp({
+    const instance = createTestApp({
       beforeRoutes() {
         throw new Error('Hook boom');
       },
@@ -74,8 +81,8 @@ describe('createApp factory', () => {
   }, 15000);
 
   test('start() returns a listening server (port 0)', async () => {
-    const instance = createApp();
-    const server = await instance.start({ port: 0 });
+    const instance = createTestApp();
+    const server = await instance.start({ port: 0, host: TEST_HOST });
     serversToClose.push(server);
     expect(server).toBeInstanceOf(http.Server);
     expect(server.listening).toBe(true);
@@ -84,17 +91,17 @@ describe('createApp factory', () => {
   }, 15000);
 
   test('start() is idempotent — returns same server on second call', async () => {
-    const instance = createApp();
-    const server1 = await instance.start({ port: 0 });
+    const instance = createTestApp();
+    const server1 = await instance.start({ port: 0, host: TEST_HOST });
     serversToClose.push(server1);
-    const server2 = await instance.start({ port: 0 });
+    const server2 = await instance.start({ port: 0, host: TEST_HOST });
     expect(server1).toBe(server2);
   }, 15000);
 
   test('hook ordering: beforeRoutes → engine routes → afterRoutes', async () => {
     const order = [];
 
-    const instance = createApp({
+    const instance = createTestApp({
       beforeRoutes(app) {
         order.push('beforeRoutes');
         app.get('/api/before-test', (req, res) => res.json({ hook: 'before' }));
@@ -105,7 +112,7 @@ describe('createApp factory', () => {
       },
     });
 
-    const server = await instance.start({ port: 0 });
+    const server = await instance.start({ port: 0, host: TEST_HOST });
     serversToClose.push(server);
 
     expect(order).toEqual(['beforeRoutes', 'afterRoutes']);
@@ -127,46 +134,46 @@ describe('createApp factory', () => {
   }, 15000);
 
   test('afterRoutes route is not shadowed by SPA fallback', async () => {
-    const instance = createApp({
+    const instance = createTestApp({
       afterRoutes(app) {
-        app.get('/api/cloud-test', (req, res) => res.json({ cloud: true }));
+        app.get('/api/extension-test', (req, res) => res.json({ extension: true }));
       },
     });
 
-    const server = await instance.start({ port: 0 });
+    const server = await instance.start({ port: 0, host: TEST_HOST });
     serversToClose.push(server);
     const port = server.address().port;
 
-    const res = await fetch(`http://localhost:${port}/api/cloud-test`);
+    const res = await fetch(`http://localhost:${port}/api/extension-test`);
     expect(res.ok).toBe(true);
     const body = await res.json();
-    expect(body.cloud).toBe(true);
+    expect(body.extension).toBe(true);
   }, 15000);
 
   test('onStarted hook receives app and server', async () => {
     let receivedApp, receivedServer;
 
-    const instance = createApp({
+    const instance = createTestApp({
       onStarted({ app, server }) {
         receivedApp = app;
         receivedServer = server;
       },
     });
 
-    const server = await instance.start({ port: 0 });
+    const server = await instance.start({ port: 0, host: TEST_HOST });
     serversToClose.push(server);
     expect(receivedApp).toBeDefined();
     expect(receivedServer).toBe(server);
   }, 15000);
 
   test('onStarted failure triggers cleanup and rethrow', async () => {
-    const instance = createApp({
+    const instance = createTestApp({
       onStarted() {
         throw new Error('onStarted boom');
       },
     });
 
-    await expect(instance.start({ port: 0 })).rejects.toThrow('onStarted boom');
+    await expect(instance.start({ port: 0, host: TEST_HOST })).rejects.toThrow('onStarted boom');
   }, 15000);
 });
 
@@ -174,8 +181,8 @@ describe('createApp factory', () => {
 // Only one test actually starts+stops since db.close() is terminal.
 describe('createApp lifecycle (stop)', () => {
   test('full lifecycle: start() → listening → stop() → closed', async () => {
-    const instance = createApp();
-    const server = await instance.start({ port: 0 });
+    const instance = createTestApp();
+    const server = await instance.start({ port: 0, host: TEST_HOST });
     expect(server).toBeInstanceOf(http.Server);
     expect(server.listening).toBe(true);
 
@@ -184,7 +191,7 @@ describe('createApp lifecycle (stop)', () => {
   }, 15000);
 
   test('stop() is idempotent — calling twice does not throw', async () => {
-    const instance = createApp();
+    const instance = createTestApp();
     // stop without prior start is a no-op
     await expect(instance.stop()).resolves.toBeUndefined();
     await expect(instance.stop()).resolves.toBeUndefined();

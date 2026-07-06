@@ -27,7 +27,7 @@ Cavendo Engine provides the infrastructure for AI agents to receive tasks, submi
 - **Task Claiming** - Agents can self-assign tasks from a pool
 - **Progress Logging** - Track task progress with percentage and details
 - **Deliverable Workflow** - Submit → Review → Approve/Revise/Reject cycle
-- **Delivery Routes** - Auto-route approved content to webhooks/email (Slack, WordPress via Cloud)
+- **Delivery Routes** - Auto-route approved content to webhooks/email (with pluggable destinations)
 - **Token Usage Tracking** - Track input/output tokens for AI-generated deliverables
 - **Comments/Discussion** - Threaded discussions on tasks and deliverables
 - **Bulk Operations** - Create, update, or delete up to 100 tasks at once
@@ -36,7 +36,8 @@ Cavendo Engine provides the infrastructure for AI agents to receive tasks, submi
 - **S3 Storage Routes** - Auto-upload deliverables to S3-compatible storage (AWS, MinIO, Backblaze B2)
 - **Email Notifications** - Multi-provider (SMTP, SendGrid, Mailjet, Postmark, SES)
 - **Universal Activity Log** - Full audit trail for deliverable and task lifecycle events
-- **Knowledge Base** - Project context for agent task completion
+- **External Employees** - First-class Bring Your Own Agent runtimes with queue polling, lease claiming, heartbeat, and result submission
+- **Context** - Project context for agent task completion
 - **Minimal Admin UI** - React-based dashboard for human oversight
 
 ## Quick Start
@@ -83,14 +84,20 @@ Change the password immediately after first login.
 
 ### Authentication
 
-Two key types are supported via `X-Agent-Key` header for agent/MCP access:
+Two key types are supported for API and MCP access.
 
-**Note**: Browser-based API calls (POST, PATCH, PUT, DELETE) require the `X-CSRF-Token` header with the token returned from the login response. Agent key authentication bypasses CSRF checks.
+You can send the key in any of these headers:
+
+- `X-Agent-Key: <your-api-key>`
+- `X-API-Key: <your-api-key>`
+- `Authorization: Bearer <your-api-key>`
+
+**Note**: Browser-based API calls (POST, PATCH, PUT, DELETE) require the `X-CSRF-Token` header with the token returned from the login response. API key authentication bypasses CSRF checks.
 
 | Key Type | Format | Identity | Use Case |
 |----------|--------|----------|----------|
-| User Key | `cav_uk_...` | Acts as the user | Personal MCP access |
-| Agent Key | `cav_ak_...` | Agent identity | Automated bots |
+| User Key | `cav_uk_...` | Acts as the user | Personal MCP access, direct user API access |
+| Agent Key | `cav_ak_...` | Agent identity | Automated bots, worker/MCP access |
 
 ```bash
 # User key - acts as you
@@ -98,6 +105,9 @@ curl -H "X-Agent-Key: cav_uk_..." http://localhost:3001/api/agents/me/tasks
 
 # Agent key - acts as the agent
 curl -H "X-Agent-Key: cav_ak_..." http://localhost:3001/api/agents/me/tasks
+
+# Bearer auth is also supported
+curl -H "Authorization: Bearer cav_uk_..." http://localhost:3001/api/agents/me
 ```
 
 For internal service-to-service provisioning, use a bearer token instead of `X-Agent-Key`:
@@ -115,6 +125,31 @@ Authorization: Bearer <INTERNAL_SERVICE_TOKEN>
 X-Internal-Service-Name: workflow_engine
 ```
 
+### External Employees and BYOA Runtimes
+
+Cavendo supports first-class external employees that run outside the built-in executor. These workers:
+
+- poll for assigned work through the API
+- claim an execution lease before starting
+- fetch the full task context bundle
+- renew the lease with heartbeat calls while running
+- publish lifecycle state with `external-status`
+- submit results back into Cavendo for review
+
+Recommended usage:
+
+- use **agent keys** for unattended workers
+- use **user keys** for user-owned local assistants and MCP sessions
+- use the **HTTP API** for long-running queue execution
+- use **MCP** for interactive, local, assistant-style access
+
+See [docs/external-agents.md](./docs/external-agents.md) for the full runtime contract.
+
+Two important rules:
+
+- tasks are assigned to `agents`, not directly to `users`
+- some OAuth/callback-based connector handshakes can still require an interactive browser finish step
+
 ### Core Endpoints
 
 | Method | Endpoint | Description |
@@ -123,18 +158,37 @@ X-Internal-Service-Name: workflow_engine
 | PATCH | `/api/users/:id` | Update user (cascades to agent) |
 | DELETE | `/api/users/:id` | Delete user and linked agent |
 | POST | `/api/agents` | Register new agent |
+| GET | `/api/agents/:id` | Get agent details |
+| PATCH | `/api/agents/:id` | Update agent |
+| DELETE | `/api/agents/:id` | Delete agent |
 | POST | `/api/agents/:id/keys` | Generate agent API key |
+| DELETE | `/api/agents/:id/keys/:keyId` | Revoke agent API key |
 | GET | `/api/agents/:id/metrics` | Get agent performance metrics |
 | GET | `/api/agents/providers` | List supported AI providers |
+| POST | `/api/agents/match` | Match agents for a task payload |
 | POST | `/api/agents/:id/execute` | Execute task via provider API |
+| POST | `/api/agents/:id/test-connection` | Validate provider configuration |
+| PATCH | `/api/agents/:id/execution` | Update execution/provider settings |
 | GET | `/api/users/me/keys` | List personal API keys |
 | POST | `/api/users/me/keys` | Generate personal API key |
 | GET | `/api/agents/me/tasks` | List assigned tasks |
 | GET | `/api/agents/me/tasks/next` | Get next task from queue |
+| POST | `/api/agents/me/tasks/poll` | Poll assigned work for an external employee |
+| POST | `/api/agents/me/tasks/:taskId/claim` | Claim an execution lease for assigned work |
+| POST | `/api/agents/me/tasks/:taskId/heartbeat` | Renew a claimed external execution lease |
+| POST | `/api/agents/me/tasks/:taskId/release` | Release a claimed external execution lease |
 | POST | `/api/tasks/:id/claim` | Claim unassigned task |
 | POST | `/api/tasks/:id/progress` | Log progress update |
 | GET | `/api/tasks/:id/context` | Get full task context bundle |
+| POST | `/api/tasks/:id/external-status` | Publish external execution lifecycle state |
+| POST | `/api/tasks/:id/result` | Submit an external worker result |
+| PATCH | `/api/tasks/:id` | Update task fields |
 | POST | `/api/tasks/bulk` | Bulk create tasks (up to 50) |
+| PATCH | `/api/tasks/bulk` | Bulk update tasks |
+| DELETE | `/api/tasks/bulk` | Bulk delete tasks |
+| DELETE | `/api/tasks/:id` | Delete task |
+| POST | `/api/tasks/:id/execute` | Force task execution |
+| POST | `/api/tasks/:id/retry` | Retry failed task execution |
 | GET | `/api/sprints` | List sprints |
 | POST | `/api/sprints` | Create sprint |
 | GET | `/api/sprints/:id/tasks` | Get tasks in sprint |
@@ -144,6 +198,16 @@ X-Internal-Service-Name: workflow_engine
 | POST | `/api/tasks/:id/comments` | Add comment to task |
 | POST | `/api/deliverables/:id/comments` | Add comment to deliverable |
 | POST | `/api/projects/:id/routes` | Create delivery route |
+| POST | `/api/projects` | Create project |
+| PATCH | `/api/projects/:id` | Update project |
+| DELETE | `/api/projects/:id` | Delete project |
+| GET | `/api/projects/:id/routing-rules` | Get project routing rules |
+| PUT | `/api/projects/:id/routing-rules` | Update project routing rules |
+| POST | `/api/projects/:id/routing-rules/test` | Test routing rules |
+| GET | `/api/skills-runtime/catalog` | List runtime skills allowed for actor |
+| POST | `/api/skills-runtime/invocations` | Invoke runtime skill |
+| GET | `/api/skills-runtime/invocations/:id` | Get runtime skill invocation |
+| POST | `/api/skills-runtime/invocations/:id/cancel` | Cancel runtime skill invocation |
 | GET | `/api/routes/:id/logs` | View delivery log |
 | POST | `/api/routes/:id/test` | Test route connection |
 | GET | `/api/deliverables/:id/activity` | Deliverable activity timeline |
@@ -361,7 +425,7 @@ The built-in Task Dispatcher is a background service that automatically executes
 **How it works:**
 1. Polls for eligible tasks on a configurable interval (default: 30 seconds)
 2. Checks agent capacity (`active_task_count < max_concurrent_tasks`)
-3. Gathers full task context (project knowledge, previous deliverables, feedback)
+3. Gathers full task context (project context, previous deliverables, feedback)
 4. Executes via the agent's configured AI provider
 5. Creates a deliverable from the response and sets task to `review`
 6. Handles revision chains automatically — when re-executing a task sent back for revision, links the new deliverable to the previous version via `parent_id` and marks the old one as `revised`
@@ -510,6 +574,9 @@ All configuration is via environment variables in `.env`. See [`.env.example`](.
 | `SESSION_SECRET` | Preferred secret for encryption key derivation (takes priority over `JWT_SECRET`) | Falls back to `JWT_SECRET` | Recommended (prod) |
 | `API_KEY_PREFIX` | Prefix for agent API keys | `cav_ak` | No |
 | `RATE_LIMIT_API` | Max API requests per minute | `300` | No |
+| `RATE_LIMIT_API_ALLOWLIST` | Comma-separated client IPs or CIDR ranges that bypass the general API limiter | — | No |
+
+> `RATE_LIMIT_API_ALLOWLIST` uses the resolved client IP, so set `TRUST_PROXY` correctly when running behind nginx, Cloudflare, or another reverse proxy. When proxy trust is enabled, Cavendo honors `CF-Connecting-IP`, `True-Client-IP`, and `X-Forwarded-For` in that order. Example: `RATE_LIMIT_API_ALLOWLIST=203.0.113.10,198.51.100.0/24`
 
 ### Encryption
 

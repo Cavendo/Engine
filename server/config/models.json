@@ -4,26 +4,29 @@
       "name": "Anthropic (Claude)",
       "models": [
         {
-          "id": "claude-opus-4-6",
-          "name": "Claude Opus 4.6",
+          "id": "claude-opus",
+          "api_model": "claude-opus-4-6",
+          "name": "Claude Opus",
           "description": "Most capable model for complex tasks",
-          "maxTokens": 32000,
-          "contextWindow": 200000
+          "maxTokens": null,
+          "contextWindow": null
         },
         {
-          "id": "claude-sonnet-4-5-20250929",
-          "name": "Claude Sonnet 4.5",
+          "id": "claude-sonnet",
+          "api_model": "claude-sonnet-4-6",
+          "name": "Claude Sonnet",
           "description": "Best balance of speed and intelligence",
-          "maxTokens": 8192,
-          "contextWindow": 200000,
+          "maxTokens": null,
+          "contextWindow": null,
           "default": true
         },
         {
-          "id": "claude-haiku-4-5-20251001",
-          "name": "Claude Haiku 4.5",
+          "id": "claude-haiku",
+          "api_model": "claude-haiku-4-5",
+          "name": "Claude Haiku",
           "description": "Fast and cost-effective for simpler tasks",
-          "maxTokens": 8192,
-          "contextWindow": 200000
+          "maxTokens": null,
+          "contextWindow": null
         }
       ]
     },
@@ -31,32 +34,20 @@
       "name": "OpenAI (GPT)",
       "models": [
         {
-          "id": "gpt-4o",
-          "name": "GPT-4o",
-          "description": "Most capable GPT model",
-          "maxTokens": 16384,
-          "contextWindow": 128000,
+          "id": "gpt-4-1",
+          "api_model": "gpt-4.1",
+          "name": "GPT-4.1",
+          "description": "High-quality model for precision tasks",
+          "maxTokens": 32768,
+          "contextWindow": 1047576,
           "default": true
         },
         {
-          "id": "gpt-4o-mini",
-          "name": "GPT-4o Mini",
-          "description": "Fast and affordable for simpler tasks",
-          "maxTokens": 16384,
-          "contextWindow": 128000
-        },
-        {
-          "id": "gpt-4-turbo",
-          "name": "GPT-4 Turbo",
-          "description": "High intelligence with vision capabilities",
-          "maxTokens": 4096,
-          "contextWindow": 128000
-        },
-        {
-          "id": "o3-mini",
-          "name": "o3-mini",
-          "description": "Fast reasoning model",
-          "maxTokens": 16384,
+          "id": "o4-mini",
+          "api_model": "o4-mini",
+          "name": "o4-mini",
+          "description": "Cost-efficient reasoning model",
+          "maxTokens": 100000,
           "contextWindow": 200000
         }
       ]
@@ -65,26 +56,37 @@
       "name": "Google (Gemini)",
       "models": [
         {
-          "id": "gemini-2.5-pro",
-          "name": "Gemini 2.5 Pro",
+          "id": "gemini-pro",
+          "api_model": "gemini-2.5-pro",
+          "name": "Gemini Pro",
           "description": "Most capable Gemini model",
-          "maxTokens": 8192,
+          "maxTokens": 65536,
           "contextWindow": 1048576,
           "default": true
         },
         {
-          "id": "gemini-2.5-flash",
-          "name": "Gemini 2.5 Flash",
+          "id": "gemini-flash",
+          "api_model": "gemini-2.5-flash",
+          "name": "Gemini Flash",
           "description": "Fast and efficient Gemini model",
-          "maxTokens": 8192,
+          "maxTokens": 65536,
           "contextWindow": 1048576
         },
         {
-          "id": "gemini-1.5-pro",
-          "name": "Gemini 1.5 Pro",
-          "description": "Long-context Gemini model",
-          "maxTokens": 8192,
-          "contextWindow": 2097152
+          "id": "gemini-flash-lite",
+          "api_model": "gemini-2.5-flash-lite",
+          "name": "Gemini Flash-Lite",
+          "description": "Smallest and most cost-effective Gemini model",
+          "maxTokens": 65536,
+          "contextWindow": 1048576
+        },
+        {
+          "id": "gemini-image",
+          "api_model": "gemini-3.1-flash-image-preview",
+          "name": "Gemini Image",
+          "description": "Image generation model (image-only routing)",
+          "maxTokens": 32768,
+          "contextWindow": 131072
         }
       ]
     },

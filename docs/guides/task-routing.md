@@ -273,7 +273,7 @@ When task execution fails, the dispatcher uses category-based cooldowns before r
 | `timeout` | 10 minutes | Provider took too long to respond |
 | `overloaded` | 10 minutes | Provider returned 503/529 |
 | `rate_limited` | 60 minutes | Provider quota hit |
-| `quota_exceeded` | 6 hours | Billing/plan issue with provider |
+| `quota_exceeded` | 6 hours | Provider quota or plan limit |
 | `bad_request` | 6 hours | Malformed prompt or unsupported model |
 | `unknown` | 6 hours | Unexpected errors |
 

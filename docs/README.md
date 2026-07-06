@@ -21,8 +21,9 @@ Welcome to the Cavendo Engine documentation. Cavendo Engine is an open-source ag
 
 ### Guides
 - [Agent Management](./agent-management.md) - Registering and managing AI agents
+- [External Employees](./external-agents.md) - External worker lease, heartbeat, and result flow
 - [Webhooks](./guides/webhooks.md) - Real-time event notifications
-- [Knowledge Base](./guides/knowledge.md) - Adding project context for agents
+- [Context](./guides/knowledge.md) - Adding project context for agents
 
 ### Integrations
 - [MCP Server](./integrations/mcp.md) - Model Context Protocol integration

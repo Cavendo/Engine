@@ -2,7 +2,11 @@
 
 MCP (Model Context Protocol) server for Cavendo Engine - an AI agent workflow platform.
 
-This server allows AI agents (like Claude) to interact with Cavendo Engine to receive tasks, submit deliverables, access knowledge bases, and manage their workflow.
+This server allows AI agents such as Claude to interact with Cavendo Engine to receive tasks, submit deliverables, access task context, and manage their workflow.
+
+Use this MCP server for interactive or locally hosted assistants.
+
+If you are implementing a first-class external employee that should continuously poll work, claim leases, heartbeat while running, and push results back into Cavendo, use the HTTP external worker contract documented in [`engine/docs/external-agents.md`](../../docs/external-agents.md). A local runtime can use both MCP and the HTTP API together.
 
 ## Installation
 
@@ -102,7 +106,7 @@ Get the highest-priority unstarted task from the queue. This is the recommended 
 **Parameters:** None
 
 #### `cavendo_get_task_context`
-Get the full context bundle for a task, including task details, project information, relevant knowledge documents, related tasks, existing deliverables, and task history.
+Get the full context bundle for a task, including task details, project information, relevant context documents, related tasks, existing deliverables, and task history.
 
 **Parameters:**
 - `taskId` (required): The ID of the task to get context for
@@ -180,10 +184,10 @@ Submit a revised version of a deliverable.
 - `contentType` (optional): New content type (`markdown`, `html`, `json`, `text`, `code`)
 - `metadata` (optional): Additional metadata for the revision
 
-### Knowledge Base
+### Context Search
 
 #### `cavendo_search_knowledge`
-Search the Cavendo knowledge base for relevant documentation, guidelines, references, or examples.
+Search the Cavendo context library for relevant documentation, guidelines, references, or examples.
 
 **Parameters:**
 - `query` (required): Search query
@@ -206,7 +210,7 @@ All tasks currently assigned to this agent, grouped by status.
 ### Resource Templates
 
 #### `cavendo://projects/{id}/knowledge`
-Knowledge documents for a specific project. Replace `{id}` with the project ID.
+Project context documents for a specific project. Replace `{id}` with the project ID.
 
 ## Example Usage
 
@@ -226,7 +230,7 @@ Here's a typical workflow for an AI agent using this server:
    Use cavendo_log_progress to show incremental progress
 
 5. Search for information:
-   Use cavendo_search_knowledge to find relevant documentation
+   Use cavendo_search_knowledge to find relevant project or shared context
 
 6. Submit deliverables:
    Use cavendo_submit_deliverable for each work product
@@ -247,6 +251,32 @@ The server provides clear error messages for common issues:
 - **API errors**: Network issues or API errors include status codes and messages
 - **Not found errors**: Clear messages when tasks, deliverables, or projects don't exist
 - **Permission errors**: Messages when the agent doesn't have access to a resource
+
+## External Employees vs MCP
+
+Use MCP when:
+
+- a human is steering the assistant
+- the runtime is primarily local and interactive
+- the assistant needs to browse Cavendo data conversationally
+
+Use the HTTP external worker flow when:
+
+- the runtime should poll for work continuously
+- the worker must claim execution leases
+- the worker must heartbeat while running
+- the worker must submit final task results back into Cavendo
+
+Recommended external worker flow:
+
+1. `POST /api/agents/me/tasks/poll`
+2. `POST /api/agents/me/tasks/:taskId/claim`
+3. `GET /api/tasks/:taskId/context`
+4. `POST /api/agents/me/tasks/:taskId/heartbeat`
+5. `POST /api/tasks/:taskId/external-status`
+6. `POST /api/tasks/:taskId/result`
+
+See [`engine/docs/external-agents.md`](../../docs/external-agents.md) for payloads, lifecycle states, and heartbeat guidance.
 
 ## Development
 
@@ -281,18 +311,23 @@ This server communicates with the following Cavendo Engine API endpoints:
 | `/api/agents/me` | GET | Get current agent info |
 | `/api/agents/me/tasks` | GET | List assigned tasks |
 | `/api/agents/me/tasks/next` | GET | Get next task from queue |
+| `/api/agents/me/tasks/poll` | POST | Poll assigned work for an external employee |
+| `/api/agents/me/tasks/:taskId/claim` | POST | Claim an execution lease |
+| `/api/agents/me/tasks/:taskId/heartbeat` | POST | Renew an external task lease |
 | `/api/tasks` | POST | Create new task |
 | `/api/tasks/:id/context` | GET | Get task context bundle |
 | `/api/tasks/:id/status` | PATCH | Update task status |
 | `/api/tasks/:id/progress` | POST | Log progress update |
+| `/api/tasks/:id/external-status` | POST | Publish external execution state |
+| `/api/tasks/:id/result` | POST | Submit an external worker result |
 | `/api/tasks/:id/claim` | POST | Claim task |
 | `/api/deliverables` | POST | Submit deliverable |
 | `/api/deliverables/:id/feedback` | GET | Get revision feedback |
 | `/api/deliverables/:id/revision` | POST | Submit revision |
-| `/api/knowledge/search` | GET | Search knowledge base |
+| `/api/knowledge/search` | GET | Search the context library |
 | `/api/projects` | GET | List projects |
 | `/api/projects/:id` | GET | Get project details |
-| `/api/projects/:id/knowledge` | GET | Get project knowledge |
+| `/api/projects/:id/knowledge` | GET | Get project context |
 
 All endpoints require the `X-Agent-Key` header for authentication.
 

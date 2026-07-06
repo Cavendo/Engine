@@ -1,0 +1,2 @@
+ALTER TABLE tasks ADD COLUMN created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE tasks ADD COLUMN created_by_agent_id INTEGER REFERENCES agents(id) ON DELETE SET NULL;

@@ -11,14 +11,17 @@ function jsonResponse(status, payload) {
 describe('HttpWorkerAdapter worker v1 contract', () => {
   const originalFetch = global.fetch;
   const originalRetries = process.env.SKILLS_MAX_PROVIDER_RETRIES;
+  const originalSecret = process.env.SKILLS_WORKER_HMAC_SECRET;
 
   beforeEach(() => {
     process.env.SKILLS_MAX_PROVIDER_RETRIES = '0';
+    process.env.SKILLS_WORKER_HMAC_SECRET = 'test-hmac-secret';
   });
 
   afterEach(() => {
     global.fetch = originalFetch;
     process.env.SKILLS_MAX_PROVIDER_RETRIES = originalRetries;
+    process.env.SKILLS_WORKER_HMAC_SECRET = originalSecret;
   });
 
   test('maps invoke request to skill.id + run_context + limits.timeout_seconds', async () => {
@@ -41,6 +44,19 @@ describe('HttpWorkerAdapter worker v1 contract', () => {
       inputs: { target: 'example.com' },
       context_data: { workflow_run_id: 'wr_123', workflow_step_id: 'wrs_55', task_id: 901 },
       connector_bindings: { 'google:gsc': 'none', 'google:psi': 'managed' },
+      connector_binding_details: {
+        'google:psi': { binding: 'managed', managed_connector_id: 77 }
+      },
+      connector_resolutions: {
+        'google:psi': {
+          connector_id: 'google:psi',
+          binding: 'managed',
+          source: 'managed_connector',
+          ready: true,
+          config: { endpoint: 'https://psi.googleapis.com' },
+          credentials: { api_key: 'managed-key' }
+        }
+      },
       timeout_ms: 600000,
       idempotency_key: 'user:user:17:key_abc',
       actor: { type: 'user', id: 'user:17' },
@@ -49,6 +65,9 @@ describe('HttpWorkerAdapter worker v1 contract', () => {
 
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toBe('http://worker.local/v1/jobs');
+    expect(calls[0].options.headers['X-Skills-Timestamp']).toBeTruthy();
+    expect(calls[0].options.headers['X-Skills-Request-Id']).toBeTruthy();
+    expect(calls[0].options.headers['X-Skills-Signature']).toBeTruthy();
     const body = JSON.parse(calls[0].options.body);
     expect(body).toMatchObject({
       request_id: 'user:user:17:key_abc',
@@ -66,6 +85,19 @@ describe('HttpWorkerAdapter worker v1 contract', () => {
     });
     expect(body.limits).toEqual({ timeout_seconds: 600 });
     expect(body.connector_bindings).toEqual({ 'google:gsc': 'none', 'google:psi': 'managed' });
+    expect(body.connector_binding_details).toEqual({
+      'google:psi': { binding: 'managed', managed_connector_id: 77 }
+    });
+    expect(body.connector_resolutions).toEqual({
+      'google:psi': {
+        connector_id: 'google:psi',
+        binding: 'managed',
+        source: 'managed_connector',
+        ready: true,
+        config: { endpoint: 'https://psi.googleapis.com' },
+        credentials: { api_key: 'managed-key' }
+      }
+    });
   });
 
   test('invoke requires job_id in response', async () => {
@@ -174,6 +206,58 @@ describe('HttpWorkerAdapter worker v1 contract', () => {
     const adapter = new HttpWorkerAdapter('http://worker.local');
     await expect(adapter.getInvocation('job_123')).rejects.toMatchObject({
       code: 'UPSTREAM_ERROR'
+    });
+  });
+
+  test('worker string error bodies are preserved for 4xx responses', async () => {
+    global.fetch = jest.fn(async () => jsonResponse(422, {
+      error: '[{"path":["skill","version"],"message":"Required"}]'
+    }));
+    const adapter = new HttpWorkerAdapter('http://worker.local');
+    await expect(adapter.invoke({
+      skill_key: 'gbp_performance',
+      skill_version: '1.0.0',
+      workspace_id: 9,
+      inputs: {},
+      idempotency_key: 'key-1'
+    })).rejects.toMatchObject({
+      code: 'UPSTREAM_ERROR',
+      message: '[{"path":["skill","version"],"message":"Required"}]',
+      details: { status: 422 }
+    });
+  });
+
+  test('canonicalizes known connector aliases before sending worker jobs', async () => {
+    const calls = [];
+    global.fetch = jest.fn(async (url, options) => {
+      calls.push({ url, options });
+      return jsonResponse(200, {
+        job_id: 'job_gbp',
+        status: 'queued',
+        outputs: null,
+        artifacts: []
+      });
+    });
+
+    const adapter = new HttpWorkerAdapter('http://worker.local');
+    await adapter.invoke({
+      skill_key: 'gbp_performance',
+      skill_version: '1.0.0',
+      workspace_id: 9,
+      inputs: {},
+      connector_bindings: { googleBusinessProfile: 'workspace' },
+      connector_binding_details: { googleBusinessProfile: { binding: 'workspace', workspace_connector_id: 44 } },
+      connector_resolutions: { googleBusinessProfile: { ready: true, credentials: { access_token: 'token' } } },
+      idempotency_key: 'key-gbp'
+    });
+
+    const body = JSON.parse(calls[0].options.body);
+    expect(body.connector_bindings).toEqual({ google_business_profile: 'workspace' });
+    expect(body.connector_binding_details).toEqual({
+      google_business_profile: { binding: 'workspace', workspace_connector_id: 44 }
+    });
+    expect(body.connector_resolutions).toEqual({
+      google_business_profile: { ready: true, credentials: { access_token: 'token' } }
     });
   });
 

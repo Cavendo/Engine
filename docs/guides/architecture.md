@@ -403,7 +403,7 @@ Four async lifecycle hooks allow external code to extend the startup sequence:
 | `beforeStart(app)` | After DB init, before HTTP listen | Extra data seeding |
 | `onStarted({ app, server })` | After server is listening | Post-startup tasks (fatal on throw) |
 
-This enables downstream projects (e.g., Cavendo Cloud) to import Engine as a subtree and layer additional routes via `afterRoutes` without forking the codebase.
+This enables downstream deployments to import Engine as a subtree and layer additional routes via `afterRoutes` without forking the codebase.
 
 **Known limitation:** `stop()` closes the SQLite connection (`better-sqlite3` singleton), which is terminal. Restart requires a new process.
 
@@ -433,10 +433,10 @@ Routes support multiple email providers:
 - AWS S3
 - DigitalOcean Spaces
 - MinIO
-- Cloudflare R2
+- S3-compatible object storage
 
 ### Database Adapters (Future)
 
-- SQLite (default, OSS)
-- MySQL (Cloud)
-- PostgreSQL (Cloud)
+- SQLite (default)
+- MySQL
+- PostgreSQL

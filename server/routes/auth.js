@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import db from '../db/adapter.js';
-import { hashPassword, verifyPassword, generateSessionToken } from '../utils/crypto.js';
+import { hashPassword, verifyPassword, generateSessionToken, hashSessionToken } from '../utils/crypto.js';
+import { getClientIp as resolveClientIp } from '../utils/clientIp.js';
 import * as response from '../utils/response.js';
 import { userAuth } from '../middleware/userAuth.js';
 import { authLimiter, setCsrfToken, clearCsrfToken } from '../middleware/security.js';
@@ -8,7 +9,72 @@ import { validateBody, loginSchema, changePasswordSchema } from '../utils/valida
 
 const router = Router();
 
-const SESSION_DURATION_HOURS = 24 * 7; // 7 days
+const SESSION_DURATION_HOURS = parseInt(process.env.SESSION_DURATION_HOURS || '', 10) || (24 * 7); // 7 days
+const MAX_SESSIONS_PER_USER = Math.max(1, parseInt(process.env.MAX_SESSIONS_PER_USER || '', 10) || 10);
+
+function getSessionCookieOptions() {
+  return {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    maxAge: SESSION_DURATION_HOURS * 60 * 60 * 1000,
+    path: '/'
+  };
+}
+
+function getSessionCookieClearOptions() {
+  return {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/'
+  };
+}
+
+function getClientIp(req) {
+  return resolveClientIp(req).slice(0, 255);
+}
+
+function getUserAgent(req) {
+  return String(req.headers['user-agent'] || '').slice(0, 512) || null;
+}
+
+async function createUserSession(userId, req) {
+  const sessionToken = generateSessionToken();
+  const sessionHash = hashSessionToken(sessionToken);
+  const sessionRecordId = generateSessionToken();
+  const expiresAt = new Date(Date.now() + SESSION_DURATION_HOURS * 60 * 60 * 1000).toISOString();
+
+  await db.exec(`
+    INSERT INTO sessions (id, user_id, token_hash, expires_at, last_activity_at, user_agent, ip_address)
+    VALUES (?, ?, ?, ?, datetime('now'), ?, ?)
+  `, [sessionRecordId, userId, sessionHash, expiresAt, getUserAgent(req), getClientIp(req)]);
+
+  // Keep recent sessions per user and prune old ones.
+  const existingSessions = await db.many(`
+    SELECT id
+    FROM sessions
+    WHERE user_id = ?
+    ORDER BY created_at DESC
+  `, [userId]);
+
+  const staleSessionIds = existingSessions.slice(MAX_SESSIONS_PER_USER).map(row => row.id);
+  for (const staleId of staleSessionIds) {
+    await db.exec('DELETE FROM sessions WHERE id = ?', [staleId]);
+  }
+
+  return { sessionToken, expiresAt };
+}
+
+async function deleteSessionByCookieToken(cookieToken) {
+  const token = String(cookieToken || '');
+  if (!token) return;
+  const tokenHash = hashSessionToken(token);
+  await db.exec(`
+    DELETE FROM sessions
+    WHERE token_hash = ? OR (token_hash IS NULL AND id = ?)
+  `, [tokenHash, token]);
+}
 
 /**
  * POST /api/auth/login
@@ -38,20 +104,7 @@ router.post('/login', authLimiter, validateBody(loginSchema), async (req, res) =
       return response.unauthorized(res, 'Invalid email or password');
     }
 
-    // Session regeneration: Delete any existing sessions for this user
-    // This prevents session fixation and ensures fresh session on login
-    await db.exec(`
-      DELETE FROM sessions WHERE user_id = ?
-    `, [user.id]);
-
-    // Create new session with cryptographically random ID
-    const sessionId = generateSessionToken();
-    const expiresAt = new Date(Date.now() + SESSION_DURATION_HOURS * 60 * 60 * 1000).toISOString();
-
-    await db.exec(`
-      INSERT INTO sessions (id, user_id, expires_at)
-      VALUES (?, ?, ?)
-    `, [sessionId, user.id, expiresAt]);
+    const { sessionToken, expiresAt } = await createUserSession(user.id, req);
 
     // Update last login
     await db.exec(`
@@ -59,12 +112,7 @@ router.post('/login', authLimiter, validateBody(loginSchema), async (req, res) =
     `, [user.id]);
 
     // Set session cookie
-    res.cookie('session', sessionId, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax',
-      maxAge: SESSION_DURATION_HOURS * 60 * 60 * 1000
-    });
+    res.cookie('session', sessionToken, getSessionCookieOptions());
 
     // Set CSRF token
     const csrfToken = setCsrfToken(res);
@@ -91,11 +139,11 @@ router.post('/login', authLimiter, validateBody(loginSchema), async (req, res) =
  * Logout current session
  */
 router.post('/logout', async (req, res) => {
-  const sessionId = req.cookies?.session;
+  const cookieToken = req.cookies?.session;
 
-  if (sessionId) {
-    await db.exec('DELETE FROM sessions WHERE id = ?', [sessionId]);
-    res.clearCookie('session');
+  if (cookieToken) {
+    await deleteSessionByCookieToken(cookieToken);
+    res.clearCookie('session', getSessionCookieClearOptions());
   }
 
   // Clear CSRF token
@@ -148,15 +196,18 @@ router.post('/change-password', userAuth, validateBody(changePasswordSchema), as
       WHERE id = ?
     `, [newHash, req.user.id]);
 
-    // Invalidate all other sessions
-    await db.exec(`
-      DELETE FROM sessions WHERE user_id = ? AND id != ?
-    `, [req.user.id, req.cookies?.session]);
+    // Rotate current session and invalidate all existing sessions for this user.
+    await db.exec('DELETE FROM sessions WHERE user_id = ?', [req.user.id]);
+    const { sessionToken, expiresAt } = await createUserSession(req.user.id, req);
+    res.cookie('session', sessionToken, getSessionCookieOptions());
+    const csrfToken = setCsrfToken(res);
 
     // Return updated user so frontend can refresh auth state
     const updated = await db.one('SELECT id, email, name, role, force_password_change FROM users WHERE id = ?', [req.user.id]);
     response.success(res, {
       passwordChanged: true,
+      expiresAt,
+      csrfToken,
       user: {
         id: updated.id,
         email: updated.email,

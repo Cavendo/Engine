@@ -2,8 +2,8 @@ import { Router } from 'express';
 import db from '../db/adapter.js';
 import { generateApiKey, generateWebhookSecret, encrypt, decrypt } from '../utils/crypto.js';
 import * as response from '../utils/response.js';
-import { userAuth, requireRoles } from '../middleware/userAuth.js';
-import { agentAuth } from '../middleware/agentAuth.js';
+import { requireRoles } from '../middleware/userAuth.js';
+import { agentAuth, dualAuth } from '../middleware/agentAuth.js';
 import { keyGenLimiter } from '../middleware/security.js';
 import { dispatchEvent } from '../services/routeDispatcher.js';
 import {
@@ -13,7 +13,10 @@ import {
   generateKeySchema,
   matchAgentsSchema,
   updateAgentOwnerSchema,
-  updateAgentExecutionSchema
+  updateAgentExecutionSchema,
+  claimTaskLeaseSchema,
+  taskLeaseHeartbeatSchema,
+  releaseTaskLeaseSchema
 } from '../utils/validation.js';
 import { validateProviderBaseUrl, resolveBaseUrl } from '../utils/providerEndpoint.js';
 import {
@@ -23,6 +26,14 @@ import {
 } from '../utils/routeHelpers.js';
 
 const router = Router();
+
+async function resolvePublicScope() {
+  return null;
+}
+
+async function requireScopedAgent() {
+  return { scope: null, scoped: false };
+}
 
 /**
  * Convert SQLite timestamp to ISO 8601 format
@@ -34,6 +45,12 @@ function toISOTimestamp(timestamp) {
 
 function agentDateBucket(column) {
   return dateBucketExpression(column, db.dialect);
+}
+
+function hasRunnableProviderSetup(agent) {
+  const provider = String(agent?.provider || '').trim().toLowerCase();
+  if (!provider) return false;
+  return provider === 'openai_compatible' || Boolean(agent?.provider_api_key_encrypted);
 }
 
 /**
@@ -56,6 +73,7 @@ function normalizeAgentTimestamps(agent) {
     project_access: safeJsonParse(agent.project_access, ['*']),
     task_types: safeJsonParse(agent.task_types, ['*']),
     has_api_key: !!(provider_api_key_encrypted),
+    has_runnable_provider_setup: hasRunnableProviderSetup(agent),
     provider_base_url: agent.provider_base_url || null,
     provider_label: agent.provider_label || null,
     created_at: toISOTimestamp(agent.created_at),
@@ -90,7 +108,10 @@ function normalizeTaskTimestamps(task) {
     due_date: toISOTimestamp(task.due_date),
     completed_at: toISOTimestamp(task.completed_at),
     assigned_at: toISOTimestamp(task.assigned_at),
-    started_at: toISOTimestamp(task.started_at)
+    started_at: toISOTimestamp(task.started_at),
+    agent_claimed_at: toISOTimestamp(task.agent_claimed_at),
+    agent_claim_expires_at: toISOTimestamp(task.agent_claim_expires_at),
+    agent_last_heartbeat_at: toISOTimestamp(task.agent_last_heartbeat_at)
   };
 }
 
@@ -107,6 +128,159 @@ function parseAgentJsonFields(agent) {
     project_access: safeJsonParse(agent.project_access, ['*']),
     task_types: safeJsonParse(agent.task_types, ['*'])
   };
+}
+
+function normalizeAgentProjectAccessForSync(rawProjectAccess) {
+  if (Array.isArray(rawProjectAccess)) {
+    const values = rawProjectAccess.map((entry) => String(entry || '').trim()).filter(Boolean);
+    if (values.length === 0) return ['*'];
+    if (values.some((entry) => entry === '*')) return ['*'];
+    return Array.from(new Set(values));
+  }
+  return ['*'];
+}
+
+async function assertRuntimeLockAllowed() {
+  return null;
+}
+
+function normalizeRuntimeLockPayload(value) {
+  const raw = value && typeof value === 'object' ? value : null;
+  if (!raw) return null;
+  const primaryProvider = String(raw.primaryProvider || raw.primary_provider || '').trim().toLowerCase();
+  const primaryModel = String(raw.primaryModel || raw.primary_model || '').trim();
+  const fallbackProvider = String(raw.fallbackProvider || raw.fallback_provider || '').trim().toLowerCase();
+  const fallbackModel = String(raw.fallbackModel || raw.fallback_model || '').trim();
+  if (!primaryProvider || !primaryModel) return null;
+  return {
+    primary_provider: primaryProvider,
+    primary_model: primaryModel,
+    fallback_provider: fallbackProvider && fallbackModel ? fallbackProvider : null,
+    fallback_model: fallbackProvider && fallbackModel ? fallbackModel : null,
+  };
+}
+
+function applyRuntimeLockMetadata(existingMetadata, runtimeLock) {
+  const metadata = existingMetadata && typeof existingMetadata === 'object' ? { ...existingMetadata } : {};
+  if (!runtimeLock) {
+    delete metadata.runtime_lock;
+    delete metadata.runtimeLock;
+    return Object.keys(metadata).length > 0 ? metadata : null;
+  }
+  metadata.runtime_lock = runtimeLock;
+  delete metadata.runtimeLock;
+  return metadata;
+}
+
+const DEFAULT_EXTERNAL_LEASE_SECONDS = Math.max(30, Math.min(3600, Number.parseInt(process.env.EXTERNAL_AGENT_LEASE_SECONDS || '300', 10) || 300));
+
+function getExternalAgentConfig(agent) {
+  const metadata = safeJsonParse(agent?.metadata, {});
+  const external = metadata?.external_agent || metadata?.externalAgent || null;
+  if (!external || typeof external !== 'object') return null;
+  return external;
+}
+
+function getAgentLeaseSeconds(agent, requestedLeaseSeconds = null) {
+  const external = getExternalAgentConfig(agent);
+  const configured = Number.parseInt(
+    String(
+      requestedLeaseSeconds
+      ?? external?.heartbeat_timeout_seconds
+      ?? external?.heartbeatTimeoutSeconds
+      ?? external?.lease_timeout_seconds
+      ?? external?.leaseTimeoutSeconds
+      ?? DEFAULT_EXTERNAL_LEASE_SECONDS
+    ),
+    10
+  );
+  if (!Number.isInteger(configured)) return DEFAULT_EXTERNAL_LEASE_SECONDS;
+  return Math.max(30, Math.min(3600, configured));
+}
+
+function buildTaskClaimantId(agentActor) {
+  const agentId = agentActor?.id ? `agent:${agentActor.id}` : 'agent:unknown';
+  const keyId = agentActor?.keyId ? `key:${agentActor.keyId}` : 'key:session';
+  return `${agentId}:${keyId}`;
+}
+
+function taskClaimMatchesActor(task, agentActor, runtimeAgentId = null) {
+  const storedClaimant = String(task?.agent_claimed_by || '').trim();
+  if (!storedClaimant) return false;
+
+  const claimantId = buildTaskClaimantId(agentActor);
+  if (storedClaimant === claimantId) return true;
+
+  const effectiveAgentId = Number(runtimeAgentId || agentActor?.id || 0);
+  if (!agentActor?.isUserKey || !Number.isInteger(effectiveAgentId) || effectiveAgentId <= 0) {
+    return false;
+  }
+
+  const canonicalAgentPrefix = `agent:${effectiveAgentId}`;
+  return storedClaimant === canonicalAgentPrefix || storedClaimant.startsWith(`${canonicalAgentPrefix}:`);
+}
+
+async function resolveExternalRuntimeActor(agentActor, preferredAgentId = null) {
+  if (!agentActor?.isUserKey) {
+    const runtimeAgent = await db.one(`
+      SELECT id, name, execution_mode, metadata, owner_user_id
+      FROM agents
+      WHERE id = ?
+    `, [agentActor?.id]);
+    if (!runtimeAgent) return null;
+    return {
+      runtimeAgent,
+      authActor: agentActor
+    };
+  }
+
+  const ownedAgents = await db.many(`
+    SELECT id, name, execution_mode, metadata, owner_user_id
+    FROM agents
+    WHERE owner_user_id = ?
+      AND status = 'active'
+    ORDER BY
+      CASE WHEN execution_mode = 'polling' THEN 0 ELSE 1 END,
+      id ASC
+  `, [agentActor.userId]);
+
+  const candidates = ownedAgents.filter((agent) => (
+    String(agent.execution_mode || '').toLowerCase() === 'polling' || Boolean(getExternalAgentConfig(agent))
+  ));
+
+  const runtimeAgent = preferredAgentId
+    ? candidates.find((agent) => Number(agent.id) === Number(preferredAgentId))
+    : (candidates[0] || null);
+
+  if (!runtimeAgent) return null;
+
+  return {
+    runtimeAgent,
+    authActor: {
+      ...agentActor,
+      id: runtimeAgent.id,
+      name: runtimeAgent.name,
+      ownerUserId: runtimeAgent.owner_user_id || agentActor.userId
+    }
+  };
+}
+
+async function updateExternalAgentMetadata(agentId, applyUpdate) {
+  if (!agentId) return null;
+  const agent = await db.one('SELECT id, metadata FROM agents WHERE id = ?', [agentId]);
+  if (!agent) return null;
+  const metadata = safeJsonParse(agent.metadata, {}) || {};
+  const nextExternal = {
+    ...(metadata.external_agent || metadata.externalAgent || {}),
+  };
+  applyUpdate(nextExternal, metadata);
+  metadata.external_agent = nextExternal;
+  delete metadata.externalAgent;
+  await db.exec(
+    `UPDATE agents SET metadata = ?, updated_at = datetime('now') WHERE id = ?`,
+    [JSON.stringify(metadata), agentId]
+  );
+  return metadata.external_agent;
 }
 
 /**
@@ -437,6 +611,339 @@ router.get('/me/tasks/next', agentAuth, async (req, res) => {
   }
 });
 
+/**
+ * POST /api/agents/me/tasks/poll
+ * Return the next assigned task available for an external/polling worker.
+ * This is task-centric and does not claim the lease by itself.
+ */
+router.post('/me/tasks/poll', agentAuth, async (req, res) => {
+  try {
+    const runtime = await resolveExternalRuntimeActor(req.agent, req.body?.agentId || req.query?.agentId || null);
+    const agent = runtime?.runtimeAgent;
+
+    if (!agent) {
+      return response.notFound(res, 'External agent');
+    }
+
+    if (String(agent.execution_mode || '').toLowerCase() !== 'polling' && !getExternalAgentConfig(agent)) {
+      return response.forbidden(res, 'This worker is not configured for external polling');
+    }
+
+    const claimantId = buildTaskClaimantId(runtime.authActor);
+    const nowIso = new Date().toISOString();
+    const task = await db.one(`
+      SELECT
+        t.*,
+        p.name as project_name
+      FROM tasks t
+      LEFT JOIN projects p ON p.id = t.project_id
+      WHERE t.assigned_agent_id = ?
+        AND t.status IN ('pending', 'assigned', 'in_progress', 'blocked')
+        AND (
+          t.agent_claimed_by IS NULL
+          OR t.agent_claimed_by = ?
+          OR t.agent_claim_expires_at IS NULL
+          OR t.agent_claim_expires_at < datetime('now')
+        )
+      ORDER BY
+        CASE
+          WHEN t.status = 'assigned' THEN 0
+          WHEN t.status = 'pending' THEN 1
+          WHEN t.status = 'in_progress' THEN 2
+          ELSE 3
+        END,
+        t.priority ASC,
+        t.created_at ASC
+      LIMIT 1
+    `, [agent.id, claimantId]);
+
+    await updateExternalAgentMetadata(agent.id, (external) => {
+      external.status = 'connected';
+      external.lastSeenAt = nowIso;
+      external.lastPollAt = nowIso;
+      external.lastConnectionType = external?.connection_type || external?.connectionType || 'api';
+    });
+
+    const external = getExternalAgentConfig(agent);
+    if (!task) {
+      return response.success(res, {
+        task: null,
+        dispatch: {
+          runtime: external?.runtime_label || external?.runtimeLabel || 'Bring Your Own Agent',
+          connectionType: external?.connection_type || external?.connectionType || 'api',
+          allowedActions: external?.allowed_actions || external?.allowedActions || ['claim', 'heartbeat', 'progress', 'submit_result', 'request_review'],
+          policy: external?.policy || 'assigned_only'
+        },
+        reason: 'no_tasks'
+      });
+    }
+
+    return response.success(res, {
+      task: normalizeTaskTimestamps(task),
+      dispatch: {
+        runtime: external?.runtime_label || external?.runtimeLabel || 'Bring Your Own Agent',
+        connectionType: external?.connection_type || external?.connectionType || 'api',
+        allowedActions: external?.allowed_actions || external?.allowedActions || ['claim', 'heartbeat', 'progress', 'submit_result', 'request_review'],
+        policy: external?.policy || 'assigned_only',
+        contextUrl: `/api/tasks/${task.id}/context`,
+      }
+    });
+  } catch (err) {
+    console.error('Error polling external agent tasks:', err);
+    response.serverError(res);
+  }
+});
+
+/**
+ * POST /api/agents/me/tasks/:taskId/claim
+ * Claim an execution lease for an assigned task.
+ */
+router.post('/me/tasks/:taskId/claim', agentAuth, validateBody(claimTaskLeaseSchema), async (req, res) => {
+  try {
+    const taskId = Number.parseInt(req.params.taskId, 10);
+    if (!Number.isInteger(taskId) || taskId <= 0) {
+      return response.validationError(res, 'Invalid task ID');
+    }
+
+    const runtime = await resolveExternalRuntimeActor(req.agent, req.body?.agentId || req.query?.agentId || null);
+    const agent = runtime?.runtimeAgent;
+    if (!agent) {
+      return response.notFound(res, 'External agent');
+    }
+
+    const task = await db.one('SELECT * FROM tasks WHERE id = ?', [taskId]);
+    if (!task) return response.notFound(res, 'Task');
+    if (task.assigned_agent_id !== agent.id) {
+      return response.forbidden(res, 'Task not assigned to this agent');
+    }
+
+    if (String(agent?.execution_mode || '').toLowerCase() !== 'polling' && !getExternalAgentConfig(agent)) {
+      return response.forbidden(res, 'This worker is not configured for external polling');
+    }
+    const claimantId = buildTaskClaimantId(runtime.authActor);
+    const now = new Date();
+    const leaseSeconds = getAgentLeaseSeconds(agent, req.body?.leaseSeconds);
+    const expiresAt = new Date(now.getTime() + (leaseSeconds * 1000)).toISOString();
+    const currentClaimant = String(task.agent_claimed_by || '').trim();
+    const currentExpiry = task.agent_claim_expires_at ? new Date(task.agent_claim_expires_at) : null;
+    const claimIsActive = currentClaimant && currentExpiry && !Number.isNaN(currentExpiry.getTime()) && currentExpiry.getTime() > Date.now();
+
+    if (claimIsActive && !taskClaimMatchesActor(task, runtime.authActor, agent.id)) {
+      return res.status(409).json({
+        success: false,
+        error: {
+          code: 'TASK_ALREADY_CLAIMED',
+          message: 'Task is already claimed by another worker.'
+        }
+      });
+    }
+
+    const nextContext = safeJsonParse(task.context, {}) || {};
+    nextContext.externalExecution = {
+      ...(nextContext.externalExecution || {}),
+      leaseClaimedAt: now.toISOString(),
+      leaseExpiresAt: expiresAt,
+      claimantId,
+    };
+    if (req.body?.externalRunId) {
+      nextContext.externalExecution.externalRunId = req.body.externalRunId;
+    }
+
+    await db.exec(`
+      UPDATE tasks
+      SET agent_claimed_by = ?,
+          agent_claimed_at = ?,
+          agent_claim_expires_at = ?,
+          agent_last_heartbeat_at = ?,
+          external_execution_status = 'accepted',
+          external_run_id = COALESCE(?, external_run_id),
+          context = ?,
+          updated_at = datetime('now')
+      WHERE id = ?
+    `, [
+      claimantId,
+      now.toISOString(),
+      expiresAt,
+      now.toISOString(),
+      req.body?.externalRunId || null,
+      JSON.stringify(nextContext),
+      taskId
+    ]);
+
+    await updateExternalAgentMetadata(agent.id, (external) => {
+      external.status = 'connected';
+      external.lastSeenAt = now.toISOString();
+      external.lastClaimAt = now.toISOString();
+      external.lastHeartbeatAt = now.toISOString();
+      external.lastErrorAt = null;
+      external.lastErrorMessage = null;
+    });
+
+    const claimed = await db.one('SELECT * FROM tasks WHERE id = ?', [taskId]);
+    return response.success(res, {
+      task: normalizeTaskTimestamps(claimed),
+      lease: {
+        claimantId,
+        claimedAt: now.toISOString(),
+        expiresAt,
+        leaseSeconds
+      }
+    });
+  } catch (err) {
+    console.error('Error claiming external task lease:', err);
+    response.serverError(res);
+  }
+});
+
+/**
+ * POST /api/agents/me/tasks/:taskId/heartbeat
+ * Extend the lease for a claimed task and update worker heartbeat metadata.
+ */
+router.post('/me/tasks/:taskId/heartbeat', agentAuth, validateBody(taskLeaseHeartbeatSchema), async (req, res) => {
+  try {
+    const taskId = Number.parseInt(req.params.taskId, 10);
+    if (!Number.isInteger(taskId) || taskId <= 0) {
+      return response.validationError(res, 'Invalid task ID');
+    }
+
+    const runtime = await resolveExternalRuntimeActor(req.agent, req.body?.agentId || req.query?.agentId || null);
+    const agent = runtime?.runtimeAgent;
+    if (!agent) {
+      return response.notFound(res, 'External agent');
+    }
+
+    const task = await db.one('SELECT * FROM tasks WHERE id = ?', [taskId]);
+    if (!task) return response.notFound(res, 'Task');
+    if (task.assigned_agent_id !== agent.id) {
+      return response.forbidden(res, 'Task not assigned to this agent');
+    }
+
+    const claimantId = buildTaskClaimantId(runtime.authActor);
+    if (!taskClaimMatchesActor(task, runtime.authActor, agent.id)) {
+      return response.forbidden(res, 'Task lease is not claimed by this worker');
+    }
+
+    if (String(agent?.execution_mode || '').toLowerCase() !== 'polling' && !getExternalAgentConfig(agent)) {
+      return response.forbidden(res, 'This worker is not configured for external polling');
+    }
+    const now = new Date();
+    const leaseSeconds = getAgentLeaseSeconds(agent, req.body?.leaseSeconds);
+    const expiresAt = new Date(now.getTime() + (leaseSeconds * 1000)).toISOString();
+    const nextContext = safeJsonParse(task.context, {}) || {};
+    nextContext.externalExecution = {
+      ...(nextContext.externalExecution || {}),
+      claimantId,
+      leaseClaimedAt: nextContext.externalExecution?.leaseClaimedAt || task.agent_claimed_at || now.toISOString(),
+      leaseExpiresAt: expiresAt,
+      lastHeartbeatAt: now.toISOString(),
+    };
+    if (req.body?.statusMessage) {
+      nextContext.externalExecution.lastHeartbeatMessage = req.body.statusMessage;
+    }
+    if (req.body?.externalRunId) {
+      nextContext.externalExecution.externalRunId = req.body.externalRunId;
+    }
+
+    await db.exec(`
+      UPDATE tasks
+      SET agent_claim_expires_at = ?,
+          agent_last_heartbeat_at = ?,
+          external_run_id = COALESCE(?, external_run_id),
+          context = ?,
+          updated_at = datetime('now')
+      WHERE id = ?
+    `, [
+      expiresAt,
+      now.toISOString(),
+      req.body?.externalRunId || null,
+      JSON.stringify(nextContext),
+      taskId
+    ]);
+
+    await updateExternalAgentMetadata(agent.id, (external) => {
+      external.status = 'connected';
+      external.lastSeenAt = now.toISOString();
+      external.lastHeartbeatAt = now.toISOString();
+      if (req.body?.externalRunId) external.lastRunId = req.body.externalRunId;
+    });
+
+    return response.success(res, {
+      taskId,
+      heartbeatAt: now.toISOString(),
+      expiresAt,
+      leaseSeconds
+    });
+  } catch (err) {
+    console.error('Error heartbeating external task lease:', err);
+    response.serverError(res);
+  }
+});
+
+/**
+ * POST /api/agents/me/tasks/:taskId/release
+ * Release a claimed task lease without finishing the task.
+ */
+router.post('/me/tasks/:taskId/release', agentAuth, validateBody(releaseTaskLeaseSchema), async (req, res) => {
+  try {
+    const taskId = Number.parseInt(req.params.taskId, 10);
+    if (!Number.isInteger(taskId) || taskId <= 0) {
+      return response.validationError(res, 'Invalid task ID');
+    }
+
+    const runtime = await resolveExternalRuntimeActor(req.agent, req.body?.agentId || req.query?.agentId || null);
+    const agent = runtime?.runtimeAgent;
+    if (!agent) {
+      return response.notFound(res, 'External agent');
+    }
+
+    const task = await db.one('SELECT * FROM tasks WHERE id = ?', [taskId]);
+    if (!task) return response.notFound(res, 'Task');
+    if (task.assigned_agent_id !== agent.id) {
+      return response.forbidden(res, 'Task not assigned to this agent');
+    }
+
+    const claimantId = buildTaskClaimantId(runtime.authActor);
+    if (!taskClaimMatchesActor(task, runtime.authActor, agent.id)) {
+      return response.forbidden(res, 'Task lease is not claimed by this worker');
+    }
+
+    const nextContext = safeJsonParse(task.context, {}) || {};
+    nextContext.externalExecution = {
+      ...(nextContext.externalExecution || {}),
+      lastReleasedAt: new Date().toISOString(),
+      lastReleaseReason: req.body?.reason || null,
+      abandoned: Boolean(req.body?.abandon)
+    };
+
+    await db.exec(`
+      UPDATE tasks
+      SET agent_claimed_by = NULL,
+          agent_claimed_at = NULL,
+          agent_claim_expires_at = NULL,
+          external_execution_status = CASE
+            WHEN external_execution_status IN ('submitted', 'failed', 'canceled') THEN external_execution_status
+            ELSE 'queued'
+          END,
+          context = ?,
+          updated_at = datetime('now')
+      WHERE id = ?
+    `, [JSON.stringify(nextContext), taskId]);
+
+    await updateExternalAgentMetadata(agent.id, (external) => {
+      external.status = 'connected';
+      external.lastReleaseAt = new Date().toISOString();
+    });
+
+    return response.success(res, {
+      released: true,
+      taskId
+    });
+  } catch (err) {
+    console.error('Error releasing external task lease:', err);
+    response.serverError(res);
+  }
+});
+
 // ============================================
 // Provider Configuration Endpoint
 // This must come BEFORE /:id routes to avoid "providers" matching as an ID
@@ -446,7 +953,7 @@ router.get('/me/tasks/next', agentAuth, async (req, res) => {
  * GET /api/agents/providers
  * List supported providers and their models
  */
-router.get('/providers', userAuth, (req, res) => {
+router.get('/providers', dualAuth, (_req, res) => {
   response.success(res, PROVIDERS);
 });
 
@@ -459,7 +966,7 @@ router.get('/providers', userAuth, (req, res) => {
  * Advisory matching endpoint - returns list of matching agents with scores
  * Does not assign tasks, just provides recommendations
  */
-router.post('/match', userAuth, validateBody(matchAgentsSchema), async (req, res) => {
+router.post('/match', dualAuth, validateBody(matchAgentsSchema), async (req, res) => {
   try {
     const { tags = [], priority, metadata = {} } = req.body;
 
@@ -560,28 +1067,36 @@ router.post('/match', userAuth, validateBody(matchAgentsSchema), async (req, res
  *   - available: Only agents with capacity ('true')
  *   - business_line: Search in specializations.business_lines
  */
-router.get('/', userAuth, async (req, res) => {
+router.get('/', dualAuth, async (req, res) => {
   try {
+    if (req.agent && !req.agent.isUserKey) {
+      return response.forbidden(res, 'User session or user API key required');
+    }
+
     const { capability, status, available, business_line } = req.query;
 
     // Build query with filters
     let query = `
       SELECT
-        id, name, type, description, capabilities, specializations, metadata, status,
-        webhook_url, webhook_events, max_concurrent_tasks, active_task_count,
-        execution_mode, owner_user_id,
-        provider, provider_model, provider_base_url, provider_label,
-        provider_api_key_encrypted,
-        created_at, updated_at,
+        agents.id, agents.name, agents.type, agents.description, agents.capabilities, agents.specializations, agents.metadata, agents.status,
+        agents.webhook_url, agents.webhook_events, agents.max_concurrent_tasks, agents.active_task_count,
+        agents.execution_mode, agents.owner_user_id, agents.project_access,
+        u.is_agent_user AS owner_user_is_agent_user,
+        u.name AS owner_user_name,
+        u.email AS owner_user_email,
+        agents.provider, agents.provider_model, agents.provider_base_url, agents.provider_label,
+        agents.provider_api_key_encrypted,
+        agents.created_at, agents.updated_at,
         (SELECT COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0) FROM deliverables WHERE agent_id = agents.id) as total_tokens
       FROM agents
+      LEFT JOIN users u ON u.id = agents.owner_user_id
       WHERE 1=1
     `;
     const params = [];
 
     // Filter by status
     if (status) {
-      query += ' AND status = ?';
+      query += ' AND agents.status = ?';
       params.push(status);
     }
 
@@ -590,7 +1105,7 @@ router.get('/', userAuth, async (req, res) => {
       query += ' AND (max_concurrent_tasks IS NULL OR active_task_count < max_concurrent_tasks)';
     }
 
-    query += ' ORDER BY created_at DESC';
+    query += ' ORDER BY agents.created_at DESC';
 
     let agents = await db.many(query, params);
 
@@ -627,15 +1142,22 @@ router.get('/', userAuth, async (req, res) => {
  * POST /api/agents
  * Register a new agent
  */
-router.post('/', userAuth, requireRoles('admin'), validateBody(createAgentSchema), async (req, res) => {
+router.post('/', dualAuth, requireRoles('admin'), validateBody(createAgentSchema), async (req, res) => {
   try {
     const {
       name, type, description, capabilities, specializations, metadata, maxConcurrentTasks,
       agentType, specialization, projectAccess, taskTypes,
       // Optional execution fields (one-step create)
       provider, providerApiKey, providerModel, providerBaseUrl, providerLabel,
+      runtimeLock,
       systemPrompt, executionMode, maxTokens, temperature
     } = req.body;
+    const normalizedRuntimeLock = normalizeRuntimeLockPayload(runtimeLock);
+    const runtimeLockError = await assertRuntimeLockAllowed(null, normalizedRuntimeLock);
+    if (runtimeLockError) {
+      return response.forbidden(res, runtimeLockError);
+    }
+    const mergedMetadata = applyRuntimeLockMetadata(metadata, normalizedRuntimeLock);
 
     // Reject providerBaseUrl for openai provider (use openai_compatible instead)
     if (provider === 'openai' && providerBaseUrl) {
@@ -676,7 +1198,7 @@ router.post('/', userAuth, requireRoles('admin'), validateBody(createAgentSchema
       description || null,
       JSON.stringify(capabilities),
       specializations ? JSON.stringify(specializations) : null,
-      metadata ? JSON.stringify(metadata) : null,
+      mergedMetadata ? JSON.stringify(mergedMetadata) : null,
       maxConcurrentTasks ?? 5,
       agentType || 'general',
       specialization || null,
@@ -732,10 +1254,19 @@ router.post('/', userAuth, requireRoles('admin'), validateBody(createAgentSchema
  * GET /api/agents/:id
  * Get agent details
  */
-router.get('/:id', userAuth, async (req, res) => {
+router.get('/:id', dualAuth, async (req, res) => {
   try {
+    const scoped = await requireScopedAgent(req, res, req.params.id);
+    if (scoped === null) return;
     const agent = await db.one(`
-      SELECT * FROM agents WHERE id = ?
+      SELECT
+        agents.*,
+        u.is_agent_user AS owner_user_is_agent_user,
+        u.name AS owner_user_name,
+        u.email AS owner_user_email
+      FROM agents
+      LEFT JOIN users u ON u.id = agents.owner_user_id
+      WHERE agents.id = ?
     `, [req.params.id]);
 
     if (!agent) {
@@ -750,10 +1281,31 @@ router.get('/:id', userAuth, async (req, res) => {
       ORDER BY created_at DESC
     `, [req.params.id]);
 
+    const ownerUserKeys = agent.owner_user_id && Number(agent.owner_user_is_agent_user || 0) === 1
+      ? await db.many(`
+        SELECT id, key_prefix, name, last_used_at, created_at
+        FROM user_keys
+        WHERE user_id = ?
+        ORDER BY created_at DESC
+      `, [agent.owner_user_id])
+      : [];
+
     response.success(res, normalizeAgentTimestamps({
       ...agent,
+      owner_user_is_agent_user: Boolean(Number(agent.owner_user_is_agent_user || 0)),
+      owner_user: agent.owner_user_id ? {
+        id: agent.owner_user_id,
+        name: agent.owner_user_name || null,
+        email: agent.owner_user_email || null,
+        is_agent_user: Boolean(Number(agent.owner_user_is_agent_user || 0))
+      } : null,
+      owner_user_keys: ownerUserKeys.map((key) => normalizeKeyTimestamps({
+        ...key,
+        prefix: key.key_prefix
+      })),
       keys: keys.map(k => normalizeKeyTimestamps({
         ...k,
+        prefix: k.key_prefix,
         scopes: safeJsonParse(k.scopes, [])
       }))
     }));
@@ -769,8 +1321,10 @@ router.get('/:id', userAuth, async (req, res) => {
  * Query params:
  *   - period: '7d', '30d', '90d', 'all' (default: '30d')
  */
-router.get('/:id/metrics', userAuth, async (req, res) => {
+router.get('/:id/metrics', dualAuth, async (req, res) => {
   try {
+    const scoped = await requireScopedAgent(req, res, req.params.id);
+    if (scoped === null) return;
     const agent = await db.one(`
       SELECT id, name FROM agents WHERE id = ?
     `, [req.params.id]);
@@ -955,9 +1509,11 @@ router.get('/:id/metrics', userAuth, async (req, res) => {
  * PATCH /api/agents/:id
  * Update agent
  */
-router.patch('/:id', userAuth, requireRoles('admin'), validateBody(updateAgentSchema), async (req, res) => {
+router.patch('/:id', dualAuth, requireRoles('admin'), validateBody(updateAgentSchema), async (req, res) => {
   try {
-    const agent = await db.one('SELECT id, status FROM agents WHERE id = ?', [req.params.id]);
+    const scoped = await requireScopedAgent(req, res, req.params.id);
+    if (scoped === null) return;
+    const agent = await db.one('SELECT id, status, owner_user_id FROM agents WHERE id = ?', [req.params.id]);
     if (!agent) {
       return response.notFound(res, 'Agent');
     }
@@ -1067,8 +1623,10 @@ router.patch('/:id', userAuth, requireRoles('admin'), validateBody(updateAgentSc
  * DELETE /api/agents/:id
  * Delete agent
  */
-router.delete('/:id', userAuth, requireRoles('admin'), async (req, res) => {
+router.delete('/:id', dualAuth, requireRoles('admin'), async (req, res) => {
   try {
+    const scoped = await requireScopedAgent(req, res, req.params.id);
+    if (scoped === null) return;
     const agent = await db.one('SELECT id, name FROM agents WHERE id = ?', [req.params.id]);
     if (!agent) {
       return response.notFound(res, 'Agent');
@@ -1077,7 +1635,7 @@ router.delete('/:id', userAuth, requireRoles('admin'), async (req, res) => {
     // Block deletion if agent has active (non-terminal) tasks
     const activeTaskRow = await db.one(`
       SELECT COUNT(*) as count FROM tasks
-      WHERE assigned_agent_id = ? AND status NOT IN ('completed', 'cancelled')
+      WHERE assigned_agent_id = ? AND status NOT IN ('completed', 'cancelled', 'blocked', 'deferred')
     `, [req.params.id]);
     const activeTaskCount = activeTaskRow.count;
 
@@ -1100,8 +1658,10 @@ router.delete('/:id', userAuth, requireRoles('admin'), async (req, res) => {
  * POST /api/agents/:id/keys
  * Generate a new API key for an agent
  */
-router.post('/:id/keys', userAuth, requireRoles('admin'), keyGenLimiter, validateBody(generateKeySchema), async (req, res) => {
+router.post('/:id/keys', dualAuth, requireRoles('admin'), keyGenLimiter, validateBody(generateKeySchema), async (req, res) => {
   try {
+    const scoped = await requireScopedAgent(req, res, req.params.id);
+    if (scoped === null) return;
     const agent = await db.one('SELECT id FROM agents WHERE id = ?', [req.params.id]);
     if (!agent) {
       return response.notFound(res, 'Agent');
@@ -1142,8 +1702,10 @@ router.post('/:id/keys', userAuth, requireRoles('admin'), keyGenLimiter, validat
  * DELETE /api/agents/:id/keys/:keyId
  * Revoke an API key
  */
-router.delete('/:id/keys/:keyId', userAuth, requireRoles('admin'), async (req, res) => {
+router.delete('/:id/keys/:keyId', dualAuth, requireRoles('admin'), async (req, res) => {
   try {
+    const scoped = await requireScopedAgent(req, res, req.params.id);
+    if (scoped === null) return;
     const key = await db.one(`
       SELECT id FROM agent_keys WHERE id = ? AND agent_id = ?
     `, [req.params.keyId, req.params.id]);
@@ -1167,8 +1729,10 @@ router.delete('/:id/keys/:keyId', userAuth, requireRoles('admin'), async (req, r
  * POST /api/agents/:id/webhook-secret
  * Generate a new webhook secret for an agent
  */
-router.post('/:id/webhook-secret', userAuth, requireRoles('admin'), async (req, res) => {
+router.post('/:id/webhook-secret', dualAuth, requireRoles('admin'), async (req, res) => {
   try {
+    const scoped = await requireScopedAgent(req, res, req.params.id);
+    if (scoped === null) return;
     const agent = await db.one('SELECT id FROM agents WHERE id = ?', [req.params.id]);
     if (!agent) {
       return response.notFound(res, 'Agent');
@@ -1199,8 +1763,10 @@ router.post('/:id/webhook-secret', userAuth, requireRoles('admin'), async (req, 
  * PUT /api/agents/:id/owner
  * Link or unlink an agent to a user
  */
-router.put('/:id/owner', userAuth, requireRoles('admin'), validateBody(updateAgentOwnerSchema), async (req, res) => {
+router.put('/:id/owner', dualAuth, requireRoles('admin'), validateBody(updateAgentOwnerSchema), async (req, res) => {
   try {
+    const scoped = await requireScopedAgent(req, res, req.params.id);
+    if (scoped === null) return;
     const agent = await db.one('SELECT id FROM agents WHERE id = ?', [req.params.id]);
     if (!agent) {
       return response.notFound(res, 'Agent');
@@ -1231,8 +1797,10 @@ router.put('/:id/owner', userAuth, requireRoles('admin'), validateBody(updateAge
  * POST /api/agents/:id/test-connection
  * Test provider API key connectivity
  */
-router.post('/:id/test-connection', userAuth, requireRoles('admin'), async (req, res) => {
+router.post('/:id/test-connection', dualAuth, requireRoles('admin'), async (req, res) => {
   try {
+    const scoped = await requireScopedAgent(req, res, req.params.id);
+    if (scoped === null) return;
     const agent = await db.one(`
       SELECT id, provider, provider_api_key_encrypted, provider_api_key_iv, encryption_key_version, provider_model, provider_base_url
       FROM agents WHERE id = ?
@@ -1301,8 +1869,10 @@ router.post('/:id/test-connection', userAuth, requireRoles('admin'), async (req,
  * POST /api/agents/:id/execute
  * Trigger task execution for an agent
  */
-router.post('/:id/execute', userAuth, requireRoles('admin'), async (req, res) => {
+router.post('/:id/execute', dualAuth, requireRoles('admin'), async (req, res) => {
   try {
+    const scoped = await requireScopedAgent(req, res, req.params.id);
+    if (scoped === null) return;
     const agent = await db.one(`
       SELECT * FROM agents WHERE id = ?
     `, [req.params.id]);
@@ -1346,9 +1916,11 @@ router.post('/:id/execute', userAuth, requireRoles('admin'), async (req, res) =>
  * PATCH /api/agents/:id/execution
  * Update agent execution configuration
  */
-router.patch('/:id/execution', userAuth, requireRoles('admin'), validateBody(updateAgentExecutionSchema), async (req, res) => {
+router.patch('/:id/execution', dualAuth, requireRoles('admin'), validateBody(updateAgentExecutionSchema), async (req, res) => {
   try {
-    const agent = await db.one('SELECT id, provider FROM agents WHERE id = ?', [req.params.id]);
+    const scoped = await requireScopedAgent(req, res, req.params.id);
+    if (scoped === null) return;
+    const agent = await db.one('SELECT id, provider, metadata FROM agents WHERE id = ?', [req.params.id]);
     if (!agent) {
       return response.notFound(res, 'Agent');
     }
@@ -1359,11 +1931,17 @@ router.patch('/:id/execution', userAuth, requireRoles('admin'), validateBody(upd
       providerModel,
       providerBaseUrl,
       providerLabel,
+      runtimeLock,
       systemPrompt,
       executionMode,
       maxTokens,
       temperature
     } = req.body;
+    const normalizedRuntimeLock = normalizeRuntimeLockPayload(runtimeLock);
+    const runtimeLockError = await assertRuntimeLockAllowed(null, normalizedRuntimeLock);
+    if (runtimeLockError) {
+      return response.forbidden(res, runtimeLockError);
+    }
 
     // Determine the effective provider (what it will be after this update)
     const effectiveProvider = provider !== undefined ? provider : agent.provider;
@@ -1417,6 +1995,13 @@ router.patch('/:id/execution', userAuth, requireRoles('admin'), validateBody(upd
     if (providerLabel !== undefined) {
       updates.push('provider_label = ?');
       values.push(providerLabel || null);
+    }
+
+    if (runtimeLock !== undefined) {
+      const currentMetadata = safeJsonParse(agent.metadata, {});
+      const nextMetadata = applyRuntimeLockMetadata(currentMetadata, normalizedRuntimeLock);
+      updates.push('metadata = ?');
+      values.push(nextMetadata && Object.keys(nextMetadata).length > 0 ? JSON.stringify(nextMetadata) : null);
     }
 
     if (systemPrompt !== undefined) {

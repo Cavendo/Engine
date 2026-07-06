@@ -320,7 +320,7 @@ export async function initializeDatabase(db) {
     SET force_password_change = 1
     WHERE email = 'admin@cavendo.local'
       AND role = 'admin'
-      AND COALESCE(last_login_at, '') = ''
+      AND last_login_at IS NULL
       AND force_password_change = 0
   `);
 

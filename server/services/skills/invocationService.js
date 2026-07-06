@@ -15,6 +15,11 @@ const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_CONTEXT_BYTES = parseInt(process.env.SKILLS_MAX_CONTEXT_BYTES || '65536', 10);
 const MAX_OUTPUT_BYTES = parseInt(process.env.SKILLS_MAX_OUTPUT_BYTES || '262144', 10);
 const MAX_INPUT_BYTES = parseInt(process.env.SKILLS_MAX_INPUT_BYTES || '262144', 10);
+const MANAGED_ONLY_CONNECTOR_IDS = new Set(['dataforseo']);
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
 
 function nowIso() {
   return new Date().toISOString();
@@ -69,6 +74,91 @@ export function createDependencyNotReadyError(message, details = {}) {
   });
 }
 
+function readConnectorBindingId(value) {
+  if (typeof value === 'string') return value.trim();
+  if (!isPlainObject(value)) return '';
+  return String(
+    value.id
+    || value.connector_id
+    || value.connectorId
+    || value.key
+    || value.connector_key
+    || value.connectorKey
+    || ''
+  ).trim();
+}
+
+function collectManagedOnlyConnectorIds(skill, connectorBindings, connectorBindingDetails) {
+  const ids = new Set();
+
+  for (const key of [
+    ...Object.keys(isPlainObject(connectorBindings) ? connectorBindings : {}),
+    ...Object.keys(isPlainObject(connectorBindingDetails) ? connectorBindingDetails : {})
+  ]) {
+    const connectorId = String(key || '').trim();
+    if (MANAGED_ONLY_CONNECTOR_IDS.has(connectorId.toLowerCase())) ids.add(connectorId);
+  }
+
+  const connectorDependencies = Array.isArray(skill?.dependencies?.connectors)
+    ? skill.dependencies.connectors
+    : (Array.isArray(skill?.connector_dependencies) ? skill.connector_dependencies : []);
+  for (const dep of connectorDependencies) {
+    const connectorId = readConnectorBindingId(dep);
+    if (connectorId && MANAGED_ONLY_CONNECTOR_IDS.has(connectorId.toLowerCase())) ids.add(connectorId);
+  }
+
+  const defaultBindings = isPlainObject(skill?.default_connector_bindings)
+    ? skill.default_connector_bindings
+    : (isPlainObject(skill?.defaultConnectorBindings) ? skill.defaultConnectorBindings : {});
+  for (const key of Object.keys(defaultBindings)) {
+    const connectorId = String(key || '').trim();
+    if (MANAGED_ONLY_CONNECTOR_IDS.has(connectorId.toLowerCase())) ids.add(connectorId);
+  }
+
+  return [...ids];
+}
+
+function normalizeManagedOnlyDetails(details) {
+  const normalized = isPlainObject(details) ? { ...details } : {};
+  delete normalized.credential_profile_id;
+  delete normalized.credentialProfileId;
+  delete normalized.workspace_connector_id;
+  delete normalized.workspaceConnectorId;
+  return {
+    ...normalized,
+    binding: 'managed'
+  };
+}
+
+export function normalizeManagedOnlyConnectorConfig({
+  skill = null,
+  connectorBindings = {},
+  connectorBindingDetails = {},
+  connectorResolutions = {}
+} = {}) {
+  const normalizedBindings = isPlainObject(connectorBindings) ? { ...connectorBindings } : {};
+  const normalizedDetails = isPlainObject(connectorBindingDetails) ? { ...connectorBindingDetails } : {};
+  const normalizedResolutions = isPlainObject(connectorResolutions) ? { ...connectorResolutions } : {};
+
+  for (const connectorId of collectManagedOnlyConnectorIds(skill, normalizedBindings, normalizedDetails)) {
+    normalizedBindings[connectorId] = 'managed';
+    normalizedDetails[connectorId] = normalizeManagedOnlyDetails(normalizedDetails[connectorId]);
+    if (isPlainObject(normalizedResolutions[connectorId])) {
+      normalizedResolutions[connectorId] = {
+        ...normalizedResolutions[connectorId],
+        binding: 'managed',
+        source: normalizedResolutions[connectorId].source || 'managed_connector'
+      };
+    }
+  }
+
+  return {
+    connectorBindings: normalizedBindings,
+    connectorBindingDetails: normalizedDetails,
+    connectorResolutions: normalizedResolutions
+  };
+}
+
 function normalizeInvocationRow(row) {
   return {
     ...row,
@@ -105,6 +195,22 @@ function validateActor(auth) {
 }
 
 function validateSimpleSchema(inputSchema, value, path = 'inputs') {
+  const resolveAliasValue = (obj, key) => {
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return { exists: false, value: undefined };
+    if (Object.prototype.hasOwnProperty.call(obj, key)) {
+      return { exists: true, value: obj[key] };
+    }
+    const camel = String(key || '').replace(/_([a-z])/g, (_m, ch) => ch.toUpperCase());
+    const snake = String(key || '').replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
+    if (camel && Object.prototype.hasOwnProperty.call(obj, camel)) {
+      return { exists: true, value: obj[camel] };
+    }
+    if (snake && Object.prototype.hasOwnProperty.call(obj, snake)) {
+      return { exists: true, value: obj[snake] };
+    }
+    return { exists: false, value: undefined };
+  };
+
   if (!inputSchema || typeof inputSchema !== 'object') return;
   if (inputSchema.type === 'object') {
     if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -112,14 +218,16 @@ function validateSimpleSchema(inputSchema, value, path = 'inputs') {
     }
     const required = Array.isArray(inputSchema.required) ? inputSchema.required : [];
     for (const key of required) {
-      if (!(key in value)) {
+      const resolved = resolveAliasValue(value, key);
+      if (!resolved.exists) {
         throw createError(SKILLS_ERROR_CODES.INPUT_VALIDATION_FAILED, `${path}.${key} is required`, 422);
       }
     }
     const props = inputSchema.properties && typeof inputSchema.properties === 'object' ? inputSchema.properties : {};
     for (const [k, schema] of Object.entries(props)) {
-      if (!(k in value)) continue;
-      validateSimpleSchema(schema, value[k], `${path}.${k}`);
+      const resolved = resolveAliasValue(value, k);
+      if (!resolved.exists) continue;
+      validateSimpleSchema(schema, resolved.value, `${path}.${k}`);
     }
     return;
   }
@@ -202,7 +310,8 @@ export async function getInvocationById(id, auth) {
   const artifacts = await loadArtifacts(id);
   return {
     ...normalized,
-    artifacts
+    artifacts,
+    skill_metadata: null,
   };
 }
 
@@ -229,15 +338,22 @@ export async function createInvocation(payload, { auth, user }) {
   const role = getEffectiveRole(auth, user);
   await assertInvokeAllowed(payload.skillKey, role, payload.workspaceId || null);
 
-  const skill = await getSkillFromCatalog(payload.skillKey);
+  const requestedSkillVersion = String(payload.skillVersion || '').trim() || null;
+  const skill = await getSkillFromCatalog(payload.skillKey, requestedSkillVersion, { allowVersionFallback: true });
+  const resolvedSkillVersion = requestedSkillVersion || String(skill.version || skill.skill_version || '').trim() || null;
   validateSimpleSchema(skill.input_schema, payload.inputs || {}, 'inputs');
+  const connectorConfig = normalizeManagedOnlyConnectorConfig({
+    skill,
+    connectorBindings: payload.connectorBindings || {},
+    connectorBindingDetails: payload.connectorBindingDetails || {},
+    connectorResolutions: payload.connectorResolutions || {}
+  });
 
   const createdAt = nowIso();
   const timeoutMs = Math.max(5000, Number(payload.timeoutMs || DEFAULT_TIMEOUT_MS));
   const timeoutAt = addMs(createdAt, timeoutMs);
   const nextPollAt = addMs(createdAt, POLL_INTERVAL_MS);
-
-  const adapter = getSkillsAdapter();
+  const invocationProvider = process.env.SKILLS_PROVIDER || 'http_worker';
 
   let invocationId;
   try {
@@ -260,9 +376,9 @@ export async function createInvocation(payload, { auth, user }) {
       payload.taskId || null,
       payload.workflowRunId || null,
       payload.workflowStepId || null,
-      process.env.SKILLS_PROVIDER || 'http_worker',
+      invocationProvider,
       payload.skillKey,
-      skill.version || null,
+      resolvedSkillVersion,
       JSON.stringify(payload.inputs || {}),
       JSON.stringify(payload.contextData || {}),
       null,
@@ -304,12 +420,14 @@ export async function createInvocation(payload, { auth, user }) {
   }
 
   try {
-    const invokeResult = await adapter.invoke({
+    const invokeResult = await getSkillsAdapter().invoke({
       skill_key: payload.skillKey,
-      skill_version: skill.version || null,
+      skill_version: resolvedSkillVersion,
       inputs: payload.inputs || {},
       context_data: payload.contextData || {},
-      connector_bindings: payload.connectorBindings || {},
+      connector_bindings: connectorConfig.connectorBindings,
+      connector_binding_details: connectorConfig.connectorBindingDetails,
+      connector_resolutions: connectorConfig.connectorResolutions,
       workspace_id: payload.workspaceId || null,
       workflow_run_id: payload.workflowRunId || null,
       workflow_step_id: payload.workflowStepId || null,
@@ -336,11 +454,11 @@ export async function createInvocation(payload, { auth, user }) {
         WHERE id = ?
       `, [
         invokeResult.status,
-        invokeResult.invocationId,
+        invokeResult.invocationId || null,
         startedAt,
         JSON.stringify(summarizeOutput(invokeResult.output)),
         nowIso(),
-        addMs(nowIso(), POLL_INTERVAL_MS),
+        TERMINAL_SKILLS_STATUSES.has(invokeResult.status) ? null : addMs(nowIso(), POLL_INTERVAL_MS),
         invocationId
       ]);
 
@@ -594,7 +712,7 @@ export async function processClaimedInvocation(invocation, ownerId) {
         now
       ];
 
-      if (result.status === SKILLS_STATUSES.RUNNING && !invocation.started_at) {
+      if ([SKILLS_STATUSES.RUNNING, SKILLS_STATUSES.COMPLETED].includes(result.status) && !invocation.started_at) {
         updates.push('started_at = ?');
         values.push(now);
       }

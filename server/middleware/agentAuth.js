@@ -1,7 +1,9 @@
 import { timingSafeEqual } from 'crypto';
 import db from '../db/adapter.js';
 import { hashApiKey } from '../utils/crypto.js';
+import { getClientIp } from '../utils/clientIp.js';
 import * as response from '../utils/response.js';
+import { extractApiKeyFromRequest } from '../utils/apiKeyHeaders.js';
 import { userAuth } from './userAuth.js';
 
 function safeJsonParse(val, fallback) {
@@ -10,39 +12,67 @@ function safeJsonParse(val, fallback) {
   try { return JSON.parse(val); } catch { return fallback; }
 }
 
-/**
- * Middleware to authenticate agents via X-Agent-Key header
- * Supports both agent keys (cav_ak_...) and user keys (cav_uk_...)
- * Attaches agent object to req.agent if authenticated
- */
-export async function agentAuth(req, res, next) {
-  const apiKey = req.headers['x-agent-key'];
+function buildUserKeyAgent(userKey, ownedAgentIds) {
+  const ROLE_SCOPES = {
+    admin: ['*'],
+    operator: ['tasks:read', 'tasks:write', 'deliverables:read', 'deliverables:write', 'projects:read', 'agents:read', 'knowledge:read', 'knowledge:write', 'workflows:read', 'workflows:write'],
+    reviewer: ['tasks:read', 'tasks:write', 'deliverables:read', 'deliverables:write', 'deliverables:review', 'projects:read', 'agents:read', 'knowledge:read', 'knowledge:write'],
+    viewer: ['tasks:read', 'deliverables:read', 'projects:read', 'agents:read', 'knowledge:read']
+  };
+  const ROLE_CAPABILITIES = {
+    admin: ['*'],
+    operator: ['operate', 'review', 'write', 'read'],
+    reviewer: ['review', 'write', 'read'],
+    viewer: ['read']
+  };
 
-  if (!apiKey) {
-    return response.unauthorized(res, 'Missing X-Agent-Key header');
-  }
+  const roleScopes = ROLE_SCOPES[userKey.role] || ROLE_SCOPES.viewer;
+  const roleCapabilities = ROLE_CAPABILITIES[userKey.role] || ROLE_CAPABILITIES.viewer;
 
-  // Hash the provided key
-  const keyHash = hashApiKey(apiKey);
-
-  // Check if this is a user key (cav_uk_...)
-  if (apiKey.startsWith('cav_uk_')) {
-    return authenticateUserKey(keyHash, req, res, next);
-  }
-
-  // Otherwise treat as agent key (cav_ak_...)
-  return authenticateAgentKey(keyHash, req, res, next);
+  return {
+    id: null,
+    name: userKey.user_name || userKey.email,
+    type: 'user',
+    capabilities: roleCapabilities,
+    status: 'active',
+    maxConcurrentTasks: 999,
+    keyId: userKey.key_id,
+    scopes: roleScopes,
+    isUserKey: true,
+    userId: userKey.user_id,
+    userName: userKey.user_name,
+    userEmail: userKey.email,
+    userRole: userKey.role,
+    keyName: userKey.key_name || null,
+    ownedAgentIds
+  };
 }
 
-/**
- * Authenticate using a user key (cav_uk_...)
- * The user becomes the "agent" for MCP purposes
- */
-async function authenticateUserKey(keyHash, req, res, next) {
+function buildAgentKeyActor(agentKey) {
+  const scopes = safeJsonParse(agentKey.scopes, []);
+  const capabilities = safeJsonParse(agentKey.capabilities, []);
+
+  return {
+    id: agentKey.agent_id,
+    name: agentKey.name,
+    type: agentKey.type,
+    capabilities,
+    status: agentKey.status,
+    maxConcurrentTasks: agentKey.max_concurrent_tasks,
+    keyId: agentKey.key_id,
+    scopes,
+    ownerUserId: agentKey.owner_user_id,
+    ownerName: agentKey.owner_name,
+    ownerEmail: agentKey.owner_email
+  };
+}
+
+async function loadUserKeyAgent(keyHash) {
   const userKey = await db.one(`
     SELECT
       uk.id as key_id,
       uk.key_hash,
+      uk.name as key_name,
       uk.user_id,
       u.name as user_name,
       u.email,
@@ -54,75 +84,39 @@ async function authenticateUserKey(keyHash, req, res, next) {
   `, [keyHash]);
 
   if (!userKey) {
-    return response.unauthorized(res, 'Invalid API key');
+    const err = new Error('Invalid API key');
+    err.status = 401;
+    throw err;
   }
 
-  // Timing-safe comparison to prevent timing attacks
   const keyHashBuffer = Buffer.from(keyHash, 'hex');
   const storedHashBuffer = Buffer.from(userKey.key_hash, 'hex');
   if (keyHashBuffer.length !== storedHashBuffer.length ||
       !timingSafeEqual(keyHashBuffer, storedHashBuffer)) {
-    return response.unauthorized(res, 'Invalid API key');
+    const err = new Error('Invalid API key');
+    err.status = 401;
+    throw err;
   }
 
   if (userKey.status !== 'active') {
-    return response.forbidden(res, `User account is ${userKey.status}`);
+    const err = new Error(`User account is ${userKey.status}`);
+    err.status = 403;
+    throw err;
   }
 
-  // Update last used timestamp
   await db.exec(`
     UPDATE user_keys SET last_used_at = datetime('now') WHERE id = ?
   `, [userKey.key_id]);
 
-  // Find agents owned by this user (for scoping "my tasks" queries)
   const ownedAgents = await db.many(
     'SELECT id FROM agents WHERE owner_user_id = ? AND status = \'active\'',
     [userKey.user_id]
   );
-  const ownedAgentIds = ownedAgents.map(a => a.id);
-
-  // VULN-005: Scope user keys to actual user role instead of granting wildcard
-  const ROLE_SCOPES = {
-    admin: ['*'],
-    reviewer: ['tasks:read', 'tasks:write', 'deliverables:read', 'deliverables:write', 'deliverables:review', 'projects:read', 'agents:read', 'knowledge:read', 'knowledge:write'],
-    viewer: ['tasks:read', 'deliverables:read', 'projects:read', 'agents:read', 'knowledge:read']
-  };
-  const ROLE_CAPABILITIES = {
-    admin: ['*'],
-    reviewer: ['review', 'write', 'read'],
-    viewer: ['read']
-  };
-
-  const roleScopes = ROLE_SCOPES[userKey.role] || ROLE_SCOPES.viewer;
-  const roleCapabilities = ROLE_CAPABILITIES[userKey.role] || ROLE_CAPABILITIES.viewer;
-
-  // Create a virtual agent representing the user
-  req.agent = {
-    id: null, // No agent ID for user keys
-    name: userKey.user_name || userKey.email,
-    type: 'user',
-    capabilities: roleCapabilities,
-    status: 'active',
-    maxConcurrentTasks: 999,
-    keyId: userKey.key_id,
-    scopes: roleScopes,
-    // User-specific fields
-    isUserKey: true,
-    userId: userKey.user_id,
-    userName: userKey.user_name,
-    userEmail: userKey.email,
-    userRole: userKey.role,
-    ownedAgentIds // Array of agent IDs owned by this user
-  };
-
-  next();
+  const ownedAgentIds = ownedAgents.map((a) => a.id);
+  return buildUserKeyAgent(userKey, ownedAgentIds);
 }
 
-/**
- * Authenticate using an agent key (cav_ak_...)
- * Also resolves owner user if agent is linked to a user
- */
-async function authenticateAgentKey(keyHash, req, res, next) {
+async function loadAgentKeyActor(keyHash) {
   const agentKey = await db.one(`
     SELECT
       ak.id as key_id,
@@ -147,58 +141,85 @@ async function authenticateAgentKey(keyHash, req, res, next) {
   `, [keyHash]);
 
   if (!agentKey) {
-    return response.unauthorized(res, 'Invalid API key');
+    const err = new Error('Invalid API key');
+    err.status = 401;
+    throw err;
   }
 
-  // Timing-safe comparison to prevent timing attacks
   const keyHashBuffer = Buffer.from(keyHash, 'hex');
   const storedHashBuffer = Buffer.from(agentKey.key_hash, 'hex');
   if (keyHashBuffer.length !== storedHashBuffer.length ||
       !timingSafeEqual(keyHashBuffer, storedHashBuffer)) {
-    return response.unauthorized(res, 'Invalid API key');
+    const err = new Error('Invalid API key');
+    err.status = 401;
+    throw err;
   }
 
-  // Check if key is revoked
   if (agentKey.revoked_at) {
-    return response.unauthorized(res, 'API key has been revoked');
+    const err = new Error('API key has been revoked');
+    err.status = 401;
+    throw err;
   }
 
-  // Check if key is expired
   if (agentKey.expires_at && new Date(agentKey.expires_at) < new Date()) {
-    return response.unauthorized(res, 'API key has expired');
+    const err = new Error('API key has expired');
+    err.status = 401;
+    throw err;
   }
 
-  // Check if agent is active
   if (agentKey.status !== 'active') {
-    return response.forbidden(res, `Agent is ${agentKey.status}`);
+    const err = new Error(`Agent is ${agentKey.status}`);
+    err.status = 403;
+    throw err;
   }
 
-  // Update last used timestamp
   await db.exec(`
     UPDATE agent_keys SET last_used_at = datetime('now') WHERE id = ?
   `, [agentKey.key_id]);
 
-  // Parse JSON fields
-  const scopes = safeJsonParse(agentKey.scopes, []);
-  const capabilities = safeJsonParse(agentKey.capabilities, []);
+  return buildAgentKeyActor(agentKey);
+}
 
-  // Attach agent to request
-  req.agent = {
-    id: agentKey.agent_id,
-    name: agentKey.name,
-    type: agentKey.type,
-    capabilities,
-    status: agentKey.status,
-    maxConcurrentTasks: agentKey.max_concurrent_tasks,
-    keyId: agentKey.key_id,
-    scopes,
-    // Owner info (for "my tasks" queries)
-    ownerUserId: agentKey.owner_user_id,
-    ownerName: agentKey.owner_name,
-    ownerEmail: agentKey.owner_email
-  };
+export async function resolveApiKeyActor(apiKey) {
+  const normalizedApiKey = String(apiKey || '').trim();
+  if (!normalizedApiKey) {
+    const err = new Error('Missing X-Agent-Key header');
+    err.status = 401;
+    throw err;
+  }
 
-  next();
+  const keyHash = hashApiKey(normalizedApiKey);
+  if (normalizedApiKey.startsWith('cav_uk_')) {
+    return loadUserKeyAgent(keyHash);
+  }
+  return loadAgentKeyActor(keyHash);
+}
+
+/**
+ * Middleware to authenticate agents via X-Agent-Key header
+ * Supports both agent keys (cav_ak_...) and user keys (cav_uk_...)
+ * Attaches agent object to req.agent if authenticated
+ */
+export async function agentAuth(req, res, next) {
+  const apiKey = extractApiKeyFromRequest(req);
+
+  if (!apiKey) {
+    return response.unauthorized(res, 'Missing X-Agent-Key header');
+  }
+
+  try {
+    req.agent = await resolveApiKeyActor(apiKey);
+    next();
+  } catch (err) {
+    if (err?.status === 401) {
+      return response.unauthorized(res, err.message || 'Invalid API key');
+    }
+    if (err?.status === 403) {
+      return response.forbidden(res, err.message || 'Access denied');
+    }
+    console.error('Agent auth error:', err);
+    return response.serverError(res, 'Authentication failed');
+  }
 }
 
 /**
@@ -249,7 +270,7 @@ export function logAgentActivity(action, getResourceInfo) {
             resourceInfo.type || null,
             resourceInfo.id || null,
             JSON.stringify(resourceInfo.details || {}),
-            req.ip
+            getClientIp(req)
           ]).catch(err => {
             console.error('Failed to log agent activity:', err);
           });
@@ -268,7 +289,7 @@ export function logAgentActivity(action, getResourceInfo) {
  * Useful for endpoints that should be accessible by both agents and users
  */
 export function dualAuth(req, res, next) {
-  const agentKey = req.headers['x-agent-key'];
+  const agentKey = extractApiKeyFromRequest(req);
   if (agentKey) {
     return agentAuth(req, res, next);
   }

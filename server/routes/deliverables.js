@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { randomUUID } from 'crypto';
 import db from '../db/adapter.js';
 import * as response from '../utils/response.js';
-import { userAuth, requireRoles } from '../middleware/userAuth.js';
+import { requireRoles } from '../middleware/userAuth.js';
 import { agentAuth, dualAuth, logAgentActivity } from '../middleware/agentAuth.js';
 import { triggerWebhook } from '../services/webhooks.js';
 import { dispatchEvent } from '../services/routeDispatcher.js';
@@ -44,6 +44,22 @@ function safeJsonParse(jsonString, defaultValue = null) {
   }
 }
 
+function buildDeliverableHtmlFilename(title) {
+  const base = String(title || 'deliverable')
+    .toLowerCase()
+    .replace(/^deliverable:\s*/i, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 64);
+  return `${base || 'deliverable'}.html`;
+}
+
+function shouldCreateHtmlAttachment(savedFiles, contentType, content) {
+  if (Array.isArray(savedFiles) && savedFiles.length > 0) return false;
+  if (String(contentType || '').trim().toLowerCase() !== 'html') return false;
+  return typeof content === 'string' && content.trim().length > 0;
+}
+
 /**
  * Convert SQLite timestamp to ISO 8601 format with explicit UTC marker.
  * SQLite stores timestamps like "2026-02-11 16:36:31" (UTC but no Z suffix).
@@ -68,6 +84,126 @@ function normalizeTimestamps(d) {
   };
 }
 
+function parseTaskContext(rawContext) {
+  if (!rawContext) return {};
+  if (typeof rawContext === 'object') return rawContext;
+  if (typeof rawContext === 'string') {
+    try {
+      const parsed = JSON.parse(rawContext);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+function appendRevisionContext(baseContext, feedback, source, requestedBy) {
+  const next = parseTaskContext(baseContext);
+  const text = String(feedback || '').trim();
+  if (!text) return next;
+
+  const entry = {
+    feedback: text,
+    source: String(source || 'deliverable_review'),
+    requested_at: new Date().toISOString(),
+  };
+  if (requestedBy) entry.requested_by = requestedBy;
+
+  const existing = Array.isArray(next.revision_requests) ? next.revision_requests : [];
+  next.revision_requests = [...existing, entry].slice(-20);
+  next.latest_revision_request = entry;
+  next.latest_revision_feedback = text;
+  return next;
+}
+
+async function resolveProjectScope() {
+  return { enabled: false, allowedProjectIds: [] };
+}
+
+function applyTaskContextPlan(rawContext) {
+  return rawContext && typeof rawContext === 'object' ? rawContext : {};
+}
+
+async function syncApprovedDeliverableToKnowledge() {
+  return null;
+}
+
+function getSubmissionClientLabel(metadata) {
+  if (!metadata || typeof metadata !== 'object') return '';
+  return String(
+    metadata.submission_client_label
+    ?? metadata.submissionClientLabel
+    ?? metadata.key_name
+    ?? metadata.keyName
+    ?? ''
+  ).trim();
+}
+
+function withUserKeySubmissionMetadata(metadata, agentActor) {
+  const next = (metadata && typeof metadata === 'object' && !Array.isArray(metadata))
+    ? { ...metadata }
+    : {};
+  if (!agentActor?.isUserKey) return next;
+  const clientLabel = String(agentActor.keyName || '').trim();
+  next.submitted_via = next.submitted_via || 'user_api_key';
+  if (clientLabel) {
+    next.submission_client_label = clientLabel;
+  }
+  return next;
+}
+
+function buildDeliverableActorLabel(row, metadata) {
+  const baseName = String(row?.agent_name || '').trim();
+  const clientLabel = getSubmissionClientLabel(metadata);
+  const hasResolvedAgent = Boolean(row?.resolved_agent_id ?? row?.agent_id);
+  const hasSubmittingUser = Boolean(row?.submitted_by_user_id);
+  if (!hasResolvedAgent && hasSubmittingUser && baseName && clientLabel) {
+    return `${baseName} via ${clientLabel}`;
+  }
+  return baseName;
+}
+
+function extractHostedMcpReviewSource(req) {
+  const source = String(req?.headers?.['x-cavendo-mcp-source'] || '').trim();
+  const client = String(req?.headers?.['x-cavendo-mcp-client'] || '').trim();
+  if (!source && !client) return null;
+  return {
+    review_source: source || null,
+    review_source_client: client || null,
+    review_source_label: client ? `via ${client}` : 'via hosted MCP',
+  };
+}
+
+async function persistTaskRevisionContext(taskId, feedback, source, requestedBy) {
+  const revisionFeedback = String(feedback || '').trim();
+  if (!taskId || !revisionFeedback) return;
+
+  const task = await db.one('SELECT id, title, description, project_id, tags, context FROM tasks WHERE id = ?', [taskId]);
+  if (!task) return;
+
+  const nextContext = appendRevisionContext(task.context, revisionFeedback, source, requestedBy);
+  const normalizedContext = applyTaskContextPlan(nextContext, {
+    title: task.title || `Task ${taskId}`,
+    description: task.description || null,
+    project_id: task.project_id || null,
+    tags: safeJsonParse(task.tags, []),
+  });
+  await db.exec(`
+    UPDATE tasks
+    SET context = ?, updated_at = datetime('now')
+    WHERE id = ?
+  `, [JSON.stringify(normalizedContext), taskId]);
+}
+
+async function maybeSendInboundTaskCompletionUpdate({ taskId, deliverable, reviewerUserId }) {
+  return null;
+}
+
+async function maybeSendInboundTaskReviewReadyUpdate({ taskId, deliverable, submitterUserId }) {
+  return null;
+}
+
 // Ensure uploads directory exists
 ensureUploadsDir().catch(console.error);
 
@@ -78,24 +214,52 @@ ensureUploadsDir().catch(console.error);
 /**
  * GET /api/deliverables
  * List all deliverables with filtering
+ * Supports browser sessions and API keys.
  */
-router.get('/', userAuth, async (req, res) => {
+router.get('/', dualAuth, async (req, res) => {
   try {
     const { status, taskId, agentId, projectId } = req.query;
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
     const offset = Math.max(0, parseInt(req.query.offset) || 0);
+    const scope = await resolveProjectScope(req);
+    const scopedProjectIds = Array.isArray(scope?.allowedProjectIds)
+      ? scope.allowedProjectIds
+          .map((id) => Number.parseInt(id, 10))
+          .filter((id) => Number.isInteger(id) && id > 0)
+      : [];
+
+    if (scope.enabled && scopedProjectIds.length === 0) {
+      return response.success(res, []);
+    }
+
+    if (scope.enabled && projectId && !scopedProjectIds.includes(parseInt(projectId, 10))) {
+      return response.success(res, []);
+    }
 
     let query = `
       SELECT
         d.*,
         t.title as task_title,
-        a.name as agent_name
+        COALESCE(d.project_id, t.project_id) as resolved_project_id,
+        COALESCE(p1.name, p2.name) as project_name,
+        COALESCE(d.agent_id, t.assigned_agent_id) as resolved_agent_id,
+        COALESCE(a.name, ta.name, u.name, u.email) as agent_name
       FROM deliverables d
       LEFT JOIN tasks t ON t.id = d.task_id
+      LEFT JOIN projects p1 ON p1.id = d.project_id
+      LEFT JOIN projects p2 ON p2.id = t.project_id
       LEFT JOIN agents a ON a.id = d.agent_id
+      LEFT JOIN agents ta ON ta.id = t.assigned_agent_id
+      LEFT JOIN users u ON u.id = d.submitted_by_user_id
       WHERE 1=1
     `;
     const params = [];
+
+    if (scope.enabled) {
+      const placeholders = scopedProjectIds.map(() => '?').join(',');
+      query += ` AND COALESCE(d.project_id, t.project_id) IN (${placeholders})`;
+      params.push(...scopedProjectIds);
+    }
 
     if (status) {
       query += ' AND d.status = ?';
@@ -106,7 +270,7 @@ router.get('/', userAuth, async (req, res) => {
       params.push(parseInt(taskId));
     }
     if (agentId) {
-      query += ' AND d.agent_id = ?';
+      query += ' AND COALESCE(d.agent_id, t.assigned_agent_id) = ?';
       params.push(parseInt(agentId));
     }
     if (projectId) {
@@ -119,12 +283,18 @@ router.get('/', userAuth, async (req, res) => {
 
     const deliverables = await db.many(query, params);
 
-    const parsed = deliverables.map(d => ({
-      ...normalizeTimestamps(d),
-      files: safeJsonParse(d.files, []),
-      actions: safeJsonParse(d.actions, []),
-      metadata: safeJsonParse(d.metadata, {})
-    }));
+    const parsed = deliverables.map((d) => {
+      const metadata = safeJsonParse(d.metadata, {});
+      return {
+        ...normalizeTimestamps(d),
+        agent_id: d.resolved_agent_id,
+        agent_name: buildDeliverableActorLabel(d, metadata),
+        project_id: d.resolved_project_id,
+        files: safeJsonParse(d.files, []),
+        actions: safeJsonParse(d.actions, []),
+        metadata,
+      };
+    });
 
     response.success(res, parsed);
   } catch (err) {
@@ -136,32 +306,62 @@ router.get('/', userAuth, async (req, res) => {
 /**
  * GET /api/deliverables/pending
  * List deliverables pending review
+ * Supports browser sessions and API keys.
  */
-router.get('/pending', userAuth, async (req, res) => {
+router.get('/pending', dualAuth, async (req, res) => {
   try {
-    const deliverables = await db.many(`
+    const scope = await resolveProjectScope(req);
+    const scopedProjectIds = Array.isArray(scope?.allowedProjectIds)
+      ? scope.allowedProjectIds
+          .map((id) => Number.parseInt(id, 10))
+          .filter((id) => Number.isInteger(id) && id > 0)
+      : [];
+
+    if (scope.enabled && scopedProjectIds.length === 0) {
+      return response.success(res, []);
+    }
+
+    let query = `
       SELECT
         d.*,
         t.title as task_title,
         COALESCE(d.project_id, t.project_id) as resolved_project_id,
         COALESCE(p1.name, p2.name) as project_name,
-        a.name as agent_name
+        COALESCE(d.agent_id, t.assigned_agent_id) as resolved_agent_id,
+        COALESCE(a.name, ta.name, u.name, u.email) as agent_name
       FROM deliverables d
       LEFT JOIN tasks t ON t.id = d.task_id
       LEFT JOIN projects p1 ON p1.id = d.project_id
       LEFT JOIN projects p2 ON p2.id = t.project_id
       LEFT JOIN agents a ON a.id = d.agent_id
+      LEFT JOIN agents ta ON ta.id = t.assigned_agent_id
+      LEFT JOIN users u ON u.id = d.submitted_by_user_id
       WHERE d.status = 'pending'
-      ORDER BY d.created_at ASC
-    `);
+    `;
+    const params = [];
 
-    const parsed = deliverables.map(d => ({
-      ...normalizeTimestamps(d),
-      project_id: d.resolved_project_id,
-      files: safeJsonParse(d.files, []),
-      actions: safeJsonParse(d.actions, []),
-      metadata: safeJsonParse(d.metadata, {})
-    }));
+    if (scope.enabled) {
+      const placeholders = scopedProjectIds.map(() => '?').join(',');
+      query += ` AND COALESCE(d.project_id, t.project_id) IN (${placeholders})`;
+      params.push(...scopedProjectIds);
+    }
+
+    query += ' ORDER BY d.created_at ASC';
+
+    const deliverables = await db.many(query, params);
+
+    const parsed = deliverables.map((d) => {
+      const metadata = safeJsonParse(d.metadata, {});
+      return {
+        ...normalizeTimestamps(d),
+        agent_id: d.resolved_agent_id,
+        agent_name: buildDeliverableActorLabel(d, metadata),
+        project_id: d.resolved_project_id,
+        files: safeJsonParse(d.files, []),
+        actions: safeJsonParse(d.actions, []),
+        metadata,
+      };
+    });
 
     response.success(res, parsed);
   } catch (err) {
@@ -206,12 +406,14 @@ router.get('/mine', agentAuth, async (req, res) => {
           d.*,
           t.title as task_title,
           COALESCE(p1.name, p2.name) as project_name,
-          a.name as agent_name
+          COALESCE(a.name, ta.name, u.name, u.email) as agent_name
         FROM deliverables d
         LEFT JOIN tasks t ON t.id = d.task_id
         LEFT JOIN projects p1 ON p1.id = d.project_id
         LEFT JOIN projects p2 ON p2.id = t.project_id
         LEFT JOIN agents a ON a.id = d.agent_id
+        LEFT JOIN agents ta ON ta.id = t.assigned_agent_id
+        LEFT JOIN users u ON u.id = d.submitted_by_user_id
         WHERE d.submitted_by_user_id = ?
            OR d.agent_id IN (SELECT id FROM agents WHERE owner_user_id = ?)
       `;
@@ -231,12 +433,16 @@ router.get('/mine', agentAuth, async (req, res) => {
 
     const deliverables = await db.many(query, params);
 
-    const parsed = deliverables.map(d => ({
-      ...normalizeTimestamps(d),
-      files: safeJsonParse(d.files, []),
-      actions: safeJsonParse(d.actions, []),
-      metadata: safeJsonParse(d.metadata, {})
-    }));
+    const parsed = deliverables.map((d) => {
+      const metadata = safeJsonParse(d.metadata, {});
+      return {
+        ...normalizeTimestamps(d),
+        agent_name: buildDeliverableActorLabel(d, metadata),
+        files: safeJsonParse(d.files, []),
+        actions: safeJsonParse(d.actions, []),
+        metadata,
+      };
+    });
 
     response.success(res, parsed);
   } catch (err) {
@@ -267,12 +473,14 @@ router.get('/:id', dualAuth, async (req, res) => {
         t.description as task_description,
         COALESCE(d.project_id, t.project_id) as resolved_project_id,
         COALESCE(p1.name, p2.name) as project_name,
-        a.name as agent_name
+        COALESCE(a.name, ta.name, u.name, u.email) as agent_name
       FROM deliverables d
       LEFT JOIN tasks t ON t.id = d.task_id
       LEFT JOIN projects p1 ON p1.id = d.project_id
       LEFT JOIN projects p2 ON p2.id = t.project_id
       LEFT JOIN agents a ON a.id = d.agent_id
+      LEFT JOIN agents ta ON ta.id = t.assigned_agent_id
+      LEFT JOIN users u ON u.id = d.submitted_by_user_id
       WHERE d.id = ?
     `, [req.params.id]);
 
@@ -284,20 +492,53 @@ router.get('/:id', dualAuth, async (req, res) => {
     let versions = [];
     if (deliverable.task_id) {
       const rawVersions = await db.many(`
-        SELECT id, version, status, created_at, reviewed_at
-        FROM deliverables
+        SELECT
+          d.id,
+          d.version,
+          d.status,
+          d.title,
+          d.summary,
+          d.content,
+          d.input_tokens,
+          d.output_tokens,
+          d.provider,
+          d.model,
+          d.content_type,
+          d.feedback,
+          d.reviewed_by,
+          d.parent_id,
+          d.submitted_by_user_id,
+          d.files,
+          d.metadata,
+          d.created_at,
+          d.updated_at,
+          d.reviewed_at,
+          COALESCE(a.name, ta.name, u.name, u.email) as agent_name
+        FROM deliverables d
+        LEFT JOIN agents a ON a.id = d.agent_id
+        LEFT JOIN tasks t ON t.id = d.task_id
+        LEFT JOIN agents ta ON ta.id = t.assigned_agent_id
+        LEFT JOIN users u ON u.id = d.submitted_by_user_id
         WHERE task_id = ?
-        ORDER BY version DESC
+        ORDER BY d.version DESC
       `, [deliverable.task_id]);
-      versions = rawVersions.map(v => ({
-        ...v,
-        created_at: toISOTimestamp(v.created_at),
-        reviewed_at: toISOTimestamp(v.reviewed_at)
-      }));
+      versions = rawVersions.map((v) => {
+        const metadata = safeJsonParse(v.metadata, {});
+        return {
+          ...v,
+          agent_name: buildDeliverableActorLabel(v, metadata),
+          files: safeJsonParse(v.files, []),
+          metadata,
+          created_at: toISOTimestamp(v.created_at),
+          updated_at: toISOTimestamp(v.updated_at),
+          reviewed_at: toISOTimestamp(v.reviewed_at)
+        };
+      });
     }
 
     response.success(res, {
       ...normalizeTimestamps(deliverable),
+      agent_name: buildDeliverableActorLabel(deliverable, safeJsonParse(deliverable.metadata, {})),
       project_id: deliverable.resolved_project_id,
       files: safeJsonParse(deliverable.files, []),
       actions: safeJsonParse(deliverable.actions, []),
@@ -361,7 +602,7 @@ router.get('/:id/feedback', dualAuth, async (req, res) => {
  * Review a deliverable (approve/revise/reject)
  * Works for both task-linked and standalone deliverables
  */
-router.patch('/:id/review', userAuth, requireRoles('admin', 'reviewer'), validateBody(reviewDeliverableSchema), async (req, res) => {
+router.patch('/:id/review', dualAuth, requireRoles('admin', 'reviewer'), validateBody(reviewDeliverableSchema), async (req, res) => {
   try {
     const deliverable = await db.one(`
       SELECT d.*, t.assigned_agent_id
@@ -380,11 +621,17 @@ router.patch('/:id/review', userAuth, requireRoles('admin', 'reviewer'), validat
 
     const { decision, feedback } = req.body;
 
+    const reviewSourceMetadata = extractHostedMcpReviewSource(req);
+    const mergedMetadata = {
+      ...safeJsonParse(deliverable.metadata, {}),
+      ...(reviewSourceMetadata || {}),
+    };
+
     await db.exec(`
       UPDATE deliverables
-      SET status = ?, feedback = ?, reviewed_by = ?, reviewed_at = datetime('now'), updated_at = datetime('now')
+      SET status = ?, feedback = ?, reviewed_by = ?, reviewed_at = datetime('now'), updated_at = datetime('now'), metadata = ?
       WHERE id = ?
-    `, [decision, feedback || null, req.user.email, req.params.id]);
+    `, [decision, feedback || null, req.user.email, JSON.stringify(mergedMetadata), req.params.id]);
 
     // Log activity
     logActivity('deliverable', parseInt(req.params.id), 'status_changed', req.user.name || req.user.email, { from: 'pending', to: decision });
@@ -413,16 +660,47 @@ router.patch('/:id/review', userAuth, requireRoles('admin', 'reviewer'), validat
           SET status = 'assigned', updated_at = datetime('now')
           WHERE id = ?
         `, [deliverable.task_id]);
+        await persistTaskRevisionContext(
+          deliverable.task_id,
+          feedback || '',
+          'deliverable_review',
+          req.user?.email || req.user?.id || null
+        );
       } else if (decision === 'rejected') {
         await db.exec(`
           UPDATE tasks
-          SET status = 'assigned', updated_at = datetime('now')
-          WHERE id = ?
+          SET status = 'cancelled', updated_at = datetime('now')
+          WHERE id = ? AND status IN ('pending', 'assigned', 'in_progress', 'review')
         `, [deliverable.task_id]);
+
+        logActivity('task', deliverable.task_id, 'cancelled', req.user.name || req.user.email, {
+          cancelledVia: 'deliverable_rejection',
+          deliverableId: parseInt(req.params.id, 10)
+        });
       }
     }
 
     const updated = await db.one('SELECT * FROM deliverables WHERE id = ?', [req.params.id]);
+
+    if (decision === 'approved') {
+      try {
+        await syncApprovedDeliverableToKnowledge({
+          deliverableId: Number(req.params.id),
+          approvedBy: req.user?.id || req.user?.email || null,
+          trigger: 'deliverable_review'
+        });
+      } catch (syncErr) {
+        console.error(`[Deliverables] Failed to sync approved deliverable #${req.params.id} to KB:`, syncErr);
+      }
+
+      if (deliverable.task_id) {
+        await maybeSendInboundTaskCompletionUpdate({
+          taskId: deliverable.task_id,
+          deliverable: updated,
+          reviewerUserId: req.user?.id || null,
+        });
+      }
+    }
 
     // Trigger webhook (use agent_id from deliverable if no task assignment)
     const webhookAgentId = deliverable.assigned_agent_id || deliverable.agent_id;
@@ -559,10 +837,13 @@ router.post('/', agentAuth, validateBody(submitDeliverableSchema), logAgentActiv
           return response.forbidden(res, 'Task not assigned to this agent');
         }
       } else if (req.agent.isUserKey && task.assigned_agent_id) {
-        // User key: check if task is assigned to an agent linked to this user
-        const assignedAgent = await db.one('SELECT owner_user_id FROM agents WHERE id = ?', [task.assigned_agent_id]);
-        if (assignedAgent && assignedAgent.owner_user_id !== req.agent.userId) {
-          return response.forbidden(res, 'Task not assigned to your agent');
+        // Admin user keys can submit on any task. Other user keys are limited
+        // to tasks assigned to agents they own.
+        if (req.agent.userRole !== 'admin') {
+          const assignedAgent = await db.one('SELECT owner_user_id FROM agents WHERE id = ?', [task.assigned_agent_id]);
+          if (assignedAgent && assignedAgent.owner_user_id !== req.agent.userId) {
+            return response.forbidden(res, 'Task not assigned to your agent');
+          }
         }
       }
 
@@ -613,6 +894,8 @@ router.post('/', agentAuth, validateBody(submitDeliverableSchema), logAgentActiv
       }
     }
 
+    const finalMetadata = withUserKeySubmissionMetadata(metadata, req.agent);
+
     // Determine submitted_by_user_id for user key submissions
     const submittedByUserId = req.agent.isUserKey ? req.agent.userId : null;
 
@@ -656,7 +939,7 @@ router.post('/', agentAuth, validateBody(submitDeliverableSchema), logAgentActiv
           txParentId,
           '[]', // Placeholder for files, will update after saving
           JSON.stringify(actions || []),
-          JSON.stringify(metadata || {}),
+          JSON.stringify(finalMetadata),
           inputTokens || null,
           outputTokens || null,
           provider || null,
@@ -707,13 +990,43 @@ router.post('/', agentAuth, validateBody(submitDeliverableSchema), logAgentActiv
       `, [JSON.stringify(savedFiles), deliverableId]);
     }
 
+    // Ensure plain HTML responses still produce a downloadable file artifact.
+    if (shouldCreateHtmlAttachment(savedFiles, finalContentType, finalContent)) {
+      const savedHtml = await saveDeliverableFile(
+        buildDeliverableHtmlFilename(title),
+        finalContent,
+        deliverableId
+      );
+      savedFiles = [{
+        ...savedHtml,
+        mimeType: 'text/html'
+      }];
+      await db.exec(`
+        UPDATE deliverables SET files = ?, updated_at = datetime('now') WHERE id = ?
+      `, [JSON.stringify(savedFiles), deliverableId]);
+    }
+
     const deliverable = await db.one('SELECT * FROM deliverables WHERE id = ?', [deliverableId]);
+
+    if (taskId) {
+      await maybeSendInboundTaskReviewReadyUpdate({
+        taskId,
+        deliverable,
+        submitterUserId: req.agent.isUserKey ? req.agent.userId : null,
+      });
+    }
 
     // Dispatch to delivery routes
     if (resolvedProjectId) {
       const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [resolvedProjectId]);
       const agentInfo = req.agent.id
         ? await db.one('SELECT id, name FROM agents WHERE id = ?', [req.agent.id])
+        : null;
+      const submitterLabel = req.agent.isUserKey
+        ? [
+          req.agent.userName || req.agent.userEmail || 'User',
+          req.agent.keyName ? `via ${req.agent.keyName}` : null
+        ].filter(Boolean).join(' ')
         : null;
 
       dispatchEvent('deliverable.submitted', {
@@ -727,7 +1040,9 @@ router.post('/', agentAuth, validateBody(submitDeliverableSchema), logAgentActiv
           status: deliverable.status,
           files: savedFiles,
           metadata: safeJsonParse(deliverable.metadata, {}),
-          submitted_by: agentInfo ? { id: agentInfo.id, name: agentInfo.name } : null
+          submitted_by: agentInfo
+            ? { id: agentInfo.id, name: agentInfo.name, type: 'agent' }
+            : (submittedByUserId ? { id: submittedByUserId, name: submitterLabel || req.agent.userName || req.agent.userEmail || 'User', type: 'user_key' } : null)
         },
         taskId: taskId || null,
         timestamp: new Date().toISOString()
@@ -804,6 +1119,14 @@ router.post('/:id/revision', agentAuth, validateBody(submitRevisionSchema), logA
     const finalContent = content ?? parent.content ?? '';
     const finalSummary = summary ?? parent.summary;
     const finalActions = actions ?? safeJsonParse(parent.actions, []);
+    const finalContentType = contentType
+      || (content ? detectDeliverableContentType(content) : parent.content_type)
+      || detectDeliverableContentType(finalContent);
+
+    const finalMetadata = withUserKeySubmissionMetadata(
+      metadata ?? safeJsonParse(parent.metadata, {}),
+      req.agent
+    );
 
     // Determine submitted_by_user_id for user key submissions
     const submittedByUserId = req.agent.isUserKey ? req.agent.userId : null;
@@ -830,12 +1153,12 @@ router.post('/:id/revision', agentAuth, validateBody(submitRevisionSchema), logA
           title || parent.title,
           finalSummary,
           finalContent,
-          contentType || (content ? detectDeliverableContentType(content) : parent.content_type) || detectDeliverableContentType(finalContent),
+          finalContentType,
           txVersion,
           parent.id,
           '[]', // Placeholder for files, will update after saving
           JSON.stringify(finalActions),
-          JSON.stringify(metadata || safeJsonParse(parent.metadata, {}))
+          JSON.stringify(finalMetadata)
         ]);
 
         // Update parent deliverable status to 'revised'
@@ -875,6 +1198,21 @@ router.post('/:id/revision', agentAuth, validateBody(submitRevisionSchema), logA
       }
 
       // Update deliverable with file references
+      await db.exec(`
+        UPDATE deliverables SET files = ?, updated_at = datetime('now') WHERE id = ?
+      `, [JSON.stringify(savedFiles), deliverableId]);
+    }
+
+    if (shouldCreateHtmlAttachment(savedFiles, finalContentType, finalContent)) {
+      const savedHtml = await saveDeliverableFile(
+        buildDeliverableHtmlFilename(title || parent.title),
+        finalContent,
+        deliverableId
+      );
+      savedFiles = [{
+        ...savedHtml,
+        mimeType: 'text/html'
+      }];
       await db.exec(`
         UPDATE deliverables SET files = ?, updated_at = datetime('now') WHERE id = ?
       `, [JSON.stringify(savedFiles), deliverableId]);

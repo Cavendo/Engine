@@ -146,7 +146,7 @@ export function createApp(options = {}) {
     const uploadsPath = join(__dirname, '../data/uploads');
     app.use('/uploads', dualAuth, express.static(uploadsPath));
 
-    // afterRoutes hook — Cloud mounts its routes HERE
+    // afterRoutes hook for downstream route extensions
     if (options.afterRoutes) await options.afterRoutes(app);
 
     // Serve static UI in production
@@ -295,25 +295,27 @@ export function createApp(options = {}) {
 ╚══════════════════════════════════════════════════════════╝
         `);
 
-        // Post-listen startup tasks
-        processPendingDeliveries().catch(err =>
-          console.error('Error processing pending deliveries:', err));
-        startDispatcher();
-        startRetrySweep();
-        startSkillsRuntimePoller();
+        if (options.startBackgroundWorkers !== false) {
+          // Post-listen startup tasks
+          processPendingDeliveries().catch(err =>
+            console.error('Error processing pending deliveries:', err));
+          startDispatcher();
+          startRetrySweep();
+          startSkillsRuntimePoller();
 
-        // Session cleanup interval (every 15 min)
-        sessionCleanupHandle = setInterval(() => {
-          db.exec("DELETE FROM sessions WHERE expires_at < datetime('now')")
-            .then(result => {
-              if (result.changes > 0) {
-                console.log(`[Sessions] Cleaned up ${result.changes} expired session(s)`);
-              }
-            })
-            .catch(err => {
-              console.error('[Sessions] Cleanup error:', err);
-            });
-        }, 15 * 60 * 1000);
+          // Session cleanup interval (every 15 min)
+          sessionCleanupHandle = setInterval(() => {
+            db.exec("DELETE FROM sessions WHERE expires_at < datetime('now')")
+              .then(result => {
+                if (result.changes > 0) {
+                  console.log(`[Sessions] Cleaned up ${result.changes} expired session(s)`);
+                }
+              })
+              .catch(err => {
+                console.error('[Sessions] Cleanup error:', err);
+              });
+          }, 15 * 60 * 1000);
+        }
 
         resolve(server);
       });

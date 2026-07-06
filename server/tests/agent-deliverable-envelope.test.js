@@ -19,6 +19,32 @@ describe('parseAgentDeliverableEnvelope', () => {
     expect(result.isEnvelope).toBe(false);
   });
 
+  test('single-file shorthand JSON becomes an HTML artifact without inlining raw source into deliverable content', () => {
+    const html = '<!doctype html><html><body><h1>Hello</h1></body></html>';
+    const result = parseAgentDeliverableEnvelope(JSON.stringify({
+      filename: 'mockup.html',
+      content: html
+    }));
+    expect(result.isEnvelope).toBe(true);
+    expect(result.content).toBe('Attached file: mockup.html');
+    expect(result.contentTypeHint).toBe('markdown');
+    expect(result.artifacts).toHaveLength(1);
+    expect(result.artifacts[0].filename).toBe('mockup.html');
+    expect(result.artifacts[0].mime_type).toBe('text/html');
+    expect(Buffer.from(result.artifacts[0].content, 'base64').toString('utf8')).toBe(html);
+    expect(result.errors).toEqual([]);
+  });
+
+  test('single-file shorthand JSON with empty content is rejected', () => {
+    const result = parseAgentDeliverableEnvelope(JSON.stringify({
+      filename: 'mockup.html',
+      content: ''
+    }));
+    expect(result.isEnvelope).toBe(true);
+    expect(result.artifacts).toHaveLength(0);
+    expect(result.errors).toContain('filename/content shorthand: content must be a non-empty string');
+  });
+
   test('JSON array returns isEnvelope false', () => {
     const result = parseAgentDeliverableEnvelope('[1, 2, 3]');
     expect(result.isEnvelope).toBe(false);
@@ -245,9 +271,8 @@ describe('parseAgentDeliverableEnvelope', () => {
     expect(result.errors[0]).toMatch(/must contain at least one of/);
   });
 
-  test('scriptable MIME types (html, js, svg) are rejected for artifacts', () => {
+  test('scriptable MIME types (js, svg) are rejected for artifacts', () => {
     const cases = [
-      { filename: 'page.html', mime_type: 'text/html' },
       { filename: 'script.js', mime_type: 'application/javascript' },
       { filename: 'icon.svg', mime_type: 'image/svg+xml' },
     ];
@@ -269,11 +294,16 @@ describe('parseAgentDeliverableEnvelope', () => {
 
   test('safe doc/media MIME types are accepted for artifacts', () => {
     const cases = [
+      { filename: 'page.html', mime_type: 'text/html' },
       { filename: 'doc.pdf', mime_type: 'application/pdf' },
       { filename: 'photo.png', mime_type: 'image/png' },
       { filename: 'data.csv', mime_type: 'text/csv' },
       { filename: 'notes.txt', mime_type: 'text/plain' },
       { filename: 'report.docx', mime_type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' },
+      { filename: 'sheet.xlsx', mime_type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' },
+      { filename: 'legacy.xls', mime_type: 'application/vnd.ms-excel' },
+      { filename: 'slides.pptx', mime_type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' },
+      { filename: 'legacy.ppt', mime_type: 'application/vnd.ms-powerpoint' },
     ];
     for (const { filename, mime_type } of cases) {
       const envelope = JSON.stringify({

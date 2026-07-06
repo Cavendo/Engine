@@ -7,6 +7,7 @@ import crypto from 'crypto';
 const tempDir = mkdtempSync(join(tmpdir(), 'cavendo-async-access-routes-'));
 const tempDbPath = join(tempDir, 'test.db');
 process.env.DATABASE_PATH = tempDbPath;
+process.env.DB_DRIVER = 'sqlite';
 process.env.SESSION_SECRET = 'test-secret-for-async-access-routes';
 process.env.NODE_ENV = 'test';
 if (!process.env.ENCRYPTION_KEY) {

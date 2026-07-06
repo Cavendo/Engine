@@ -489,7 +489,7 @@ function classifyApiError(status, errorBody, provider) {
   let category = 'unknown';
   if (status === 401 || code === 'invalid_api_key' || code === 'authentication_error') {
     category = 'auth_error';
-  } else if (status === 403 || code === 'insufficient_quota' || message.toLowerCase().includes('billing')) {
+  } else if (status === 403 || code === 'insufficient_quota' || message.toLowerCase().includes('payment') || message.toLowerCase().includes('plan')) {
     category = 'quota_exceeded';
   } else if (status === 429 || code === 'rate_limit_exceeded') {
     category = 'rate_limited';

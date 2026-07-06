@@ -7,6 +7,7 @@ import crypto from 'crypto';
 const tempDir = mkdtempSync(join(tmpdir(), 'cavendo-internal-provisioning-'));
 const tempDbPath = join(tempDir, 'test.db');
 process.env.DATABASE_PATH = tempDbPath;
+process.env.DB_DRIVER = 'sqlite';
 process.env.SESSION_SECRET = 'test-secret-for-internal-provisioning';
 process.env.INTERNAL_SERVICE_TOKEN = 'internal-provisioning-token';
 process.env.NODE_ENV = 'test';

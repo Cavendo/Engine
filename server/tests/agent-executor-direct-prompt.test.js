@@ -7,6 +7,7 @@ import crypto from 'crypto';
 const tempDir = mkdtempSync(join(tmpdir(), 'cavendo-agent-executor-direct-'));
 const tempDbPath = join(tempDir, 'test.db');
 process.env.DATABASE_PATH = tempDbPath;
+process.env.DB_DRIVER = 'sqlite';
 process.env.SESSION_SECRET = 'test-secret-for-agent-executor-direct';
 process.env.NODE_ENV = 'test';
 process.env.ENCRYPTION_KEY = crypto.randomBytes(32).toString('hex');

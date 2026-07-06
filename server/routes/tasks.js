@@ -1,12 +1,15 @@
 import { Router } from 'express';
 import db from '../db/adapter.js';
 import * as response from '../utils/response.js';
-import { userAuth, requireRoles } from '../middleware/userAuth.js';
+import { requireRoles } from '../middleware/userAuth.js';
 import { agentAuth, dualAuth, logAgentActivity } from '../middleware/agentAuth.js';
 import { triggerWebhook } from '../services/webhooks.js';
 import { dispatchEvent } from '../services/routeDispatcher.js';
 import { logActivity } from '../services/activityLogger.js';
 import { canAccessTask } from '../utils/authorization.js';
+import { insertDeliverableWithRetry } from '../utils/deliverableVersioning.js';
+import { detectDeliverableContentType } from '../utils/detectDeliverableContentType.js';
+import { toISOTimestamp as formatTimestamp } from '../utils/routeHelpers.js';
 import {
   evaluateRoutingRules,
   incrementActiveTaskCount,
@@ -19,13 +22,16 @@ import {
   updateTaskSchema,
   updateTaskStatusSchema,
   logTaskProgressSchema,
+  updateExternalTaskExecutionSchema,
+  submitExternalTaskResultSchema,
   bulkCreateTasksSchema,
   bulkUpdateTasksSchema,
   bulkDeleteTasksSchema
 } from '../utils/validation.js';
-import { toISOTimestamp as formatTimestamp } from '../utils/routeHelpers.js';
 
 const router = Router();
+const TERMINAL_TASK_STATUSES = ['completed', 'cancelled', 'blocked', 'deferred'];
+const USER_MUTABLE_TASK_STATUSES = ['pending', 'assigned', 'in_progress', 'review', 'blocked', 'deferred', 'completed', 'cancelled'];
 
 /**
  * Build assignee info for task.assigned event dispatch.
@@ -85,8 +91,212 @@ function normalizeTaskTimestamps(task) {
     due_date: toISOTimestamp(task.due_date),
     completed_at: toISOTimestamp(task.completed_at),
     assigned_at: toISOTimestamp(task.assigned_at),
-    started_at: toISOTimestamp(task.started_at)
+    started_at: toISOTimestamp(task.started_at),
+    agent_claimed_at: toISOTimestamp(task.agent_claimed_at),
+    agent_claim_expires_at: toISOTimestamp(task.agent_claim_expires_at),
+    agent_last_heartbeat_at: toISOTimestamp(task.agent_last_heartbeat_at)
   };
+}
+
+function normalizeTaskForContext(task) {
+  const normalized = normalizeTaskTimestamps(task);
+  return {
+    ...normalized,
+    projectId: normalized.projectId ?? normalized.project_id ?? null,
+    projectName: normalized.projectName ?? normalized.project_name ?? null,
+    assignedAgentId: normalized.assignedAgentId ?? normalized.assigned_agent_id ?? null,
+    parentTaskId: normalized.parentTaskId ?? normalized.parent_task_id ?? null,
+    dueDate: normalized.dueDate ?? normalized.due_date ?? null,
+    createdAt: normalized.createdAt ?? normalized.created_at ?? null,
+    updatedAt: normalized.updatedAt ?? normalized.updated_at ?? null,
+  };
+}
+
+function normalizeDeliverableForContext(deliverable) {
+  const createdAt = toISOTimestamp(deliverable?.created_at ?? deliverable?.createdAt);
+  const updatedAt = toISOTimestamp(deliverable?.updated_at ?? deliverable?.updatedAt);
+  return {
+    ...deliverable,
+    contentType: deliverable?.contentType ?? deliverable?.content_type ?? null,
+    created_at: createdAt,
+    createdAt,
+    updated_at: updatedAt,
+    updatedAt,
+  };
+}
+
+function normalizeActivityForTaskContext(activity) {
+  const createdAt = toISOTimestamp(activity?.created_at ?? activity?.createdAt);
+  const detail = safeJsonParse(activity?.detail ?? activity?.details, {});
+  return {
+    id: activity?.id,
+    taskId: String(activity?.entity_id ?? activity?.taskId ?? ''),
+    action: activity?.event_type ?? activity?.action ?? 'activity',
+    eventType: activity?.event_type ?? activity?.eventType ?? 'activity',
+    detail,
+    details: detail,
+    performedBy: activity?.actor_name ?? activity?.performedBy ?? 'system',
+    actorName: activity?.actor_name ?? activity?.actorName ?? 'system',
+    created_at: createdAt,
+    createdAt,
+  };
+}
+
+function usesHumanProjectScope(req) {
+  return Boolean(req.user || req.agent?.isUserKey);
+}
+
+async function resolveProjectScope() {
+  return { enabled: false, allowedProjectIds: [] };
+}
+
+async function ensureProjectAccess(req, projectId) {
+  if (!projectId || !usesHumanProjectScope(req)) {
+    return { allowed: true, scope: null };
+  }
+
+  const scope = await resolveProjectScope(req);
+  if (!scope.enabled) {
+    return { allowed: true, scope };
+  }
+
+  return {
+    allowed: scope.allowedProjectIds.includes(String(projectId)),
+    scope
+  };
+}
+
+function applyTaskContextPlan(rawContext) {
+  return rawContext && typeof rawContext === 'object' ? rawContext : {};
+}
+
+async function retrieveWeightedKnowledgeForTask() {
+  return { chunks: [] };
+}
+
+function buildTaskClaimantId(agentActor) {
+  const agentId = agentActor?.id ? `agent:${agentActor.id}` : 'agent:unknown';
+  const keyId = agentActor?.keyId ? `key:${agentActor.keyId}` : 'key:session';
+  return `${agentId}:${keyId}`;
+}
+
+function getRequestTaskCreatorIds(req) {
+  return {
+    createdByUserId: req.user?.id || req.agent?.userId || null,
+    createdByAgentId: req.agent?.id && !req.agent?.isUserKey ? req.agent.id : null
+  };
+}
+
+function taskClaimMatchesActor(task, agentActor, runtimeAgentId = null) {
+  const storedClaimant = String(task?.agent_claimed_by || '').trim();
+  if (!storedClaimant) return false;
+
+  const claimantId = buildTaskClaimantId(agentActor);
+  if (storedClaimant === claimantId) return true;
+
+  const effectiveAgentId = Number(runtimeAgentId || agentActor?.id || 0);
+  if (!agentActor?.isUserKey || !Number.isInteger(effectiveAgentId) || effectiveAgentId <= 0) {
+    return false;
+  }
+
+  const canonicalAgentPrefix = `agent:${effectiveAgentId}`;
+  return storedClaimant === canonicalAgentPrefix || storedClaimant.startsWith(`${canonicalAgentPrefix}:`);
+}
+
+function normalizeExternalAgentConfig(agent) {
+  const metadata = safeJsonParse(agent?.metadata, {}) || {};
+  return metadata.external_agent || metadata.externalAgent || null;
+}
+
+async function resolveExternalTaskActor(agentActor, preferredAgentId = null) {
+  if (!agentActor?.isUserKey) {
+    return {
+      runtimeAgent: {
+        id: agentActor?.id,
+        name: agentActor?.name || null,
+        owner_user_id: agentActor?.ownerUserId || null
+      },
+      authActor: agentActor
+    };
+  }
+
+  const ownedAgents = await db.many(`
+    SELECT id, name, execution_mode, metadata, owner_user_id
+    FROM agents
+    WHERE owner_user_id = ?
+      AND status = 'active'
+    ORDER BY
+      CASE WHEN execution_mode = 'polling' THEN 0 ELSE 1 END,
+      id ASC
+  `, [agentActor.userId]);
+
+  const candidates = ownedAgents.filter((agent) => (
+    String(agent.execution_mode || '').toLowerCase() === 'polling' || Boolean(normalizeExternalAgentConfig(agent))
+  ));
+
+  const runtimeAgent = preferredAgentId
+    ? candidates.find((agent) => Number(agent.id) === Number(preferredAgentId))
+    : (candidates[0] || null);
+
+  if (!runtimeAgent) return null;
+
+  return {
+    runtimeAgent,
+    authActor: {
+      ...agentActor,
+      id: runtimeAgent.id,
+      name: runtimeAgent.name,
+      ownerUserId: runtimeAgent.owner_user_id || agentActor.userId
+    }
+  };
+}
+
+async function updateExternalAgentMetadata(agentId, applyUpdate) {
+  if (!agentId) return null;
+  const agent = await db.one('SELECT id, metadata FROM agents WHERE id = ?', [agentId]);
+  if (!agent) return null;
+  const metadata = safeJsonParse(agent.metadata, {}) || {};
+  const nextExternal = {
+    ...(metadata.external_agent || metadata.externalAgent || {})
+  };
+  applyUpdate(nextExternal, metadata);
+  metadata.external_agent = nextExternal;
+  delete metadata.externalAgent;
+  await db.exec(
+    `UPDATE agents SET metadata = ?, updated_at = datetime('now') WHERE id = ?`,
+    [JSON.stringify(metadata), agentId]
+  );
+  return metadata.external_agent;
+}
+
+function hasTaskSourceMaterials(context) {
+  if (!context || typeof context !== 'object') return false;
+  const sourceDocuments = Array.isArray(context.source_documents)
+    ? context.source_documents
+    : (Array.isArray(context.sourceDocuments) ? context.sourceDocuments : []);
+  const sourceUrls = Array.isArray(context.source_urls)
+    ? context.source_urls
+    : (Array.isArray(context.sourceUrls) ? context.sourceUrls : []);
+  return sourceDocuments.length > 0 || sourceUrls.length > 0;
+}
+
+function isMissingColumnError(err, columnName) {
+  const normalizedColumn = String(columnName || '').trim().toLowerCase();
+  if (!normalizedColumn) return false;
+  const message = String(err?.message || '').toLowerCase();
+  return err?.code === '42703'
+    || message.includes(`column "${normalizedColumn}" does not exist`)
+    || message.includes(`no such column: ${normalizedColumn}`);
+}
+
+function buildTaskContextPayload(taskLike, rawContext = {}) {
+  return applyTaskContextPlan(rawContext, {
+    title: taskLike.title,
+    description: taskLike.description,
+    project_id: taskLike.project_id ?? taskLike.projectId ?? null,
+    task_type: taskLike.task_type ?? taskLike.taskType ?? null,
+    tags: Array.isArray(taskLike.tags) ? taskLike.tags : safeJsonParse(taskLike.tags, []),
+  });
 }
 
 // ============================================
@@ -96,12 +306,27 @@ function normalizeTaskTimestamps(task) {
 /**
  * GET /api/tasks
  * List all tasks with filtering
+ * Supports browser sessions and API keys.
  */
-router.get('/', userAuth, async (req, res) => {
+router.get('/', dualAuth, async (req, res) => {
   try {
     const { status, priority, projectId, agentId, sprintId } = req.query;
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
     const offset = Math.max(0, parseInt(req.query.offset) || 0);
+    const scope = await resolveProjectScope(req);
+    const scopedProjectIds = Array.isArray(scope?.allowedProjectIds)
+      ? scope.allowedProjectIds
+          .map((id) => Number.parseInt(id, 10))
+          .filter((id) => Number.isInteger(id) && id > 0)
+      : [];
+
+    if (scope.enabled && scopedProjectIds.length === 0) {
+      return response.success(res, []);
+    }
+
+    if (scope.enabled && projectId && !scopedProjectIds.includes(parseInt(projectId, 10))) {
+      return response.success(res, []);
+    }
 
     let query = `
       SELECT
@@ -116,6 +341,12 @@ router.get('/', userAuth, async (req, res) => {
       WHERE 1=1
     `;
     const params = [];
+
+    if (scope.enabled) {
+      const placeholders = scopedProjectIds.map(() => '?').join(',');
+      query += ` AND t.project_id IN (${placeholders})`;
+      params.push(...scopedProjectIds);
+    }
 
     if (status) {
       query += ' AND t.status = ?';
@@ -168,6 +399,18 @@ router.post('/', dualAuth, validateBody(createTaskSchema), async (req, res) => {
       taskType, requiredCapabilities, preferredAgentId
     } = req.body;
 
+    if (!projectId) {
+      return response.validationError(res, 'projectId is required');
+    }
+
+    const contextWithPlan = buildTaskContextPayload({
+      title,
+      description,
+      projectId,
+      taskType,
+      tags: tags || [],
+    }, context || {});
+
     const isAutoAssign = assignedAgentId === 'auto';
 
     // Validate agent exists if directly assigned (not 'auto')
@@ -178,12 +421,18 @@ router.post('/', dualAuth, validateBody(createTaskSchema), async (req, res) => {
       }
     }
 
-    // Validate project exists if provided
-    if (projectId) {
-      const project = await db.one('SELECT id FROM projects WHERE id = ?', [projectId]);
-      if (!project) {
-        return response.validationError(res, 'Invalid project ID');
-      }
+    const project = await db.one('SELECT id FROM projects WHERE id = ?', [projectId]);
+    if (!project) {
+      return response.validationError(res, 'Invalid project ID');
+    }
+
+    const projectAccess = await ensureProjectAccess(req, projectId);
+    if (!projectAccess.allowed) {
+      return response.forbidden(res, 'Project access denied');
+    }
+
+    if (hasTaskSourceMaterials(contextWithPlan) && !projectId) {
+      return response.validationError(res, 'projectId is required when source materials are attached');
     }
 
     // Validate sprint exists if provided
@@ -202,13 +451,13 @@ router.post('/', dualAuth, validateBody(createTaskSchema), async (req, res) => {
     // Auto-assign: evaluate routing rules when 'auto' and project exists (read-only)
     let candidateAgentId = null;
     if (isAutoAssign && projectId) {
-      const taskData = {
-        tags: tags || [],
-        priority: priority || 2,
-        context: context || {},
-        requiredCapabilities: requiredCapabilities || [],
-        preferredAgentId: preferredAgentId || null
-      };
+          const taskData = {
+            tags: tags || [],
+            priority: priority || 2,
+            context: contextWithPlan,
+            requiredCapabilities: requiredCapabilities || [],
+            preferredAgentId: preferredAgentId || null
+          };
 
       const routingResult = await evaluateRoutingRules(projectId, taskData);
 
@@ -223,6 +472,7 @@ router.post('/', dualAuth, validateBody(createTaskSchema), async (req, res) => {
 
     // Reservation + task INSERT in same transaction (Issue #18)
     let result;
+    const { createdByUserId, createdByAgentId } = getRequestTaskCreatorIds(req);
     if (candidateAgentId) {
       result = await db.tx(async (tx) => {
         const reservation = await reserveAgentCapacity(candidateAgentId, tx);
@@ -240,9 +490,10 @@ router.post('/', dualAuth, validateBody(createTaskSchema), async (req, res) => {
             title, description, project_id, sprint_id, assigned_agent_id,
             status, priority, tags, context, due_date, assigned_at,
             routing_rule_id, routing_decision,
-            task_type, required_capabilities, preferred_agent_id
+            task_type, required_capabilities, preferred_agent_id,
+            created_by_user_id, created_by_agent_id
           )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `, [
           title,
           description || null,
@@ -252,14 +503,16 @@ router.post('/', dualAuth, validateBody(createTaskSchema), async (req, res) => {
           status,
           priority || 2,
           JSON.stringify(tags || []),
-          JSON.stringify(context || {}),
+          JSON.stringify(contextWithPlan),
           dueDate || null,
           finalAgentId ? new Date().toISOString() : null,
           routingRuleId,
           routingDecision,
           taskType || null,
           JSON.stringify(requiredCapabilities || []),
-          preferredAgentId || null
+          preferredAgentId || null,
+          createdByUserId,
+          createdByAgentId
         ]);
       });
     } else {
@@ -270,9 +523,10 @@ router.post('/', dualAuth, validateBody(createTaskSchema), async (req, res) => {
           title, description, project_id, sprint_id, assigned_agent_id,
           status, priority, tags, context, due_date, assigned_at,
           routing_rule_id, routing_decision,
-          task_type, required_capabilities, preferred_agent_id
+          task_type, required_capabilities, preferred_agent_id,
+          created_by_user_id, created_by_agent_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         title,
         description || null,
@@ -282,14 +536,16 @@ router.post('/', dualAuth, validateBody(createTaskSchema), async (req, res) => {
         status,
         priority || 2,
         JSON.stringify(tags || []),
-        JSON.stringify(context || {}),
+        JSON.stringify(contextWithPlan),
         dueDate || null,
         finalAgentId ? new Date().toISOString() : null,
         routingRuleId,
         routingDecision,
         taskType || null,
         JSON.stringify(requiredCapabilities || []),
-        preferredAgentId || null
+        preferredAgentId || null,
+        createdByUserId,
+        createdByAgentId
       ]);
       // Direct assignment bypasses capacity check (admin override)
       if (finalAgentId) {
@@ -406,7 +662,7 @@ router.post('/', dualAuth, validateBody(createTaskSchema), async (req, res) => {
  * Bulk create tasks (max 50 per request)
  * Supports automatic routing when no assignedAgentId is provided
  */
-router.post('/bulk', userAuth, requireRoles('admin'), validateBody(bulkCreateTasksSchema), async (req, res) => {
+router.post('/bulk', dualAuth, requireRoles('admin'), validateBody(bulkCreateTasksSchema), async (req, res) => {
   const { tasks } = req.body;
   const results = [];
   const errors = [];
@@ -422,6 +678,19 @@ router.post('/bulk', userAuth, requireRoles('admin'), validateBody(bulkCreateTas
             priority, tags, context, dueDate
           } = taskData;
 
+          if (!projectId) {
+            errors.push({ index: i, title, error: 'projectId is required' });
+            continue;
+          }
+
+          const contextWithPlan = buildTaskContextPayload({
+            title,
+            description,
+            projectId,
+            taskType: taskData.taskType,
+            tags: tags || [],
+          }, context || {});
+
           const isBulkAutoAssign = assignedAgentId === 'auto';
 
           // Validate agent exists if directly assigned (not 'auto')
@@ -433,13 +702,16 @@ router.post('/bulk', userAuth, requireRoles('admin'), validateBody(bulkCreateTas
             }
           }
 
-          // Validate project exists if provided
-          if (projectId) {
-            const project = await tx.one('SELECT id FROM projects WHERE id = ?', [projectId]);
-            if (!project) {
-              errors.push({ index: i, title, error: 'Invalid project ID' });
-              continue;
-            }
+          const project = await tx.one('SELECT id FROM projects WHERE id = ?', [projectId]);
+          if (!project) {
+            errors.push({ index: i, title, error: 'Invalid project ID' });
+            continue;
+          }
+
+          const projectAccess = await ensureProjectAccess(req, projectId);
+          if (!projectAccess.allowed) {
+            errors.push({ index: i, title, error: 'Project access denied' });
+            continue;
           }
 
           // Validate sprint exists if provided
@@ -461,7 +733,7 @@ router.post('/bulk', userAuth, requireRoles('admin'), validateBody(bulkCreateTas
             const routingTaskData = {
               tags: tags || [],
               priority: priority || 2,
-              context: context || {},
+              context: contextWithPlan,
               requiredCapabilities: taskData.requiredCapabilities || [],
               preferredAgentId: taskData.preferredAgentId || null
             };
@@ -488,14 +760,15 @@ router.post('/bulk', userAuth, requireRoles('admin'), validateBody(bulkCreateTas
           }
 
           const status = finalAgentId ? 'assigned' : 'pending';
+          const { createdByUserId, createdByAgentId } = getRequestTaskCreatorIds(req);
 
           const result = await tx.insert(`
             INSERT INTO tasks (
               title, description, project_id, sprint_id, assigned_agent_id,
               status, priority, tags, context, due_date, assigned_at,
-              routing_rule_id, routing_decision
+              routing_rule_id, routing_decision, created_by_user_id, created_by_agent_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `, [
             title,
             description || null,
@@ -505,11 +778,13 @@ router.post('/bulk', userAuth, requireRoles('admin'), validateBody(bulkCreateTas
             status,
             priority || 2,
             JSON.stringify(tags || []),
-            JSON.stringify(context || {}),
+            JSON.stringify(contextWithPlan),
             dueDate || null,
             finalAgentId ? new Date().toISOString() : null,
             routingRuleId,
-            routingDecision
+            routingDecision,
+            createdByUserId,
+            createdByAgentId
           ]);
 
           const task = await tx.one('SELECT * FROM tasks WHERE id = ?', [result.lastInsertRowid]);
@@ -580,10 +855,26 @@ router.post('/bulk', userAuth, requireRoles('admin'), validateBody(bulkCreateTas
  * Bulk update tasks (max 100 per request)
  * Handles agent task count management when reassigning or completing tasks
  */
-router.patch('/bulk', userAuth, requireRoles('admin'), validateBody(bulkUpdateTasksSchema), async (req, res) => {
+router.patch('/bulk', dualAuth, requireRoles('admin'), validateBody(bulkUpdateTasksSchema), async (req, res) => {
   const { taskIds, updates } = req.body;
   let updatedCount = 0;
   const errors = [];
+
+  if (updates.projectId === null) {
+    return response.validationError(res, 'projectId cannot be cleared');
+  }
+
+  if (updates.projectId !== undefined && updates.projectId !== null) {
+    const project = await db.one('SELECT id FROM projects WHERE id = ?', [updates.projectId]);
+    if (!project) {
+      return response.validationError(res, 'Invalid project ID');
+    }
+
+    const projectAccess = await ensureProjectAccess(req, updates.projectId);
+    if (!projectAccess.allowed) {
+      return response.forbidden(res, 'Project access denied');
+    }
+  }
 
   // Build update query
   const updateParts = [];
@@ -680,21 +971,20 @@ router.patch('/bulk', userAuth, requireRoles('admin'), validateBody(bulkUpdateTa
             });
           }
           // Decrement old agent count
-          if (oldAgentId && oldStatus !== 'completed' && oldStatus !== 'cancelled') {
+          if (oldAgentId && !TERMINAL_TASK_STATUSES.includes(oldStatus)) {
             agentCountChanges.set(oldAgentId, (agentCountChanges.get(oldAgentId) || 0) - 1);
           }
-          // Increment new agent count (only if task is not completed/cancelled)
-          if (newAgentId && newStatus !== 'completed' && newStatus !== 'cancelled') {
+          // Increment new agent count if task is active and not terminal.
+          if (newAgentId && !TERMINAL_TASK_STATUSES.includes(newStatus)) {
             agentCountChanges.set(newAgentId, (agentCountChanges.get(newAgentId) || 0) + 1);
           }
         }
 
         // Handle status changes affecting active task count
         if (updates.status !== undefined) {
-          const terminalStatuses = ['completed', 'cancelled'];
           const activeStatuses = ['in_progress'];
-          const oldWasTerminal = terminalStatuses.includes(oldStatus);
-          const newIsTerminal = terminalStatuses.includes(newStatus);
+          const oldWasTerminal = TERMINAL_TASK_STATUSES.includes(oldStatus);
+          const newIsTerminal = TERMINAL_TASK_STATUSES.includes(newStatus);
           const newIsActive = activeStatuses.includes(newStatus);
 
           // If task moved FROM terminal TO active status, increment active count
@@ -840,7 +1130,7 @@ router.patch('/bulk', userAuth, requireRoles('admin'), validateBody(bulkUpdateTa
  * Bulk delete tasks (max 100 per request)
  * Decrements agent task counts for active assigned tasks
  */
-router.delete('/bulk', userAuth, requireRoles('admin'), validateBody(bulkDeleteTasksSchema), async (req, res) => {
+router.delete('/bulk', dualAuth, requireRoles('admin'), validateBody(bulkDeleteTasksSchema), async (req, res) => {
   const { taskIds } = req.body;
   let deletedCount = 0;
   const errors = [];
@@ -868,7 +1158,7 @@ router.delete('/bulk', userAuth, requireRoles('admin'), validateBody(bulkDeleteT
       const agentDecrements = new Map();
       for (const task of existingTasks) {
         // Only decrement if task has an agent and is not already completed/cancelled
-        if (task.assigned_agent_id && task.status !== 'completed' && task.status !== 'cancelled') {
+        if (task.assigned_agent_id && !TERMINAL_TASK_STATUSES.includes(task.status)) {
           agentDecrements.set(
             task.assigned_agent_id,
             (agentDecrements.get(task.assigned_agent_id) || 0) + 1
@@ -999,7 +1289,7 @@ router.get('/:id', dualAuth, async (req, res) => {
 router.get('/:id/context', dualAuth, async (req, res) => {
   try {
     const task = await db.one(`
-      SELECT t.*, p.id as project_id, p.name as project_name, s.id as sprint_id, s.name as sprint_name
+      SELECT t.*, p.id as project_id, p.name as project_name, p.description as project_description, p.type as project_type, s.id as sprint_id, s.name as sprint_name
       FROM tasks t
       LEFT JOIN projects p ON p.id = t.project_id
       LEFT JOIN sprints s ON s.id = t.sprint_id
@@ -1013,9 +1303,11 @@ router.get('/:id/context', dualAuth, async (req, res) => {
     // Authorization check
     if (req.agent) {
       if (req.agent.isUserKey) {
-        // User keys inherit the user's role — only admin/reviewer can access task context
-        if (!req.agent.userRole || !['admin', 'reviewer'].includes(req.agent.userRole)) {
-          return response.forbidden(res, 'Insufficient role for task context access');
+        const ownedIds = req.agent.ownedAgentIds || [];
+        if (!ownedIds.includes(task.assigned_agent_id)) {
+          if (!req.agent.userRole || !['admin', 'reviewer'].includes(req.agent.userRole)) {
+            return response.forbidden(res, 'Task not assigned to an agent you own');
+          }
         }
       } else {
         // Agent key: verify this task is assigned to them OR to an agent they own
@@ -1061,59 +1353,88 @@ router.get('/:id/context', dualAuth, async (req, res) => {
       }
     }
 
-    // Get project knowledge
-    let knowledge = [];
-    if (task.project_id) {
-      knowledge = await db.many(`
-        SELECT id, title, content, content_type, category, tags
-        FROM knowledge
-        WHERE project_id = ?
-        ORDER BY created_at DESC
-      `, [task.project_id]);
-
-      knowledge = knowledge.map(k => ({
-        ...k,
-        tags: safeJsonParse(k.tags, [])
-      }));
-    }
+    // Weighted context retrieval (same context strategy used during agent execution)
+    const retrieval = await retrieveWeightedKnowledgeForTask(task, {
+      requesterType: 'task_context_api',
+      requesterId: String(req.params.id),
+      logRetrieval: false,
+      returnAudit: true,
+    });
+    const knowledge = Array.isArray(retrieval?.chunks) ? retrieval.chunks : [];
 
     // Get previous deliverables and feedback
-    const deliverables = (await db.many(`
+    const deliverableRows = await db.many(`
       SELECT id, title, content, content_type, status, version, feedback, created_at
       FROM deliverables
       WHERE task_id = ?
       ORDER BY version DESC
-    `, [req.params.id])).map(d => ({
-      ...d,
-      created_at: toISOTimestamp(d.created_at)
-    }));
+    `, [req.params.id]);
+    const deliverables = Array.isArray(deliverableRows)
+      ? deliverableRows.map(normalizeDeliverableForContext)
+      : [];
 
     // Get related tasks (same project)
     let relatedTasks = [];
     if (task.project_id) {
-      relatedTasks = await db.many(`
+      const relatedTaskRows = await db.many(`
         SELECT id, title, status, priority
         FROM tasks
         WHERE project_id = ? AND id != ?
         ORDER BY priority ASC, created_at DESC
         LIMIT 10
       `, [task.project_id, req.params.id]);
+      relatedTasks = Array.isArray(relatedTaskRows)
+        ? relatedTaskRows
+        : [];
     }
 
+    const historyRows = await db.many(`
+      SELECT id, entity_id, event_type, actor_name, detail, created_at
+      FROM activity_log
+      WHERE entity_type = 'task' AND entity_id = ?
+      ORDER BY created_at ASC
+      LIMIT 25
+    `, [req.params.id]);
+    const history = Array.isArray(historyRows)
+      ? historyRows.map(normalizeActivityForTaskContext)
+      : [];
+
+    const taskContext = safeJsonParse(task.context, {});
+
     response.success(res, {
-      task: normalizeTaskTimestamps(task),
+      task: normalizeTaskForContext(task),
       agent: agentProfile,
       project: task.project_id ? {
         id: task.project_id,
-        name: task.project_name
+        name: task.project_name,
+        description: task.project_description || '',
+        type: task.project_type || 'project'
       } : null,
       sprint: task.sprint_id ? {
         id: task.sprint_id,
         name: task.sprint_name
       } : null,
+      contextPlan: retrieval?.contextPlan || null,
+      taskMaterials: retrieval?.taskMaterials || {
+        sourceDocuments: [],
+        sourceUrls: [],
+        inboundAttachments: [],
+      },
+      projectCollectionsContext: taskContext?.project_collections_context
+        || taskContext?.projectCollectionsContext
+        || null,
+      contextBuckets: {
+        taskMaterials: retrieval?.buckets?.taskMaterials || [],
+        projectContext: retrieval?.buckets?.projectContext || [],
+        projectCollections: retrieval?.buckets?.projectCollections || [],
+        priorOutputs: retrieval?.buckets?.priorOutputs || [],
+        systemReferences: retrieval?.buckets?.systemReferences || [],
+      },
+      retrievalAudit: retrieval?.audit || null,
       knowledge,
       deliverables,
-      relatedTasks
+      relatedTasks,
+      history
     });
   } catch (err) {
     console.error('Error getting task context:', err);
@@ -1125,17 +1446,68 @@ router.get('/:id/context', dualAuth, async (req, res) => {
  * PATCH /api/tasks/:id
  * Update task
  */
-router.patch('/:id', userAuth, validateBody(updateTaskSchema), async (req, res) => {
+router.patch('/:id', dualAuth, validateBody(updateTaskSchema), async (req, res) => {
   try {
     const task = await db.one('SELECT * FROM tasks WHERE id = ?', [req.params.id]);
     if (!task) {
       return response.notFound(res, 'Task');
     }
 
+    // User API keys should behave like the owning user, but generic agent keys
+    // must continue using the narrower task status/progress endpoints.
+    if (req.agent && !req.agent.isUserKey) {
+      return response.forbidden(res, 'Agent keys cannot update tasks via this endpoint');
+    }
+
+    const access = await canAccessTask(req, req.params.id);
+    if (!access?.allowed) {
+      if (access?.reason === 'not_found') {
+        return response.notFound(res, 'Task');
+      }
+      return response.forbidden(res, 'Access denied');
+    }
+
     const {
       title, description, projectId, sprintId, assignedAgentId,
       status, priority, context, dueDate, tags
     } = req.body;
+
+    if (projectId === null) {
+      return response.validationError(res, 'projectId cannot be cleared');
+    }
+
+    if (projectId !== undefined && projectId !== null) {
+      const project = await db.one('SELECT id FROM projects WHERE id = ?', [projectId]);
+      if (!project) {
+        return response.validationError(res, 'Invalid project ID');
+      }
+
+      const projectAccess = await ensureProjectAccess(req, projectId);
+      if (!projectAccess.allowed) {
+        return response.forbidden(res, 'Project access denied');
+      }
+    }
+
+    const effectiveProjectId = projectId !== undefined ? projectId : task.project_id;
+    const effectiveContext = context !== undefined ? context : safeJsonParse(task.context, {});
+    const effectiveTags = tags !== undefined ? tags : safeJsonParse(task.tags, []);
+    if (hasTaskSourceMaterials(effectiveContext) && !effectiveProjectId) {
+      return response.validationError(res, 'projectId is required when source materials are attached');
+    }
+    const nextContextPayload = buildTaskContextPayload({
+      title: title !== undefined ? title : task.title,
+      description: description !== undefined ? description : task.description,
+      projectId: effectiveProjectId,
+      taskType: task.task_type,
+      tags: effectiveTags,
+    }, effectiveContext);
+    const shouldRefreshContextPlan = (
+      title !== undefined
+      || description !== undefined
+      || projectId !== undefined
+      || tags !== undefined
+      || context !== undefined
+    );
 
     const updates = [];
     const values = [];
@@ -1214,10 +1586,6 @@ router.patch('/:id', userAuth, validateBody(updateTaskSchema), async (req, res) 
 
       // Check if this is a new assignment or reassignment
       if (resolvedAgentId && resolvedAgentId !== task.assigned_agent_id) {
-        const agent = await db.one('SELECT id FROM agents WHERE id = ?', [resolvedAgentId]);
-        if (!agent) {
-          return response.validationError(res, 'Invalid agent ID');
-        }
         shouldTriggerAssignedWebhook = true;
 
         // Defer count changes to happen in transaction with UPDATE (Issue #18)
@@ -1239,7 +1607,7 @@ router.patch('/:id', userAuth, validateBody(updateTaskSchema), async (req, res) 
       }
     }
     if (status !== undefined) {
-      const validStatuses = ['pending', 'assigned', 'in_progress', 'review', 'completed', 'cancelled'];
+      const validStatuses = USER_MUTABLE_TASK_STATUSES;
       if (!validStatuses.includes(status)) {
         return response.validationError(res, `Status must be one of: ${validStatuses.join(', ')}`);
       }
@@ -1259,9 +1627,9 @@ router.patch('/:id', userAuth, validateBody(updateTaskSchema), async (req, res) 
       values.push(priority);
       shouldTriggerUpdatedWebhook = true;
     }
-    if (context !== undefined) {
+    if (shouldRefreshContextPlan) {
       updates.push('context = ?');
-      values.push(JSON.stringify(context));
+      values.push(JSON.stringify(nextContextPayload));
     }
     if (dueDate !== undefined) {
       updates.push('due_date = ?');
@@ -1314,10 +1682,9 @@ router.patch('/:id', userAuth, validateBody(updateTaskSchema), async (req, res) 
       await tx.exec(`UPDATE tasks SET ${updates.join(', ')} WHERE id = ?`, values);
 
       // Handle active_task_count changes based on status transitions
-      const terminalStatuses = ['completed', 'cancelled'];
       const activeStatuses = ['in_progress'];
-      const oldWasTerminal = terminalStatuses.includes(task.status);
-      const newIsTerminal = terminalStatuses.includes(status);
+      const oldWasTerminal = TERMINAL_TASK_STATUSES.includes(task.status);
+      const newIsTerminal = TERMINAL_TASK_STATUSES.includes(status);
       const newIsActive = activeStatuses.includes(status);
 
       // Need to read the updated task for agent ID
@@ -1422,7 +1789,7 @@ router.patch('/:id', userAuth, validateBody(updateTaskSchema), async (req, res) 
  * DELETE /api/tasks/:id
  * Delete task
  */
-router.delete('/:id', userAuth, requireRoles('admin'), async (req, res) => {
+router.delete('/:id', dualAuth, requireRoles('admin'), async (req, res) => {
   try {
     const task = await db.one('SELECT id, title, description, assigned_agent_id, status, priority, project_id, tags FROM tasks WHERE id = ?', [req.params.id]);
     if (!task) {
@@ -1491,36 +1858,54 @@ router.patch('/:id/status', agentAuth, validateBody(updateTaskStatusSchema), log
       return response.notFound(res, 'Task');
     }
 
-    // Verify task is assigned to this agent (or to an agent owned by this user)
+    // Verify task is assigned to this actor, or was created by this actor.
     if (req.agent.isUserKey) {
       const ownedIds = req.agent.ownedAgentIds || [];
-      if (!ownedIds.includes(task.assigned_agent_id)) {
+      const createdByUser = req.agent.userId && Number(task.created_by_user_id) === Number(req.agent.userId);
+      if (!createdByUser && !ownedIds.includes(task.assigned_agent_id)) {
         return response.forbidden(res, 'Task not assigned to an agent you own');
       }
-    } else if (task.assigned_agent_id !== req.agent.id) {
+    } else if (task.assigned_agent_id !== req.agent.id && task.created_by_agent_id !== req.agent.id) {
       return response.forbidden(res, 'Task not assigned to this agent');
     }
 
     const { status, progress } = req.body;
 
-    const validStatuses = ['in_progress', 'review'];
+    const validStatuses = ['assigned', 'in_progress', 'review', 'completed'];
     if (!validStatuses.includes(status)) {
       return response.validationError(res, `Status must be one of: ${validStatuses.join(', ')}`);
     }
 
     const updates = ['status = ?', "updated_at = datetime('now')"];
     const values = [status];
+    const nextContext = safeJsonParse(task.context, {});
+    let shouldPersistContext = false;
 
     if (status === 'in_progress' && task.status !== 'in_progress') {
       updates.push("started_at = datetime('now')");
     }
 
+    if (status === 'assigned') {
+      updates.push('started_at = NULL');
+      updates.push('completed_at = NULL');
+      if (Object.prototype.hasOwnProperty.call(nextContext, 'lastExecutionError')) {
+        delete nextContext.lastExecutionError;
+        shouldPersistContext = true;
+      }
+    }
+
+    if (status === 'completed' && task.status !== 'completed') {
+      updates.push("completed_at = COALESCE(completed_at, datetime('now'))");
+    }
+
     if (progress !== undefined) {
-      // Store progress in context
-      const context = safeJsonParse(task.context, {});
-      context.progress = progress;
+      nextContext.progress = progress;
+      shouldPersistContext = true;
+    }
+
+    if (shouldPersistContext) {
       updates.push('context = ?');
-      values.push(JSON.stringify(context));
+      values.push(JSON.stringify(nextContext));
     }
 
     values.push(req.params.id);
@@ -1663,6 +2048,319 @@ router.post('/:id/progress', agentAuth, validateBody(logTaskProgressSchema), log
     });
   } catch (err) {
     console.error('Error logging task progress:', err);
+    response.serverError(res);
+  }
+});
+
+/**
+ * POST /api/tasks/:id/external-status
+ * Update BYOA execution lifecycle state for a claimed task.
+ */
+router.post('/:id/external-status', agentAuth, validateBody(updateExternalTaskExecutionSchema), async (req, res) => {
+  try {
+    const runtime = await resolveExternalTaskActor(req.agent, req.body?.agentId || req.query?.agentId || null);
+    const runtimeAgent = runtime?.runtimeAgent;
+    if (!runtimeAgent) {
+      return response.notFound(res, 'External agent');
+    }
+
+    const task = await db.one('SELECT * FROM tasks WHERE id = ?', [req.params.id]);
+    if (!task) {
+      return response.notFound(res, 'Task');
+    }
+    if (task.assigned_agent_id !== runtimeAgent.id) {
+      return response.forbidden(res, 'Task not assigned to this agent');
+    }
+
+    const claimantId = buildTaskClaimantId(runtime.authActor);
+    if (!taskClaimMatchesActor(task, runtime.authActor, runtimeAgent.id)) {
+      return response.forbidden(res, 'Task lease is not claimed by this worker');
+    }
+
+    const { status, message, progress, externalRunId, error } = req.body;
+    const nextContext = safeJsonParse(task.context, {}) || {};
+    nextContext.externalExecution = {
+      ...(nextContext.externalExecution || {}),
+      status,
+      message: message || null,
+      lastUpdatedAt: new Date().toISOString(),
+      error: error || null,
+      externalRunId: externalRunId || nextContext.externalExecution?.externalRunId || task.external_run_id || null
+    };
+    if (progress !== undefined) nextContext.externalExecution.progress = progress;
+
+    let mappedTaskStatus = task.status;
+    if (status === 'running') mappedTaskStatus = 'in_progress';
+    else if (status === 'blocked' || status === 'needs_input' || status === 'failed') mappedTaskStatus = 'blocked';
+    else if (status === 'submitted') mappedTaskStatus = 'review';
+    else if (status === 'canceled') mappedTaskStatus = 'cancelled';
+
+    const updates = [
+      'external_execution_status = ?',
+      'external_run_id = COALESCE(?, external_run_id)',
+      'external_error = ?',
+      'context = ?',
+      "updated_at = datetime('now')"
+    ];
+    const values = [
+      status,
+      externalRunId || null,
+      error || null,
+      JSON.stringify(nextContext)
+    ];
+
+    if (mappedTaskStatus !== task.status) {
+      updates.push('status = ?');
+      values.push(mappedTaskStatus);
+      if (mappedTaskStatus === 'in_progress' && task.status !== 'in_progress') {
+        updates.push("started_at = COALESCE(started_at, datetime('now'))");
+      }
+      if (mappedTaskStatus === 'cancelled' && task.status !== 'cancelled') {
+        updates.push("completed_at = COALESCE(completed_at, datetime('now'))");
+      }
+    }
+
+    values.push(req.params.id);
+    await db.exec(`UPDATE tasks SET ${updates.join(', ')} WHERE id = ?`, values);
+
+    await updateExternalAgentMetadata(runtimeAgent.id, (external) => {
+      external.status = status === 'failed' ? 'error' : 'connected';
+      external.lastSeenAt = new Date().toISOString();
+      external.lastHeartbeatAt = new Date().toISOString();
+      external.lastExecutionStatus = status;
+      if (externalRunId) external.lastRunId = externalRunId;
+      if (error) {
+        external.lastErrorAt = new Date().toISOString();
+        external.lastErrorMessage = error;
+      } else if (status !== 'failed') {
+        external.lastErrorAt = null;
+        external.lastErrorMessage = null;
+      }
+    });
+
+    const updated = await db.one('SELECT * FROM tasks WHERE id = ?', [req.params.id]);
+    response.success(res, normalizeTaskTimestamps(updated));
+  } catch (err) {
+    console.error('Error updating external task status:', err);
+    response.serverError(res);
+  }
+});
+
+/**
+ * POST /api/tasks/:id/result
+ * Submit a text deliverable for a claimed task from a BYOA worker.
+ */
+router.post('/:id/result', agentAuth, validateBody(submitExternalTaskResultSchema), async (req, res) => {
+  let runtimeAgentId = null;
+  let submitPhase = 'resolve_runtime';
+  try {
+    const runtime = await resolveExternalTaskActor(req.agent, req.body?.agentId || req.query?.agentId || null);
+    const runtimeAgent = runtime?.runtimeAgent;
+    if (!runtimeAgent) {
+      return response.notFound(res, 'External agent');
+    }
+    runtimeAgentId = runtimeAgent.id;
+
+    const task = await db.one('SELECT * FROM tasks WHERE id = ?', [req.params.id]);
+    if (!task) {
+      return response.notFound(res, 'Task');
+    }
+    if (task.assigned_agent_id !== runtimeAgent.id) {
+      return response.forbidden(res, 'Task not assigned to this agent');
+    }
+
+    const claimantId = buildTaskClaimantId(runtime.authActor);
+    if (!taskClaimMatchesActor(task, runtime.authActor, runtimeAgent.id)) {
+      return response.forbidden(res, 'Task lease is not claimed by this worker');
+    }
+
+    const {
+      title,
+      summary,
+      content,
+      contentType,
+      metadata,
+      artifacts,
+      inputTokens,
+      outputTokens,
+      provider,
+      model,
+      requestReview
+    } = req.body;
+
+    const finalTitle = String(title || task.title || `Task #${task.id} result`).trim();
+    const finalContent = content || '';
+    const finalSummary = summary || null;
+    const finalContentType = contentType || detectDeliverableContentType(content);
+    const agentId = runtimeAgent.id;
+    const normalizedMetadata = (metadata && typeof metadata === 'object' && !Array.isArray(metadata)) ? metadata : {};
+    const normalizedArtifacts = Array.isArray(artifacts)
+      ? artifacts.filter((artifact) => artifact && typeof artifact === 'object' && !Array.isArray(artifact))
+      : [];
+    const finalMetadata = normalizedArtifacts.length > 0
+      ? { ...normalizedMetadata, external_artifacts: normalizedArtifacts }
+      : normalizedMetadata;
+    const nextTaskStatus = requestReview === false ? 'completed' : 'review';
+    const nextExecutionStatus = requestReview === false ? 'completed' : 'submitted';
+
+    submitPhase = 'insert_deliverable';
+    const deliverableId = await insertDeliverableWithRetry(db, async (tx) => {
+      const lastVersion = await tx.one(`
+        SELECT MAX(version) as max_version FROM deliverables WHERE task_id = ?
+      `, [task.id]);
+      const version = (lastVersion?.max_version || 0) + 1;
+      let parentId = null;
+      if (version > 1) {
+        const parent = await tx.one(`
+          SELECT id FROM deliverables WHERE task_id = ? AND version = ?
+        `, [task.id, version - 1]);
+        parentId = parent?.id || null;
+      }
+
+      const insertResult = await tx.insert(`
+        INSERT INTO deliverables (
+          task_id, project_id, agent_id, title, summary, content, content_type,
+          version, parent_id, files, actions, metadata,
+          input_tokens, output_tokens, provider, model
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        task.id,
+        task.project_id || null,
+        agentId,
+        finalTitle,
+        finalSummary,
+        finalContent,
+        finalContentType,
+        version,
+        parentId,
+        JSON.stringify([]),
+        JSON.stringify([]),
+        JSON.stringify(finalMetadata),
+        inputTokens || null,
+        outputTokens || null,
+        provider || null,
+        model || null
+      ]);
+
+      return insertResult.lastInsertRowid;
+    });
+
+    submitPhase = 'update_task_after_result';
+    const nextContext = safeJsonParse(task.context, {}) || {};
+    nextContext.externalExecution = {
+      ...(nextContext.externalExecution || {}),
+      status: nextExecutionStatus,
+      submittedAt: new Date().toISOString(),
+      resultDeliverableId: Number(deliverableId)
+    };
+    const taskUpdateParts = [
+      'context = ?',
+      'agent_claimed_by = NULL',
+      'agent_claimed_at = NULL',
+      'agent_claim_expires_at = NULL',
+      'external_execution_status = ?',
+      'status = ?',
+      "updated_at = datetime('now')"
+    ];
+    if (requestReview === false) {
+      taskUpdateParts.splice(taskUpdateParts.length - 1, 0, "completed_at = COALESCE(completed_at, datetime('now'))");
+    }
+    const runTaskUpdate = async (includeCompletedAt = requestReview === false) => {
+      const updateParts = [
+        'context = ?',
+        'agent_claimed_by = NULL',
+        'agent_claimed_at = NULL',
+        'agent_claim_expires_at = NULL',
+        'external_execution_status = ?',
+        'status = ?',
+        "updated_at = datetime('now')"
+      ];
+      if (includeCompletedAt) {
+        updateParts.splice(updateParts.length - 1, 0, "completed_at = COALESCE(completed_at, datetime('now'))");
+      }
+      return db.exec(`
+        UPDATE tasks
+        SET ${updateParts.join(',\n          ')}
+        WHERE id = ?
+      `, [JSON.stringify(nextContext), nextExecutionStatus, nextTaskStatus, task.id]);
+    };
+
+    try {
+      await runTaskUpdate(requestReview === false);
+    } catch (taskUpdateErr) {
+      if (requestReview === false && isMissingColumnError(taskUpdateErr, 'completed_at')) {
+        console.warn('External task result completion update retried without completed_at column', {
+          taskId: task.id,
+          runtimeAgentId: agentId
+        });
+        await runTaskUpdate(false);
+      } else {
+        throw taskUpdateErr;
+      }
+    }
+
+    submitPhase = 'load_deliverable';
+    const deliverable = await db.one('SELECT * FROM deliverables WHERE id = ?', [deliverableId]);
+    const deliverablePayload = {
+      ...deliverable,
+      files: safeJsonParse(deliverable.files, []),
+      actions: safeJsonParse(deliverable.actions, []),
+      metadata: safeJsonParse(deliverable.metadata, {})
+    };
+    submitPhase = 'load_agent_name';
+    const agentName = (await db.one('SELECT name FROM agents WHERE id = ?', [agentId]))?.name || 'agent';
+    logActivity('deliverable', Number(deliverableId), 'created', agentName, { title: finalTitle, source: 'external_agent' });
+    triggerWebhook(agentId, 'deliverable.submitted', {
+      deliverable: deliverablePayload,
+      taskId: task.id
+    });
+    if (task.project_id) {
+      submitPhase = 'dispatch_deliverable_submitted';
+      const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [task.project_id]);
+      dispatchEvent('deliverable.submitted', {
+        project: project ? { id: project.id, name: project.name } : { id: task.project_id },
+        projectId: task.project_id,
+        deliverable: {
+          id: deliverable.id,
+          title: deliverable.title,
+          summary: deliverable.summary,
+          content: deliverable.content,
+          content_type: deliverable.content_type,
+          status: deliverable.status,
+          files: deliverablePayload.files,
+          metadata: deliverablePayload.metadata,
+          submitted_by: { id: agentId, name: agentName }
+        },
+        taskId: task.id,
+        timestamp: new Date().toISOString()
+      }).catch(err => console.error('[Tasks] Route dispatch error:', err));
+    }
+
+    submitPhase = 'update_external_agent_metadata';
+    await updateExternalAgentMetadata(agentId, (external) => {
+      external.status = 'connected';
+      external.lastSeenAt = new Date().toISOString();
+      external.lastSuccessfulResultAt = new Date().toISOString();
+      external.lastExecutionStatus = nextExecutionStatus;
+      external.lastErrorAt = null;
+      external.lastErrorMessage = null;
+    });
+
+    submitPhase = 'load_updated_task';
+    response.created(res, {
+      deliverable: deliverablePayload,
+      task: normalizeTaskTimestamps(await db.one('SELECT * FROM tasks WHERE id = ?', [task.id]))
+    });
+  } catch (err) {
+    console.error('Error submitting external task result:', {
+      phase: submitPhase,
+      taskId: Number.parseInt(req.params.id, 10) || null,
+      requestReview: req.body?.requestReview,
+      runtimeAgentId,
+      bodyKeys: Object.keys(req.body || {}).sort(),
+      error: err?.stack || err?.message || err
+    });
     response.serverError(res);
   }
 });
@@ -1838,7 +2536,7 @@ router.get('/:id/activity', dualAuth, async (req, res) => {
  * POST /api/tasks/:id/execute
  * Manually trigger execution for a task (admin only)
  */
-router.post('/:id/execute', userAuth, requireRoles('admin'), async (req, res) => {
+router.post('/:id/execute', dualAuth, requireRoles('admin'), async (req, res) => {
   try {
     const { executeTaskNow } = await import('../services/taskDispatcher.js');
     const result = await executeTaskNow(parseInt(req.params.id));
@@ -1860,7 +2558,7 @@ router.post('/:id/execute', userAuth, requireRoles('admin'), async (req, res) =>
  * Clear execution error from a task so the dispatcher will pick it up again.
  * Also allows resetting status to 'assigned' if currently stuck.
  */
-router.post('/:id/retry', userAuth, requireRoles('admin'), async (req, res) => {
+router.post('/:id/retry', dualAuth, requireRoles('admin'), async (req, res) => {
   try {
     const task = await db.one('SELECT id, context, status, assigned_agent_id FROM tasks WHERE id = ?', [req.params.id]);
     if (!task) return response.notFound(res, 'Task');

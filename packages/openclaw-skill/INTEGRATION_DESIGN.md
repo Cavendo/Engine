@@ -377,7 +377,7 @@ CAVENDO_AGENT_KEY=cav_uk_xxxxx  # Never commit to git
 - API accessible only from local machine
 - No TLS required (localhost trusted)
 
-**Cloud Deployment:**
+**Hosted Deployment:**
 - HTTPS required (TLS 1.2+)
 - API key sent in `X-Agent-Key` header (encrypted in transit)
 - Consider IP whitelist for additional security
@@ -572,7 +572,7 @@ if active_count >= get_max_concurrent():
 ### Scenario 2: Team Use (Multi-User)
 
 **Setup:**
-- Cavendo Engine on VPS/cloud (https://portal.cavendo.net)
+- Cavendo Engine on a VPS or hosted environment
 - Multiple OpenClaw instances (each team member)
 - Agent keys per instance (`cav_ak_...`)
 - Shared projects, separate tasks

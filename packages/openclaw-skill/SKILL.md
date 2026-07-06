@@ -54,7 +54,7 @@ This skill connects your OpenClaw assistant to a Cavendo Engine instance, allowi
 
 1. **Cavendo Engine** - Running instance (v0.1.0 or higher)
    - Self-hosted: http://localhost:3001
-   - Or cloud: https://portal.cavendo.net
+   - Or hosted at your deployment URL
 
 2. **Python 3.8+** - For Cavendo Python SDK
 
@@ -279,7 +279,7 @@ Create a cron job that automatically claims and executes tasks:
 Edit `lib/config.py` to customize which AI models are used:
 
 ```python
-MODEL_ROUTING = {
+MODEL_SELECTION = {
     "high_priority": "anthropic/claude-sonnet-4-6",
     "medium_priority": "anthropic/claude-haiku-4-5",
     "low_priority": "anthropic/claude-haiku-4-5",
@@ -405,7 +405,7 @@ Deliverables:
 **Solution:**
 1. Verify Cavendo Engine is running: `curl http://localhost:3001/api/health`
 2. Check `CAVENDO_URL` in `.env`
-3. If using cloud, ensure URL includes `https://`
+3. If using a hosted endpoint, ensure URL includes `https://`
 
 ### Authentication Errors
 

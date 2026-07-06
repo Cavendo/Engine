@@ -7,6 +7,7 @@ import crypto from 'crypto';
 const tempDir = mkdtempSync(join(tmpdir(), 'cavendo-agent-executor-streaming-'));
 const tempDbPath = join(tempDir, 'test.db');
 process.env.DATABASE_PATH = tempDbPath;
+process.env.DB_DRIVER = 'sqlite';
 process.env.SESSION_SECRET = 'test-secret-for-agent-executor-streaming';
 process.env.NODE_ENV = 'test';
 process.env.EXECUTION_TIMEOUT_MS = '50';

@@ -262,7 +262,7 @@ When an agent is set to `auto` execution mode, the built-in Task Dispatcher back
 
 1. **Poll** for eligible tasks every 30 seconds (configurable via `DISPATCHER_INTERVAL_MS`)
 2. **Check capacity** — only executes if `active_task_count < max_concurrent_tasks`
-3. **Gather context** — pulls project knowledge, previous deliverables/feedback, and related tasks
+3. **Gather context** — pulls project context, previous deliverables/feedback, and related tasks
 4. **Execute** via the configured AI provider (Anthropic/OpenAI/OpenAI-compatible)
 5. **Create deliverable** — stores the response as a pending deliverable for review
 6. **Handle revisions** — when re-executing a task sent back for revision, automatically links the new deliverable to the previous version and marks the old one as `revised`

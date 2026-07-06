@@ -1,10 +1,12 @@
-# Knowledge Base Guide
+# Context Guide
 
-Add knowledge documents to give AI agents context about your projects.
+Add context documents to give AI agents the background they need for your projects.
 
 ## Overview
 
-The knowledge base stores reference documents, guidelines, templates, and examples that agents can search and use when working on tasks. Knowledge is scoped to projects, allowing you to provide relevant context for different workflows.
+The context library stores reference documents, guidelines, templates, and examples that agents can search and use when working on tasks. Context is scoped to projects, allowing you to provide relevant background for different workflows.
+
+For API compatibility, the current endpoints and MCP tool names still use `knowledge` in their paths or identifiers.
 
 ## Document Types
 
@@ -32,6 +34,29 @@ The knowledge base stores reference documents, guidelines, templates, and exampl
 
 ### Via API
 
+Default rule:
+
+- if the document belongs to a specific project, use the project-scoped route
+- only use the generic `/api/knowledge` write path when you intentionally want shared Context
+
+Recommended project-scoped example:
+
+```bash
+curl -X POST http://localhost:3001/api/projects/1/knowledge \
+  -H "Content-Type: application/json" \
+  -b cookies.txt \
+  -d '{
+    "title": "API Style Guide",
+    "type": "guideline",
+    "category": "development",
+    "content": "## REST API Guidelines\n\n### Naming Conventions\n- Use kebab-case for endpoints...",
+    "contentType": "markdown",
+    "include_in_tasks": true
+  }'
+```
+
+Generic shared example:
+
 ```bash
 curl -X POST http://localhost:3001/api/knowledge \
   -H "Content-Type: application/json" \
@@ -45,6 +70,8 @@ curl -X POST http://localhost:3001/api/knowledge \
     "contentType": "markdown"
   }'
 ```
+
+Only use that generic route when the Context should be shared across the whole deployment rather than tied to one project.
 
 ## Searching Knowledge
 
@@ -60,7 +87,8 @@ cavendo_search_knowledge(query="authentication", projectId=1)
 
 ```bash
 curl "http://localhost:3001/api/knowledge/search?query=authentication&projectId=1" \
-  -H "X-Agent-Key: cav_ak_..."
+  -H "Authorization: Bearer cav_uk_..." \
+  -H "X-Project-Id: 1"
 ```
 
 ## Task Context Integration

@@ -265,7 +265,7 @@ components:
           type: array
           items:
             type: string
-            enum: [read, write, webhook:create, '*']
+            enum: [read, write, 'webhook:create', '*']
         last_used_at:
           type: string
           format: date-time
@@ -360,7 +360,7 @@ components:
           type: array
           items:
             type: string
-            enum: [read, write, webhook:create, '*']
+            enum: [read, write, 'webhook:create', '*']
           default: [read, write]
         expiresAt:
           type: string
@@ -628,6 +628,135 @@ components:
           description: Agents can only set status to in_progress or review
         progress:
           description: Optional progress data to store in task context
+
+    ExternalTaskPollResponse:
+      type: object
+      properties:
+        task:
+          $ref: '#/components/schemas/Task'
+          nullable: true
+        dispatch:
+          type: object
+          properties:
+            runtime:
+              type: string
+            connectionType:
+              type: string
+            allowedActions:
+              type: array
+              items:
+                type: string
+            policy:
+              type: string
+            contextUrl:
+              type: string
+              nullable: true
+        reason:
+          type: string
+          nullable: true
+
+    ClaimTaskLeaseRequest:
+      type: object
+      properties:
+        externalRunId:
+          type: string
+          maxLength: 255
+          nullable: true
+        leaseSeconds:
+          type: integer
+          minimum: 30
+          maximum: 3600
+          nullable: true
+
+    TaskLeaseHeartbeatRequest:
+      type: object
+      properties:
+        externalRunId:
+          type: string
+          maxLength: 255
+          nullable: true
+        leaseSeconds:
+          type: integer
+          minimum: 30
+          maximum: 3600
+          nullable: true
+        statusMessage:
+          type: string
+          maxLength: 2000
+          nullable: true
+
+    ReleaseTaskLeaseRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          maxLength: 2000
+          nullable: true
+        abandon:
+          type: boolean
+          default: false
+
+    UpdateExternalTaskExecutionRequest:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum: [accepted, running, blocked, needs_input, submitted, failed, canceled]
+        message:
+          type: string
+          maxLength: 5000
+          nullable: true
+        progress:
+          type: object
+          additionalProperties: true
+        externalRunId:
+          type: string
+          maxLength: 255
+          nullable: true
+        error:
+          type: string
+          maxLength: 5000
+          nullable: true
+
+    SubmitExternalTaskResultRequest:
+      type: object
+      properties:
+        title:
+          type: string
+          maxLength: 500
+          nullable: true
+        summary:
+          type: string
+          maxLength: 50000
+        content:
+          type: string
+          maxLength: 1000000
+        contentType:
+          type: string
+          enum: [markdown, html, json, text, code]
+        metadata:
+          type: object
+          additionalProperties: true
+        inputTokens:
+          type: integer
+          minimum: 0
+        outputTokens:
+          type: integer
+          minimum: 0
+        provider:
+          type: string
+          maxLength: 50
+        model:
+          type: string
+          maxLength: 100
+        requestReview:
+          type: boolean
+          default: true
+      anyOf:
+        - required: [summary]
+        - required: [content]
 
     NextTaskResponse:
       type: object
@@ -1748,6 +1877,183 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
 
+  /api/agents/me/tasks/poll:
+    post:
+      tags: [Agents]
+      summary: Poll assigned work for an external employee
+      description: |
+        Returns the next assigned task that is ready for an external employee runtime.
+        Includes dispatch metadata such as allowed actions, policy, and the task context URL.
+      security:
+        - agentKey: []
+      responses:
+        '200':
+          description: Assigned task or a no-work response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/ExternalTaskPollResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/agents/me/tasks/{taskId}/claim:
+    post:
+      tags: [Agents]
+      summary: Claim an external task lease
+      description: Claims the execution lease for an assigned task before work begins.
+      security:
+        - agentKey: []
+      parameters:
+        - name: taskId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClaimTaskLeaseRequest'
+      responses:
+        '200':
+          description: Lease claimed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      task:
+                        $ref: '#/components/schemas/Task'
+                      lease:
+                        type: object
+                        properties:
+                          claimantId:
+                            type: string
+                          claimedAt:
+                            type: string
+                            format: date-time
+                          expiresAt:
+                            type: string
+                            format: date-time
+                          leaseSeconds:
+                            type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Task already claimed by another worker
+
+  /api/agents/me/tasks/{taskId}/heartbeat:
+    post:
+      tags: [Agents]
+      summary: Renew an external task lease
+      description: Extends the lease for a claimed task and records the worker heartbeat.
+      security:
+        - agentKey: []
+      parameters:
+        - name: taskId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TaskLeaseHeartbeatRequest'
+      responses:
+        '200':
+          description: Heartbeat accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      taskId:
+                        type: integer
+                      heartbeatAt:
+                        type: string
+                        format: date-time
+                      expiresAt:
+                        type: string
+                        format: date-time
+                      leaseSeconds:
+                        type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/agents/me/tasks/{taskId}/release:
+    post:
+      tags: [Agents]
+      summary: Release an external task lease
+      description: Releases a claimed task lease without submitting a final result.
+      security:
+        - agentKey: []
+      parameters:
+        - name: taskId
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReleaseTaskLeaseRequest'
+      responses:
+        '200':
+          description: Lease released
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    type: object
+                    properties:
+                      released:
+                        type: boolean
+                        example: true
+                      taskId:
+                        type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   /api/agents/{id}:
     get:
       tags: [Agents]
@@ -2361,7 +2667,7 @@ paths:
         Returns comprehensive context bundle for task execution including:
         - Task details
         - Project information
-        - Project knowledge base
+        - Project context
         - Previous deliverables and feedback
         - Related tasks
 
@@ -2438,6 +2744,84 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/tasks/{id}/external-status:
+    post:
+      tags: [Tasks]
+      summary: Update external execution lifecycle state
+      description: Updates BYOA or external employee execution state for a claimed task.
+      security:
+        - agentKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateExternalTaskExecutionRequest'
+      responses:
+        '200':
+          description: External status updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/Task'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/tasks/{id}/result:
+    post:
+      tags: [Tasks]
+      summary: Submit an external worker result
+      description: Creates a deliverable from a claimed external task and clears the lease.
+      security:
+        - agentKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitExternalTaskResultRequest'
+      responses:
+        '200':
+          description: Result submitted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  data:
+                    $ref: '#/components/schemas/Deliverable'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
         '422':

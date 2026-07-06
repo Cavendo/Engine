@@ -40,9 +40,11 @@ function signHeaders(body) {
   const secret = process.env.SKILLS_WORKER_HMAC_SECRET;
   if (secret) {
     const timestamp = new Date().toISOString();
-    const payload = `${timestamp}.${body}`;
+    const requestId = crypto.randomUUID();
+    const payload = `${timestamp}.${requestId}.${body}`;
     const signature = crypto.createHmac('sha256', secret).update(payload).digest('hex');
     headers['X-Skills-Timestamp'] = timestamp;
+    headers['X-Skills-Request-Id'] = requestId;
     headers['X-Skills-Signature'] = signature;
   }
 
@@ -76,6 +78,23 @@ function normalizeRunContext(input = {}) {
 
 function isObjectLike(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function normalizeWorkerConnectorKey(key) {
+  const normalized = String(key || '').trim();
+  if (normalized === 'googleBusinessProfile') return 'google_business_profile';
+  return normalized;
+}
+
+function normalizeWorkerConnectorMap(value) {
+  if (!isObjectLike(value)) return {};
+  const out = {};
+  for (const [key, entry] of Object.entries(value)) {
+    const normalizedKey = normalizeWorkerConnectorKey(key);
+    if (!normalizedKey) continue;
+    out[normalizedKey] = entry;
+  }
+  return out;
 }
 
 function mapInvokePayloadToWorker(payload = {}) {
@@ -112,7 +131,15 @@ function mapInvokePayloadToWorker(payload = {}) {
   };
 
   if (isObjectLike(payload.connector_bindings)) {
-    body.connector_bindings = payload.connector_bindings;
+    body.connector_bindings = normalizeWorkerConnectorMap(payload.connector_bindings);
+  }
+
+  if (isObjectLike(payload.connector_binding_details)) {
+    body.connector_binding_details = normalizeWorkerConnectorMap(payload.connector_binding_details);
+  }
+
+  if (isObjectLike(payload.connector_resolutions)) {
+    body.connector_resolutions = normalizeWorkerConnectorMap(payload.connector_resolutions);
   }
 
   if (timeoutSeconds) {
@@ -165,7 +192,10 @@ export class HttpWorkerAdapter extends SkillsAdapter {
       }
 
       const data = await parseJsonResponse(response).catch(() => ({}));
-      const message = data.error?.message || data.message || `Worker error HTTP ${response.status}`;
+      const message = (typeof data.error === 'string' && data.error.trim())
+        || data.error?.message
+        || data.message
+        || `Worker error HTTP ${response.status}`;
 
       if (response.status === 404) {
         throw createError(SKILLS_ERROR_CODES.SKILL_NOT_FOUND, message, { status: response.status });

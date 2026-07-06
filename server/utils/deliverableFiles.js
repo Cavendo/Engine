@@ -36,27 +36,39 @@ const MIME_TYPES = {
   '.xml': 'application/xml',
   '.zip': 'application/zip',
   '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.odt': 'application/vnd.oasis.opendocument.text',
   '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.xls': 'application/vnd.ms-excel',
+  '.ods': 'application/vnd.oasis.opendocument.spreadsheet',
+  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.ppt': 'application/vnd.ms-powerpoint',
+  '.odp': 'application/vnd.oasis.opendocument.presentation',
   '.csv': 'text/csv',
 };
 
 /**
  * Allowed MIME types for agent-produced artifacts.
- * Conservative allowlist: documents, images, and data formats only.
- * Excludes scriptable/web types (.html, .js, .svg, .xml, .zip, .css) to
- * prevent agents from producing executable content.
+ * Conservative allowlist for user-facing deliverable artifacts.
+ * Includes common office formats and html mockups used in creative workflows.
  */
 const ALLOWED_ARTIFACT_MIME_TYPES = new Set([
   'text/plain',
   'text/markdown',
   'text/csv',
+  'text/html',
   'application/json',
   'application/pdf',
   'image/png',
   'image/jpeg',
   'image/gif',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.oasis.opendocument.text',
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.ms-excel',
+  'application/vnd.oasis.opendocument.spreadsheet',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'application/vnd.ms-powerpoint',
+  'application/vnd.oasis.opendocument.presentation',
 ]);
 
 /**

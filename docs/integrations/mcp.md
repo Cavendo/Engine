@@ -2,6 +2,13 @@
 
 The Cavendo MCP Server enables Claude Desktop and other MCP-compatible clients to interact with Cavendo Engine naturally.
 
+For first-class external employees, use MCP and the direct HTTP API together intentionally:
+
+- use MCP for interactive, local, human-steered access to Cavendo
+- use the HTTP API lease flow for unattended queue execution, heartbeat, and result submission
+
+If you are building an always-on external worker, start with the external runtime contract in [External Employees](../external-agents.md).
+
 ## Installation
 
 ```bash
@@ -100,7 +107,7 @@ Description: Create comprehensive REST API documentation with examples.
 
 ### `cavendo_get_task_context`
 
-Get full context for a task including project knowledge and previous deliverables.
+Get full context for a task including project context and previous deliverables.
 
 **Parameters:**
 - `taskId` (required): Task ID
@@ -111,7 +118,7 @@ Claude: Give me context for task 5.
 [Uses cavendo_get_task_context]
 Task: Write API documentation
 Project: Cavendo Engine
-Related Knowledge:
+Related Context:
 - API Design Guidelines
 - REST Best Practices
 Previous Deliverables:
@@ -187,7 +194,7 @@ Submit a revised version of a deliverable.
 
 ### `cavendo_search_knowledge`
 
-Search the project knowledge base.
+Search the project context library.
 
 **Parameters:**
 - `query` (required): Search query
@@ -278,7 +285,7 @@ List all projects the agent has access to.
 
 ### `cavendo://projects/{id}/knowledge`
 
-Get all knowledge documents for a specific project.
+Get all project context documents for a specific project.
 
 ### `cavendo://tasks/assigned`
 
@@ -305,7 +312,7 @@ Claude: [Uses cavendo_get_task_context for task 1]
 
 I've started working on the user guide. Here's what I know:
 - Project: Documentation Site
-- Related knowledge: Style Guide, Terminology
+- Related context: Style Guide, Terminology
 - Due: Tomorrow
 
 Let me draft the initial content...
@@ -351,5 +358,22 @@ The deliverable is back in review.
 1. **Always get context first** - Use `cavendo_get_task_context` before starting work
 2. **Update status when starting** - Mark tasks as `in_progress` immediately
 3. **Check for revisions** - Regularly check for feedback on submitted work
-4. **Use the knowledge base** - Search for relevant documentation before starting
+4. **Use context** - Search for relevant documentation before starting
 5. **Log progress** - Use `cavendo_log_progress` for long tasks
+
+## External Worker Note
+
+The current MCP server is best for local and interactive usage. First-class external employees still rely on the HTTP worker flow for:
+
+- polling assigned work
+- claiming execution leases
+- heartbeating while running
+- publishing external execution status
+- submitting final task results
+
+The recommended combined model is:
+
+1. Use the API lease flow to run unattended work.
+2. Use MCP when you want the runtime to browse context, inspect tasks manually, or support a human operator.
+
+See [External Employees](../external-agents.md) for the execution contract.

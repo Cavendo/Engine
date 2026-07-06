@@ -7,7 +7,7 @@ Routes automate the delivery of approved content to external systems. When a del
 Routes are project-scoped automation rules that:
 - **Trigger** on events like `deliverable.approved`, `deliverable.submitted`, etc.
 - **Filter** using optional conditions (tags, metadata)
-- **Deliver** to webhooks or email (Cloud adds Slack, WordPress, Zapier)
+- **Deliver** to webhooks, email, or other destination adapters
 - **Log** all delivery attempts with retry on failure
 
 ## Trigger Events

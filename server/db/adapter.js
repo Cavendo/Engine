@@ -2,16 +2,16 @@
  * Database Adapter Factory
  *
  * Returns the appropriate adapter based on DB_DRIVER env var.
- * Default is 'sqlite' for backward compatibility.
+ * Runtime requires PostgreSQL.
  *
  * Usage:
  *   import db from './db/adapter.js';
  *   const row = await db.one('SELECT * FROM tasks WHERE id = ?', [id]);
  *
  * Environment:
- *   DB_DRIVER=sqlite (default) — uses better-sqlite3
  *   DB_DRIVER=postgres — uses pg Pool
  *   DB_DRIVER=mysql — uses mysql2/promise Pool
+ *   DB_DRIVER=sqlite — only allowed when ALLOW_SQLITE=true (local tooling/tests)
  */
 
 import { createSqliteAdapter } from './sqliteAdapter.js';
@@ -42,7 +42,24 @@ function parseMysqlDatabaseUrl(databaseUrl) {
   };
 }
 
-const DB_DRIVER = process.env.DB_DRIVER || 'sqlite';
+const DB_DRIVER = String(
+  process.env.DB_DRIVER || (process.env.NODE_ENV === 'test' ? 'sqlite' : 'postgres')
+).toLowerCase();
+const ALLOW_SQLITE = process.env.ALLOW_SQLITE === 'true' || process.env.NODE_ENV === 'test';
+
+function sanitizeConnectionStringForManagedSsl(raw) {
+  try {
+    const url = new URL(raw);
+    // pg/pg-connection-string gives sslmode precedence over ssl object.
+    // Strip sslmode/libpq-compat flags so DATABASE_SSL=true can enforce
+    // rejectUnauthorized=false for managed DBs with internal/self-signed chains.
+    url.searchParams.delete('sslmode');
+    url.searchParams.delete('uselibpqcompat');
+    return url.toString();
+  } catch {
+    return raw;
+  }
+}
 
 let adapter;
 
@@ -59,11 +76,23 @@ if (DB_DRIVER === 'postgres') {
   // Optional pool configuration
   const poolMin = parseInt(process.env.PG_POOL_MIN, 10) || 2;
   const poolMax = parseInt(process.env.PG_POOL_MAX, 10) || 10;
+  const databaseSsl = process.env.DATABASE_SSL;
+
+  let ssl;
+  let connectionString = DATABASE_URL;
+  if (databaseSsl === 'true') {
+    // Managed Postgres providers often use private/internal CAs by default.
+    ssl = { rejectUnauthorized: false };
+    connectionString = sanitizeConnectionStringForManagedSsl(DATABASE_URL);
+  } else if (databaseSsl === 'false') {
+    ssl = false;
+  }
 
   const pool = new pg.Pool({
-    connectionString: DATABASE_URL,
+    connectionString,
     min: poolMin,
     max: poolMax,
+    ...(ssl !== undefined ? { ssl } : {}),
   });
 
   // Optional: parse timestamps as ISO strings instead of Date objects
@@ -108,6 +137,9 @@ if (DB_DRIVER === 'postgres') {
 
   adapter = createMysqlAdapter(pool);
 } else if (DB_DRIVER === 'sqlite') {
+  if (!ALLOW_SQLITE) {
+    throw new Error('DB_DRIVER=sqlite is disabled for runtime. Use DB_DRIVER=postgres (set ALLOW_SQLITE=true only for local tooling/tests).');
+  }
   // Import the existing connection singleton
   const { default: rawDb } = await import('./connection.js');
   adapter = createSqliteAdapter(rawDb);

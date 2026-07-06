@@ -1,6 +1,9 @@
 import crypto from 'crypto';
+import net from 'net';
 import rateLimit from 'express-rate-limit';
-import { generateCsrfToken } from '../utils/crypto.js';
+import { generateCsrfToken, hashApiKey, hashSessionToken } from '../utils/crypto.js';
+import { extractApiKeyFromRequest } from '../utils/apiKeyHeaders.js';
+import { getClientIp, normalizeIpAddress } from '../utils/clientIp.js';
 import * as response from '../utils/response.js';
 
 // ============================================
@@ -9,21 +12,99 @@ import * as response from '../utils/response.js';
 
 /**
  * General API rate limiter
- * Default: 300 requests per minute per IP (configurable via RATE_LIMIT_API env var)
+ * Default: 300 requests per minute per authenticated API key, or per IP when anonymous
+ * (configurable via RATE_LIMIT_API env var)
  */
-export const apiLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: parseInt(process.env.RATE_LIMIT_API || '300'),
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: {
-    success: false,
-    error: {
-      code: 'RATE_LIMIT_EXCEEDED',
-      message: 'Too many requests, please try again later'
+function parseRateLimitAllowlist(raw = process.env.RATE_LIMIT_API_ALLOWLIST || '') {
+  const blockList = new net.BlockList();
+  const entries = String(raw || '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+
+  for (const entry of entries) {
+    const cidrMatch = entry.match(/^(.+)\/(\d{1,3})$/);
+    if (cidrMatch) {
+      const address = normalizeIpAddress(cidrMatch[1]);
+      const prefix = parseInt(cidrMatch[2], 10);
+      const family = net.isIP(address);
+      if (family === 4 && prefix >= 0 && prefix <= 32) {
+        blockList.addSubnet(address, prefix, 'ipv4');
+      } else if (family === 6 && prefix >= 0 && prefix <= 128) {
+        blockList.addSubnet(address, prefix, 'ipv6');
+      }
+      continue;
+    }
+
+    const address = normalizeIpAddress(entry);
+    const family = net.isIP(address);
+    if (family === 4) {
+      blockList.addAddress(address, 'ipv4');
+    } else if (family === 6) {
+      blockList.addAddress(address, 'ipv6');
     }
   }
-});
+
+  return blockList;
+}
+
+export function isApiRateLimitAllowlisted(req, rawAllowlist = process.env.RATE_LIMIT_API_ALLOWLIST || '') {
+  const ip = getClientIp(req);
+  if (!ip) return false;
+
+  const family = net.isIP(ip);
+  if (!family) return false;
+
+  const blockList = parseRateLimitAllowlist(rawAllowlist);
+  if (family === 4) return blockList.check(ip, 'ipv4');
+  if (family === 6) return blockList.check(ip, 'ipv6');
+  return false;
+}
+
+export function getApiRateLimitKey(req) {
+  const apiKey = extractApiKeyFromRequest(req);
+  if (apiKey) {
+    return `api:${hashApiKey(apiKey)}`;
+  }
+
+  const sessionToken = String(req?.cookies?.session || '');
+  if (sessionToken) {
+    return `session:${hashSessionToken(sessionToken)}`;
+  }
+
+  const clientIp = getClientIp(req);
+  return `ip:${clientIp}`;
+}
+
+export function createApiLimiter(overrides = {}) {
+  const { skip: customSkip, ...restOverrides } = overrides;
+  return rateLimit({
+    windowMs: 60 * 1000, // 1 minute
+    max: parseInt(process.env.RATE_LIMIT_API || '300'),
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: getApiRateLimitKey,
+    skip: async (req, res) => {
+      if (isApiRateLimitAllowlisted(req)) {
+        return true;
+      }
+      if (typeof customSkip === 'function') {
+        return await customSkip(req, res);
+      }
+      return false;
+    },
+    message: {
+      success: false,
+      error: {
+        code: 'RATE_LIMIT_EXCEEDED',
+        message: 'Too many requests, please try again later'
+      }
+    },
+    ...restOverrides
+  });
+}
+
+export const apiLimiter = createApiLimiter();
 
 /**
  * Strict rate limiter for authentication endpoints
@@ -34,6 +115,7 @@ export const authLimiter = rateLimit({
   max: 5,
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: (req) => getClientIp(req) || String(req.ip || ''),
   skipSuccessfulRequests: true, // Only count failed attempts
   message: {
     success: false,
@@ -53,6 +135,7 @@ export const keyGenLimiter = rateLimit({
   max: 10,
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: (req) => getClientIp(req) || String(req.ip || ''),
   message: {
     success: false,
     error: {
@@ -71,6 +154,7 @@ export const webhookLimiter = rateLimit({
   max: 1000,
   standardHeaders: true,
   legacyHeaders: false,
+  keyGenerator: (req) => getClientIp(req) || String(req.ip || ''),
   message: {
     success: false,
     error: {
@@ -87,6 +171,19 @@ export const webhookLimiter = rateLimit({
 const CSRF_COOKIE_NAME = 'csrf_token';
 const CSRF_HEADER_NAME = 'x-csrf-token';
 const CSRF_TOKEN_LENGTH = 64;
+const PROOF_PROXY_PATH_PREFIX = String(process.env.PROOF_PROXY_PATH_PREFIX || '/proof').trim() || '/proof';
+const CSRF_EXEMPT_POST_PATHS = new Set([
+  '/api/auth/login',
+  '/api/auth/client-login',
+  '/oauth/approve',
+  '/oauth/deny',
+]);
+
+function normalizePath(pathValue) {
+  const raw = String(pathValue || '').trim();
+  if (!raw) return '';
+  return raw.length > 1 ? raw.replace(/\/+$/, '') : raw;
+}
 
 /**
  * Generate and set CSRF token cookie
@@ -126,8 +223,18 @@ export function csrfProtection(req, res, next) {
     return next();
   }
 
+  if (normalizePath(req.path).startsWith(PROOF_PROXY_PATH_PREFIX)) {
+    return next();
+  }
+
+  // Skip login/session-bootstrap endpoints. These can be called while a stale
+  // session cookie exists client-side, before a CSRF token is (re)issued.
+  if (req.method === 'POST' && CSRF_EXEMPT_POST_PATHS.has(normalizePath(req.path))) {
+    return next();
+  }
+
   // Skip for agent API requests
-  if (req.headers['x-agent-key']) {
+  if (extractApiKeyFromRequest(req)) {
     return next();
   }
 
@@ -170,7 +277,11 @@ export function csrfProtection(req, res, next) {
  */
 export function securityHeaders(req, res, next) {
   // Prevent clickjacking
-  res.setHeader('X-Frame-Options', 'DENY');
+  if (normalizePath(req.path).startsWith(PROOF_PROXY_PATH_PREFIX)) {
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  } else {
+    res.setHeader('X-Frame-Options', 'DENY');
+  }
 
   // Prevent MIME type sniffing
   res.setHeader('X-Content-Type-Options', 'nosniff');

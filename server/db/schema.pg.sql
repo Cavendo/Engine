@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS users (
     email TEXT UNIQUE NOT NULL,
     password_hash TEXT NOT NULL,
     name TEXT,
-    role TEXT DEFAULT 'reviewer' CHECK (role IN ('admin', 'reviewer', 'viewer')),
+    role TEXT DEFAULT 'reviewer' CHECK (role IN ('admin', 'operator', 'reviewer', 'viewer')),
+    is_agent_user INTEGER DEFAULT 0 CHECK (is_agent_user IN (0, 1)),
     status TEXT DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
     force_password_change INTEGER DEFAULT 0 CHECK (force_password_change IN (0, 1)),
     last_login_at TIMESTAMPTZ,
@@ -65,6 +66,7 @@ CREATE TABLE IF NOT EXISTS projects (
     name TEXT NOT NULL,
     external_key TEXT,
     description TEXT,
+    primary_url TEXT,
     status TEXT DEFAULT 'active' CHECK (status IN ('active', 'archived', 'completed')),
     task_routing_rules TEXT,
     default_agent_id INTEGER REFERENCES agents(id) ON DELETE SET NULL,
@@ -109,18 +111,27 @@ CREATE TABLE IF NOT EXISTS tasks (
     title TEXT NOT NULL,
     description TEXT,
     tags TEXT,
-    status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'assigned', 'in_progress', 'review', 'completed', 'cancelled')),
+    status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'assigned', 'in_progress', 'review', 'blocked', 'deferred', 'completed', 'cancelled')),
     priority INTEGER DEFAULT 2 CHECK (priority BETWEEN 1 AND 4),
     context TEXT,
     due_date TIMESTAMPTZ,
     assigned_at TIMESTAMPTZ,
     started_at TIMESTAMPTZ,
     completed_at TIMESTAMPTZ,
+    agent_claimed_by TEXT,
+    agent_claimed_at TIMESTAMPTZ,
+    agent_claim_expires_at TIMESTAMPTZ,
+    agent_last_heartbeat_at TIMESTAMPTZ,
+    external_execution_status TEXT CHECK (external_execution_status IN ('queued', 'accepted', 'running', 'blocked', 'needs_input', 'submitted', 'completed', 'failed', 'canceled')),
+    external_run_id TEXT,
+    external_error TEXT,
     routing_rule_id TEXT,
     routing_decision TEXT,
     task_type TEXT,
     required_capabilities TEXT,
     preferred_agent_id INTEGER REFERENCES agents(id) ON DELETE SET NULL,
+    created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    created_by_agent_id INTEGER REFERENCES agents(id) ON DELETE SET NULL,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
@@ -138,7 +149,7 @@ CREATE TABLE IF NOT EXISTS deliverables (
     content_type TEXT DEFAULT 'markdown' CHECK (content_type IN ('markdown', 'html', 'json', 'text', 'code')),
     files TEXT,
     actions TEXT,
-    status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'revision_requested', 'revised', 'rejected')),
+    status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'awaiting_client_review', 'approved', 'revision_requested', 'revised', 'rejected', 'dismissed', 'expired')),
     version INTEGER DEFAULT 1,
     parent_id INTEGER REFERENCES deliverables(id) ON DELETE SET NULL,
     reviewed_by TEXT,
@@ -221,7 +232,12 @@ CREATE TABLE IF NOT EXISTS task_progress (
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    token_hash TEXT,
     expires_at TIMESTAMPTZ NOT NULL,
+    last_activity_at TIMESTAMPTZ DEFAULT NOW(),
+    user_agent TEXT,
+    ip_address TEXT,
+    revoked_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
@@ -405,6 +421,8 @@ CREATE INDEX IF NOT EXISTS idx_agent_activity_agent ON agent_activity(agent_id);
 CREATE INDEX IF NOT EXISTS idx_agent_activity_created ON agent_activity(created_at);
 CREATE INDEX IF NOT EXISTS idx_task_progress_task ON task_progress(task_id);
 CREATE INDEX IF NOT EXISTS idx_task_progress_created ON task_progress(created_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_agent_claim_expires_at ON tasks(agent_claim_expires_at);
+CREATE INDEX IF NOT EXISTS idx_tasks_external_execution_status ON tasks(external_execution_status);
 CREATE INDEX IF NOT EXISTS idx_agents_owner ON agents(owner_user_id);
 CREATE INDEX IF NOT EXISTS idx_user_keys_user ON user_keys(user_id);
 CREATE INDEX IF NOT EXISTS idx_user_keys_hash ON user_keys(key_hash);

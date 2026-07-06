@@ -7,7 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-06
+
 ### Added
+- External-agent/BYOA runtime contracts for polling workers, execution leases,
+  status heartbeats, and result submission.
+- Runtime skill catalog/invocation improvements, worker adapter hardening, and
+  connector binding metadata support.
+- Additional security and validation hardening for API key headers, CSRF
+  handling, rate limits, environment loading, and generated content artifacts.
+- Database migrations for external execution state, user/operator metadata,
+  runtime skill policies, project URLs, task creator tracking, and deliverable
+  artifact links.
 - `createApp(options?)` factory in `server/app.js` for programmatic composition
   - Async lifecycle hooks: `beforeRoutes`, `afterRoutes`, `beforeStart`, `onStarted`
   - `start(bindOptions?)` with port/host override and idempotency

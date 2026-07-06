@@ -77,10 +77,19 @@ async function findEligibleTasks() {
     FROM tasks t
     JOIN agents a ON a.id = t.assigned_agent_id
     WHERE t.status IN ('pending', 'assigned')
-      AND a.execution_mode = 'auto'
+      -- Workflow-owned tasks must keep running even when the selected AI employee
+      -- is configured as manual (common for existing employees reused in workflows).
+      AND (
+        a.execution_mode = 'auto'
+        OR (
+          a.execution_mode IN ('manual', 'polling')
+          AND (
+            t.context LIKE '%"workflow_run_id"%'
+            OR t.context LIKE '%"workflowRunId"%'
+          )
+        )
+      )
       AND a.status = 'active'
-      AND a.provider IS NOT NULL
-      AND (a.provider_api_key_encrypted IS NOT NULL OR a.provider = 'openai_compatible')
       AND (a.max_concurrent_tasks IS NULL OR a.active_task_count < a.max_concurrent_tasks)
       -- due_date is a deadline, not a start schedule; do not gate auto-dispatch on it
     ORDER BY t.priority ASC, t.created_at ASC
@@ -128,6 +137,7 @@ async function dispatchTask(eligible) {
 
     if (result.success) {
       console.log(`[Dispatcher] Task #${task_id} completed successfully — deliverable #${result.deliverableId}`);
+      await clearTaskExecutionError(task_id);
 
       // Log success
       await logAgentActivity(agent_id, 'task.execution_completed', 'task', task_id, {
@@ -140,7 +150,8 @@ async function dispatchTask(eligible) {
         agentName: agent_name,
         deliverableId: result.deliverableId,
         inputTokens: result.usage?.inputTokens,
-        outputTokens: result.usage?.outputTokens
+        outputTokens: result.usage?.outputTokens,
+        autoRetry: result.autoRetry || null
       });
       await logActivity('deliverable', result.deliverableId, 'created', agent_name, {
         taskId: task_id,
@@ -253,13 +264,43 @@ async function flagTaskError(taskId, agentName, errorMessage, errorCategory) {
 }
 
 /**
+ * Clear stale execution error metadata after a successful run so UI/state
+ * reflects the latest task outcome instead of an old cooldown error.
+ */
+async function clearTaskExecutionError(taskId) {
+  try {
+    const task = await db.one('SELECT context FROM tasks WHERE id = ?', [taskId]);
+    let context = {};
+    try { context = JSON.parse(task?.context || '{}'); } catch { context = {}; }
+    if (!context.lastExecutionError) return;
+    delete context.lastExecutionError;
+    await db.exec(`
+      UPDATE tasks SET context = ?, updated_at = datetime('now') WHERE id = ?
+    `, [JSON.stringify(context), taskId]);
+  } catch (err) {
+    console.error(`[Dispatcher] Failed to clear error context for task #${taskId}:`, err);
+  }
+}
+
+/**
  * Classify an error message string into a category (fallback when category not available)
  */
 function classifyErrorMessage(msg) {
   if (!msg) return 'unknown';
   const lower = msg.toLowerCase();
+  if (lower.includes('model not found') || lower.includes('unknown model') || (lower.includes('404') && lower.includes('model'))) {
+    return 'model_not_found';
+  }
+  if (lower.includes('token limit')
+    || lower.includes('tokens per min')
+    || lower.includes('tpm')
+    || lower.includes('maximum context length')
+    || lower.includes('request too large')
+    || lower.includes('too many tokens')) {
+    return 'token_overlimit';
+  }
   if (lower.includes('invalid_api_key') || lower.includes('authentication') || lower.includes('401')) return 'auth_error';
-  if (lower.includes('insufficient_quota') || lower.includes('billing') || lower.includes('quota')) return 'quota_exceeded';
+  if (lower.includes('insufficient_quota') || lower.includes('payment') || lower.includes('plan') || lower.includes('quota')) return 'quota_exceeded';
   if (lower.includes('rate limit') || lower.includes('429')) return 'rate_limited';
   if (lower.includes('timeout') || lower.includes('aborted')) return 'timeout';
   if (lower.includes('overloaded') || lower.includes('529') || lower.includes('503')) return 'overloaded';
@@ -271,12 +312,34 @@ function classifyErrorMessage(msg) {
  * Check if an error is likely retryable (rate limits, timeouts, config errors)
  */
 function isRetryableError(errorMessage, category) {
-  if (category) return ['rate_limited', 'overloaded', 'timeout', 'config_error'].includes(category);
+  if (category) return ['rate_limited', 'overloaded', 'timeout', 'config_error', 'token_overlimit'].includes(category);
   if (!errorMessage) return false;
   const msg = errorMessage.toLowerCase();
   return msg.includes('rate limit') || msg.includes('timeout') || msg.includes('aborted') ||
          msg.includes('overloaded') || msg.includes('529') || msg.includes('503') ||
-         msg.includes('decrypt');
+         msg.includes('decrypt') || msg.includes('token limit') || msg.includes('tokens per min');
+}
+
+/**
+ * Certain bad_request failures are deploy-fixable and should be retried immediately
+ * after a hotfix lands rather than waiting the full bad_request cooldown window.
+ */
+function isDeployFixableBadRequest(lastExecutionError) {
+  if (!lastExecutionError) return false;
+  const category = String(lastExecutionError.category || '').toLowerCase();
+  if (category !== 'bad_request') return false;
+  const msg = String(lastExecutionError.error || '').toLowerCase();
+  if (!msg) return false;
+
+  return (
+    (msg.includes('unsupported parameter') && msg.includes('max_tokens') && msg.includes('max_completion_tokens'))
+    || (msg.includes('unsupported parameter') && msg.includes('max_completion_tokens') && msg.includes('max_tokens'))
+    || (msg.includes('temperature') && (
+      msg.includes('unsupported value')
+      || msg.includes('does not support')
+      || msg.includes('only the default')
+    ))
+  );
 }
 
 /**
@@ -425,7 +488,7 @@ async function checkOverdueTasks() {
              t.project_id, t.assigned_agent_id, t.tags, t.context
       FROM tasks t
       WHERE t.due_date < datetime('now')
-        AND t.status NOT IN ('completed', 'cancelled')
+        AND t.status NOT IN ('completed', 'cancelled', 'blocked', 'deferred')
         AND t.project_id IS NOT NULL
     `, []);
 
@@ -521,8 +584,10 @@ async function dispatchCycle() {
     const ERROR_COOLDOWNS_MS = {
       config_error:    5 * 60 * 1000,       // 5 min — credentials/config likely fixed quickly
       auth_error:      5 * 60 * 1000,       // 5 min — API key may have been updated
+      model_not_found: 5 * 60 * 1000,       // 5 min — model list can refresh quickly after deploy
+      token_overlimit: 10 * 60 * 1000,      // 10 min — fallback/routing adjustment expected soon
       rate_limited:    60 * 60 * 1000,       // 60 min — wait for quota window to reset
-      quota_exceeded:  6 * 60 * 60 * 1000,   // 6 hours — billing/plan issue
+      quota_exceeded:  6 * 60 * 60 * 1000,   // 6 hours - provider quota or plan limit
       overloaded:      10 * 60 * 1000,       // 10 min — provider should recover
       timeout:         10 * 60 * 1000,       // 10 min — transient, worth retrying soon
       bad_request:     6 * 60 * 60 * 1000,   // 6 hours — likely needs human fix
@@ -540,13 +605,18 @@ async function dispatchCycle() {
         const errorAge = Date.now() - errorTime;
         const category = context.lastExecutionError.category || 'unknown';
         const cooldown = ERROR_COOLDOWNS_MS[category] || DEFAULT_COOLDOWN_MS;
+        const bypassCooldown = isDeployFixableBadRequest(context.lastExecutionError);
 
-        if (errorAge < cooldown) {
+        if (errorAge < cooldown && !bypassCooldown) {
           const remainMin = Math.round((cooldown - errorAge) / 60000);
           console.log(`[Dispatcher] Skipping task #${e.task_id} — ${category} error (retry in ${remainMin}m): ${context.lastExecutionError.error}`);
           continue;
         }
-        console.log(`[Dispatcher] Retrying task #${e.task_id} — ${category} error cooldown expired after ${Math.round(errorAge / 60000)}m`);
+        if (bypassCooldown) {
+          console.log(`[Dispatcher] Retrying task #${e.task_id} immediately — known deploy-fixable ${category}: ${context.lastExecutionError.error}`);
+        } else {
+          console.log(`[Dispatcher] Retrying task #${e.task_id} — ${category} error cooldown expired after ${Math.round(errorAge / 60000)}m`);
+        }
       }
       tasksToRun.push(e);
     }
@@ -613,9 +683,8 @@ export async function executeTaskNow(taskId) {
 
   const agent = await db.one('SELECT * FROM agents WHERE id = ?', [task.assigned_agent_id]);
   if (!agent) throw new Error('Assigned agent not found');
-  if (!agent.provider || !agent.provider_api_key_encrypted) {
-    throw new Error('Agent does not have task execution configured. Go to Manage > Task Execution to set up a provider.');
-  }
+  // Managed-routing employees may not carry a direct provider or BYOK key on the
+  // agent record. Let the executor resolve env-backed routes instead of failing here.
 
   // Increment active_task_count while executing
   await incrementActiveTaskCount(agent.id);
@@ -636,6 +705,16 @@ export async function executeTaskNow(taskId) {
     result = await executeTask(agent, task);
   } catch (err) {
     await decrementActiveTaskCount(agent.id);
+    await logAgentActivity(agent.id, 'task.execution_failed', 'task', taskId, {
+      title: task.title,
+      error: err.message
+    });
+    await logActivity('task', taskId, 'execution_failed', 'system', {
+      agentId: agent.id,
+      agentName: agent.name,
+      error: err.message
+    });
+    await flagTaskError(taskId, agent.name, err.message, err.category);
     throw err;
   }
 
@@ -643,6 +722,7 @@ export async function executeTaskNow(taskId) {
   await decrementActiveTaskCount(agent.id);
 
   if (result.success) {
+    await clearTaskExecutionError(taskId);
     await logAgentActivity(agent.id, 'task.execution_completed', 'task', taskId, {
       title: task.title,
       deliverableId: result.deliverableId,
@@ -653,7 +733,8 @@ export async function executeTaskNow(taskId) {
       agentName: agent.name,
       deliverableId: result.deliverableId,
       inputTokens: result.usage?.inputTokens,
-      outputTokens: result.usage?.outputTokens
+      outputTokens: result.usage?.outputTokens,
+      autoRetry: result.autoRetry || null
     });
     await logActivity('deliverable', result.deliverableId, 'created', agent.name, {
       taskId: taskId,

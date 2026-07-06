@@ -1,6 +1,6 @@
 /**
  * Email Provider Service
- * Multi-provider email abstraction supporting SMTP, SendGrid, Mailjet, Postmark, AWS SES
+ * Multi-provider email abstraction supporting SMTP, Mailgun API, SendGrid, Mailjet, Postmark, AWS SES
  */
 
 import nodemailer from 'nodemailer';
@@ -26,6 +26,9 @@ let SMTP_CONFIG = {
 
 // API Keys
 let SENDGRID_API_KEY = process.env.EMAIL_SENDGRID_API_KEY;
+let MAILGUN_API_KEY = process.env.EMAIL_MAILGUN_API_KEY;
+let MAILGUN_DOMAIN = process.env.EMAIL_MAILGUN_DOMAIN;
+let MAILGUN_BASE_URL = process.env.EMAIL_MAILGUN_BASE_URL || 'https://api.mailgun.net';
 let MAILJET_API_KEY = process.env.EMAIL_MAILJET_API_KEY;
 let MAILJET_SECRET_KEY = process.env.EMAIL_MAILJET_SECRET_KEY;
 let POSTMARK_SERVER_TOKEN = process.env.EMAIL_POSTMARK_SERVER_TOKEN;
@@ -51,6 +54,9 @@ let SES_CONFIG = {
  * @property {string} [text] - Plain text content
  * @property {Attachment[]} [attachments] - File attachments
  * @property {string} [replyTo] - Reply-to address
+ * @property {string} [inReplyTo] - RFC Message-ID this message replies to
+ * @property {string|string[]} [references] - RFC References header value(s)
+ * @property {Record<string,string>} [headers] - Additional provider headers
  */
 
 /**
@@ -92,6 +98,11 @@ export function getConfig() {
       user: SMTP_CONFIG.auth?.user || '',
       pass: mask(SMTP_CONFIG.auth?.pass)
     },
+    mailgun: {
+      apiKey: mask(MAILGUN_API_KEY),
+      domain: MAILGUN_DOMAIN || '',
+      baseUrl: MAILGUN_BASE_URL || '',
+    },
     sendgrid: { apiKey: mask(SENDGRID_API_KEY) },
     mailjet: { apiKey: mask(MAILJET_API_KEY), secretKey: mask(MAILJET_SECRET_KEY) },
     postmark: { serverToken: mask(POSTMARK_SERVER_TOKEN) },
@@ -109,6 +120,8 @@ export function isConfigured() {
       return !!SMTP_CONFIG.host;
     case 'sendgrid':
       return !!SENDGRID_API_KEY;
+    case 'mailgun':
+      return !!MAILGUN_API_KEY && !!MAILGUN_DOMAIN;
     case 'mailjet':
       return !!MAILJET_API_KEY && !!MAILJET_SECRET_KEY;
     case 'postmark':
@@ -135,6 +148,8 @@ export async function validateConfig() {
         return await validateSmtp();
       case 'sendgrid':
         return await validateSendGrid();
+      case 'mailgun':
+        return await validateMailgun();
       case 'mailjet':
         return await validateMailjet();
       case 'postmark':
@@ -170,7 +185,10 @@ export async function sendEmail(options) {
     to: Array.isArray(options.to) ? options.to : [options.to],
     cc: options.cc ? (Array.isArray(options.cc) ? options.cc : [options.cc]) : [],
     bcc: options.bcc ? (Array.isArray(options.bcc) ? options.bcc : [options.bcc]) : [],
-    attachments: options.attachments || []
+    attachments: options.attachments || [],
+    inReplyTo: options.inReplyTo || undefined,
+    references: options.references || undefined,
+    headers: options.headers && typeof options.headers === 'object' ? options.headers : {}
   };
 
   switch (EMAIL_PROVIDER) {
@@ -178,6 +196,8 @@ export async function sendEmail(options) {
       return await sendViaSMTP(normalizedOptions);
     case 'sendgrid':
       return await sendViaSendGrid(normalizedOptions);
+    case 'mailgun':
+      return await sendViaMailgun(normalizedOptions);
     case 'mailjet':
       return await sendViaMailjet(normalizedOptions);
     case 'postmark':
@@ -221,6 +241,9 @@ async function sendViaSMTP(options) {
     cc: options.cc.length > 0 ? options.cc.join(', ') : undefined,
     bcc: options.bcc.length > 0 ? options.bcc.join(', ') : undefined,
     replyTo: options.replyTo,
+    inReplyTo: options.inReplyTo,
+    references: options.references,
+    headers: options.headers,
     subject: options.subject,
     html: options.html,
     text: options.text,
@@ -274,6 +297,17 @@ async function sendViaSendGrid(options) {
       email: options.from,
       name: options.fromName
     },
+    headers: {
+      ...(options.headers || {}),
+      ...(options.inReplyTo ? { 'In-Reply-To': options.inReplyTo } : {}),
+      ...(options.references
+        ? {
+          References: Array.isArray(options.references)
+            ? options.references.join(' ')
+            : String(options.references)
+        }
+        : {}),
+    },
     reply_to: options.replyTo ? { email: options.replyTo } : undefined,
     subject: options.subject,
     content: [
@@ -304,6 +338,70 @@ async function sendViaSendGrid(options) {
   return {
     messageId: response.headers.get('x-message-id') || `sg_${Date.now()}`,
     status: 'sent'
+  };
+}
+
+// ============================================
+// Mailgun Provider
+// ============================================
+
+async function validateMailgun() {
+  try {
+    const auth = Buffer.from(`api:${MAILGUN_API_KEY}`).toString('base64');
+    const response = await fetch(`${MAILGUN_BASE_URL}/v3/domains/${encodeURIComponent(MAILGUN_DOMAIN)}`, {
+      headers: {
+        Authorization: `Basic ${auth}`,
+      },
+    });
+    if (response.ok) return { valid: true };
+    const text = await response.text();
+    return { valid: false, error: `Mailgun authentication failed: ${text.slice(0, 200)}` };
+  } catch (error) {
+    return { valid: false, error: `Mailgun connection failed: ${error.message}` };
+  }
+}
+
+async function sendViaMailgun(options) {
+  const auth = Buffer.from(`api:${MAILGUN_API_KEY}`).toString('base64');
+  const params = new URLSearchParams();
+  const fromValue = options.fromName ? `"${options.fromName}" <${options.from}>` : options.from;
+  params.append('from', fromValue);
+  params.append('to', options.to.join(', '));
+  if (options.cc.length > 0) params.append('cc', options.cc.join(', '));
+  if (options.bcc.length > 0) params.append('bcc', options.bcc.join(', '));
+  if (options.replyTo) params.append('h:Reply-To', options.replyTo);
+  if (options.inReplyTo) params.append('h:In-Reply-To', options.inReplyTo);
+  if (options.references) {
+    params.append('h:References', Array.isArray(options.references) ? options.references.join(' ') : String(options.references));
+  }
+  if (options.headers && typeof options.headers === 'object') {
+    for (const [key, val] of Object.entries(options.headers)) {
+      if (!key || val == null) continue;
+      params.append(`h:${key}`, String(val));
+    }
+  }
+  params.append('subject', options.subject || '(no subject)');
+  if (options.text) params.append('text', options.text);
+  if (options.html) params.append('html', options.html);
+
+  const response = await fetch(`${MAILGUN_BASE_URL}/v3/${encodeURIComponent(MAILGUN_DOMAIN)}/messages`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${auth}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: params.toString(),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Mailgun send failed: ${text.slice(0, 300)}`);
+  }
+
+  const result = await response.json().catch(() => ({}));
+  return {
+    messageId: result.id || `mg_${Date.now()}`,
+    status: 'sent',
   };
 }
 
@@ -343,6 +441,17 @@ async function sendViaMailjet(options) {
       Cc: options.cc.length > 0 ? options.cc.map(email => ({ Email: email })) : undefined,
       Bcc: options.bcc.length > 0 ? options.bcc.map(email => ({ Email: email })) : undefined,
       ReplyTo: options.replyTo ? { Email: options.replyTo } : undefined,
+      Headers: {
+        ...(options.headers || {}),
+        ...(options.inReplyTo ? { 'In-Reply-To': options.inReplyTo } : {}),
+        ...(options.references
+          ? {
+            References: Array.isArray(options.references)
+              ? options.references.join(' ')
+              : String(options.references)
+          }
+          : {}),
+      },
       Subject: options.subject,
       HTMLPart: options.html,
       TextPart: options.text,
@@ -405,6 +514,16 @@ async function sendViaPostmark(options) {
     Cc: options.cc.length > 0 ? options.cc.join(', ') : undefined,
     Bcc: options.bcc.length > 0 ? options.bcc.join(', ') : undefined,
     ReplyTo: options.replyTo,
+    Headers: [
+      ...(options.inReplyTo ? [{ Name: 'In-Reply-To', Value: options.inReplyTo }] : []),
+      ...(options.references
+        ? [{
+          Name: 'References',
+          Value: Array.isArray(options.references) ? options.references.join(' ') : String(options.references)
+        }]
+        : []),
+      ...Object.entries(options.headers || {}).map(([Name, Value]) => ({ Name, Value: String(Value) })),
+    ],
     Subject: options.subject,
     HtmlBody: options.html,
     TextBody: options.text,
@@ -478,6 +597,9 @@ export function reloadConfig() {
     } : undefined
   };
   SENDGRID_API_KEY = process.env.EMAIL_SENDGRID_API_KEY;
+  MAILGUN_API_KEY = process.env.EMAIL_MAILGUN_API_KEY;
+  MAILGUN_DOMAIN = process.env.EMAIL_MAILGUN_DOMAIN;
+  MAILGUN_BASE_URL = process.env.EMAIL_MAILGUN_BASE_URL || 'https://api.mailgun.net';
   MAILJET_API_KEY = process.env.EMAIL_MAILJET_API_KEY;
   MAILJET_SECRET_KEY = process.env.EMAIL_MAILJET_SECRET_KEY;
   POSTMARK_SERVER_TOKEN = process.env.EMAIL_POSTMARK_SERVER_TOKEN;
