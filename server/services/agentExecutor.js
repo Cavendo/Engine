@@ -13,6 +13,10 @@ import { parseSSEStream } from '../utils/sse.js';
 import { detectDeliverableContentType } from '../utils/detectDeliverableContentType.js';
 import { parseAgentDeliverableEnvelope } from '../utils/agentDeliverableEnvelope.js';
 import {
+  retrieveRecentKnowledgeForTask,
+  retrieveWeightedKnowledgeForTask
+} from './taskContextRetrieval.js';
+import {
   getMimeType,
   saveDeliverableFile,
   ensureUploadsDir
@@ -217,16 +221,21 @@ async function gatherTaskContext(task) {
   // Get project knowledge
   let knowledge = [];
   if (task.project_id) {
-    const rows = await db.many(`
-      SELECT id, title, content, content_type, category, tags
-      FROM knowledge
-      WHERE project_id = ?
-      ORDER BY created_at DESC
-    `, [task.project_id]);
-    knowledge = rows.map(k => ({
-      ...k,
-      tags: parseTags(k.tags)
-    }));
+    try {
+      const retrieval = await retrieveWeightedKnowledgeForTask(task, {
+        limit: 50,
+        logger: console
+      });
+      knowledge = Array.isArray(retrieval?.chunks) ? retrieval.chunks : [];
+    } catch (err) {
+      console.warn('[AgentExecutor] Knowledge retrieval failed; using recent context:', err?.message || err);
+      try {
+        knowledge = await retrieveRecentKnowledgeForTask(task, { limit: 50 });
+      } catch (fallbackErr) {
+        console.warn('[AgentExecutor] Recent knowledge fallback failed; continuing without knowledge:', fallbackErr?.message || fallbackErr);
+        knowledge = [];
+      }
+    }
   }
 
   // Get previous deliverables and feedback (critical for revision tasks)

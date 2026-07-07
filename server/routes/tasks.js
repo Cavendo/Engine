@@ -10,6 +10,7 @@ import { canAccessTask } from '../utils/authorization.js';
 import { insertDeliverableWithRetry } from '../utils/deliverableVersioning.js';
 import { detectDeliverableContentType } from '../utils/detectDeliverableContentType.js';
 import { toISOTimestamp as formatTimestamp } from '../utils/routeHelpers.js';
+import { retrieveWeightedKnowledgeForTask } from '../services/taskContextRetrieval.js';
 import {
   evaluateRoutingRules,
   incrementActiveTaskCount,
@@ -180,25 +181,6 @@ async function ensureProjectAccess(req, projectId) {
 
 function applyTaskContextPlan(rawContext) {
   return rawContext && typeof rawContext === 'object' ? rawContext : {};
-}
-
-async function retrieveWeightedKnowledgeForTask(task) {
-  if (!task?.project_id) return { chunks: [] };
-
-  const rows = await db.many(`
-    SELECT id, title, content, content_type, category, tags
-    FROM knowledge
-    WHERE project_id = ?
-    ORDER BY created_at DESC
-    LIMIT 50
-  `, [task.project_id]);
-
-  return {
-    chunks: rows.map((row) => ({
-      ...row,
-      tags: safeJsonParse(row.tags, [])
-    }))
-  };
 }
 
 function buildTaskClaimantId(agentActor) {

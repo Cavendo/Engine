@@ -25,9 +25,85 @@ import {
 
 const POLL_INTERVAL_MS = parseInt(process.env.DISPATCHER_INTERVAL_MS) || 30000; // 30 seconds
 const MAX_BATCH_SIZE = parseInt(process.env.DISPATCHER_BATCH_SIZE) || 5; // max tasks per cycle
+const DEFAULT_IDENTICAL_FAILURE_QUARANTINE_THRESHOLD = 3;
+const MIN_IDENTICAL_FAILURE_QUARANTINE_THRESHOLD = 2;
 
 let intervalHandle = null;
 let isRunning = false;
+
+export function getIdenticalFailureQuarantineThreshold(env = process.env) {
+  const parsed = parseInt(env.DISPATCHER_IDENTICAL_FAILURE_QUARANTINE_THRESHOLD, 10);
+  if (!Number.isFinite(parsed)) return DEFAULT_IDENTICAL_FAILURE_QUARANTINE_THRESHOLD;
+  return Math.max(MIN_IDENTICAL_FAILURE_QUARANTINE_THRESHOLD, parsed);
+}
+
+export function normalizeFailureSignature(errorMessage, errorCategory) {
+  const category = String(errorCategory || classifyErrorMessage(errorMessage) || 'unknown').toLowerCase();
+  const normalizedMessage = String(errorMessage || '')
+    .toLowerCase()
+    .replace(/\b[0-9a-f]{8,}(?:-[0-9a-f]{4,})+\b/gi, '<hex>')
+    .replace(/\b[0-9a-f]{12,}\b/gi, '<hex>')
+    .replace(/\b\d+\b/g, '<n>')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return `${category}:${normalizedMessage}`;
+}
+
+function summarizeStatusError(errorMessage, maxLength = 180) {
+  const summary = String(errorMessage || 'Unknown execution error').replace(/\s+/g, ' ').trim();
+  if (summary.length <= maxLength) return summary;
+  return `${summary.slice(0, maxLength - 3)}...`;
+}
+
+function buildFailureMetadata(context, agentName, errorMessage, errorCategory) {
+  const category = errorCategory || classifyErrorMessage(errorMessage);
+  const signature = normalizeFailureSignature(errorMessage, category);
+  const previousError = context.lastExecutionError || null;
+  const previousSignature = previousError?.signature || normalizeFailureSignature(previousError?.error, previousError?.category);
+  const previousCount = Number(previousError?.consecutiveCount) || 0;
+  const consecutiveCount = previousSignature === signature ? previousCount + 1 : 1;
+  const threshold = getIdenticalFailureQuarantineThreshold();
+  const quarantined = consecutiveCount >= threshold;
+  const timestamp = new Date().toISOString();
+  const statusNote = quarantined
+    ? `Task blocked after ${consecutiveCount} identical execution failures. Last error: ${summarizeStatusError(errorMessage)}`
+    : `Execution failed (${consecutiveCount}/${threshold} identical failure count). The task will be blocked if the same failure repeats.`;
+
+  const nextContext = {
+    ...context,
+    lastExecutionError: {
+      error: errorMessage,
+      category,
+      agent: agentName,
+      timestamp,
+      retryable: isRetryableError(errorMessage, category),
+      signature,
+      consecutiveCount,
+      quarantined,
+      statusNote
+    }
+  };
+
+  if (quarantined) {
+    nextContext.dispatcherQuarantine = {
+      reason: 'identical_execution_failure',
+      signature,
+      consecutiveCount,
+      threshold,
+      statusNote,
+      updatedAt: timestamp
+    };
+  } else {
+    delete nextContext.dispatcherQuarantine;
+  }
+
+  return {
+    context: nextContext,
+    status: quarantined ? 'blocked' : 'assigned',
+    quarantined
+  };
+}
 
 /**
  * Log to agent_activity table
@@ -226,38 +302,33 @@ async function dispatchTask(eligible) {
 
 /**
  * Flag a task with an error so the user can see it in the UI.
- * Stores the error in the task's context JSON and resets status to 'assigned'
- * so the dispatcher doesn't retry it in a loop.
+ * Stores the error in the task's context JSON and blocks tasks that hit the
+ * identical-failure threshold so deterministic failures do not loop forever.
  */
-async function flagTaskError(taskId, agentName, errorMessage, errorCategory) {
-  // Step 1: Always reset status — must not be silenced by context-building failures
-  try {
-    await db.exec(`
-      UPDATE tasks SET status = 'assigned', updated_at = datetime('now') WHERE id = ?
-    `, [taskId]);
-  } catch (err) {
-    console.error(`[Dispatcher] CRITICAL: Failed to reset task #${taskId} status from in_progress:`, err);
-  }
-
-  // Step 2: Store error details in context — secondary, safe to fail independently
+export async function flagTaskError(taskId, agentName, errorMessage, errorCategory) {
   try {
     const task = await db.one('SELECT context FROM tasks WHERE id = ?', [taskId]);
     let context = {};
     try { context = JSON.parse(task?.context || '{}'); } catch { context = {}; }
 
-    context.lastExecutionError = {
-      error: errorMessage,
-      category: errorCategory || classifyErrorMessage(errorMessage),
-      agent: agentName,
-      timestamp: new Date().toISOString(),
-      retryable: isRetryableError(errorMessage, errorCategory)
-    };
+    const failure = buildFailureMetadata(context, agentName, errorMessage, errorCategory);
 
     await db.exec(`
-      UPDATE tasks SET context = ?, updated_at = datetime('now') WHERE id = ?
-    `, [JSON.stringify(context), taskId]);
+      UPDATE tasks SET status = ?, context = ?, updated_at = datetime('now') WHERE id = ?
+    `, [failure.status, JSON.stringify(failure.context), taskId]);
+
+    if (failure.quarantined) {
+      console.warn(`[Dispatcher] Task #${taskId} blocked after repeated identical execution failures`);
+    }
   } catch (err) {
     console.error(`[Dispatcher] Failed to store error context for task #${taskId}:`, err);
+    try {
+      await db.exec(`
+        UPDATE tasks SET status = 'assigned', updated_at = datetime('now') WHERE id = ?
+      `, [taskId]);
+    } catch (statusErr) {
+      console.error(`[Dispatcher] CRITICAL: Failed to reset task #${taskId} status from in_progress:`, statusErr);
+    }
   }
 }
 
@@ -265,13 +336,14 @@ async function flagTaskError(taskId, agentName, errorMessage, errorCategory) {
  * Clear stale execution error metadata after a successful run so UI/state
  * reflects the latest task outcome instead of an old cooldown error.
  */
-async function clearTaskExecutionError(taskId) {
+export async function clearTaskExecutionError(taskId) {
   try {
     const task = await db.one('SELECT context FROM tasks WHERE id = ?', [taskId]);
     let context = {};
     try { context = JSON.parse(task?.context || '{}'); } catch { context = {}; }
-    if (!context.lastExecutionError) return;
+    if (!context.lastExecutionError && !context.dispatcherQuarantine) return;
     delete context.lastExecutionError;
+    delete context.dispatcherQuarantine;
     await db.exec(`
       UPDATE tasks SET context = ?, updated_at = datetime('now') WHERE id = ?
     `, [JSON.stringify(context), taskId]);
