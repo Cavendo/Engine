@@ -121,6 +121,66 @@ describe('executeDirectAgentPrompt', () => {
     expect(global.fetch.mock.calls[0][1].headers['x-api-key']).toBe('sk-ant-secret');
   });
 
+  test('applies Anthropic prompt cache control blocks for direct prompts', async () => {
+    global.fetch = jest.fn(async () => jsonResponse(200, successPayload('anthropic', 'cached ok')));
+
+    await executeDirectAgentPrompt(makeAgent('anthropic'), {
+      title: 'Cached prompt',
+      description: 'Stable planner instructions.'.repeat(40),
+      context: { user_message: 'What should the agent do?', planner_context: { scope: 'project' } },
+      promptCache: {
+        enabled: true,
+        providerHint: 'anthropic',
+        strategy: 'stable_prefix',
+        minimumStableTokens: 1,
+      },
+    });
+
+    const body = JSON.parse(global.fetch.mock.calls[0][1].body);
+    expect(Array.isArray(body.system)).toBe(true);
+    expect(body.system[0].cache_control).toEqual({ type: 'ephemeral' });
+    expect(Array.isArray(body.messages[0].content)).toBe(true);
+    expect(body.messages[0].content[0].cache_control).toEqual({ type: 'ephemeral' });
+  });
+
+  test('forces Anthropic structured output through tool use', async () => {
+    global.fetch = jest.fn(async () => jsonResponse(200, {
+      content: [{
+        type: 'tool_use',
+        id: 'toolu_test',
+        name: 'planner_command',
+        input: {
+          type: 'answer_question',
+          payload: { question: 'Hello' },
+        },
+      }],
+      usage: { input_tokens: 3, output_tokens: 4 },
+    }));
+
+    const result = await executeDirectAgentPrompt(makeAgent('anthropic'), {
+      title: 'Structured prompt',
+      structuredOutput: {
+        type: 'json_object',
+        name: 'planner_command',
+        schema: {
+          type: 'object',
+          additionalProperties: true,
+        },
+      },
+    });
+
+    const body = JSON.parse(global.fetch.mock.calls[0][1].body);
+    expect(body.tools[0]).toMatchObject({
+      name: 'planner_command',
+      input_schema: { type: 'object', additionalProperties: true },
+    });
+    expect(body.tool_choice).toEqual({ type: 'tool', name: 'planner_command' });
+    expect(JSON.parse(result.content)).toMatchObject({
+      type: 'answer_question',
+      payload: { question: 'Hello' },
+    });
+  });
+
   test('allows keyless openai_compatible agents and omits Authorization', async () => {
     global.fetch = jest.fn(async () => jsonResponse(200, successPayload('openai', 'local ok')));
 
@@ -155,6 +215,21 @@ describe('executeDirectAgentPrompt', () => {
     expect(body.messages[1].content).toContain('Prompt description');
     expect(body.messages[1].content).toContain('"customer": "Acme"');
     expect(body.messages[1].content).toContain('"tier": "gold"');
+  });
+
+  test('requests OpenAI JSON object mode for structured direct prompts', async () => {
+    global.fetch = jest.fn(async () => jsonResponse(200, successPayload('openai', '{"ok":true}')));
+
+    await executeDirectAgentPrompt(makeAgent('openai'), {
+      title: 'JSON mode',
+      structuredOutput: {
+        type: 'json_object',
+        name: 'planner_command',
+      },
+    });
+
+    const body = JSON.parse(global.fetch.mock.calls[0][1].body);
+    expect(body.response_format).toEqual({ type: 'json_object' });
   });
 
   test('includes project knowledge when projectId is provided', async () => {
@@ -209,6 +284,37 @@ describe('executeDirectAgentPrompt', () => {
       usage: { inputTokens: 1, outputTokens: 2 },
       provider: 'google',
       model: 'gemini-test'
+    });
+  });
+
+  test('requests Gemini JSON output and response schema for structured direct prompts', async () => {
+    global.fetch = jest.fn(async () => jsonResponse(200, successPayload('google', '{"ok":true}')));
+
+    await executeDirectAgentPrompt(makeAgent('google'), {
+      title: 'Gemini JSON',
+      structuredOutput: {
+        type: 'json_object',
+        name: 'planner_command',
+        schema: {
+          type: 'object',
+          properties: {
+            type: { type: 'string' },
+          },
+          required: ['type'],
+        },
+      },
+    });
+
+    const body = JSON.parse(global.fetch.mock.calls[0][1].body);
+    expect(body.generationConfig).toMatchObject({
+      responseMimeType: 'application/json',
+      responseSchema: {
+        type: 'OBJECT',
+        properties: {
+          type: { type: 'STRING' },
+        },
+        required: ['type'],
+      },
     });
   });
 

@@ -103,6 +103,196 @@ async function executeProviderPrompt(agent, apiKey, systemPrompt, userPrompt, ma
   return await executeOpenAI(apiKey, agent.provider_model, systemPrompt, userPrompt, maxTokens, agent.temperature, baseUrl, options);
 }
 
+function isPlainObjectValue(value) {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function parsePositiveInteger(value, fallback = null) {
+  const parsed = Number.parseInt(String(value || ''), 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function estimateTokensForPrompt(text) {
+  if (!text) return 0;
+  return Math.ceil(String(text).length / 4);
+}
+
+function normalizePromptCachePolicy(policy = null) {
+  if (!isPlainObjectValue(policy) || policy.enabled !== true) return null;
+  return {
+    strategy: String(policy.strategy || 'stable_prefix').trim().toLowerCase(),
+    providerHint: String(policy.providerHint || policy.provider_hint || '').trim().toLowerCase() || null,
+    minimumStableTokens: parsePositiveInteger(
+      policy.minimumStableTokens ?? policy.minimum_stable_tokens,
+      1024
+    ),
+    stablePrefixMarker: String(
+      policy.stablePrefixMarker
+      || policy.stable_prefix_marker
+      || policy.stablePrefixBoundaryMarker
+      || policy.stable_prefix_boundary_marker
+      || '## Additional Context'
+    ),
+  };
+}
+
+function buildAnthropicCacheControl(_policy = null) {
+  return { type: 'ephemeral' };
+}
+
+function buildAnthropicTextBlock(text, cacheControl = null) {
+  const block = { type: 'text', text: String(text || '') };
+  if (cacheControl) block.cache_control = cacheControl;
+  return block;
+}
+
+function maybeBuildAnthropicCachedTextContent(text, policy = null, { splitStablePrefix = false } = {}) {
+  const value = String(text || '');
+  if (!value) return value;
+  const normalizedPolicy = normalizePromptCachePolicy(policy);
+  if (!normalizedPolicy || normalizedPolicy.providerHint && normalizedPolicy.providerHint !== 'anthropic') return value;
+  const minimumTokens = Math.max(1, normalizedPolicy.minimumStableTokens || 1024);
+
+  if (splitStablePrefix && normalizedPolicy.strategy === 'stable_prefix') {
+    const marker = normalizedPolicy.stablePrefixMarker || '';
+    const markerIndex = marker ? value.indexOf(marker) : -1;
+    if (markerIndex > 0) {
+      const stablePrefix = value.slice(0, markerIndex);
+      const volatileSuffix = value.slice(markerIndex);
+      if (estimateTokensForPrompt(stablePrefix) >= minimumTokens && volatileSuffix.trim()) {
+        return [
+          buildAnthropicTextBlock(stablePrefix, buildAnthropicCacheControl(normalizedPolicy)),
+          buildAnthropicTextBlock(volatileSuffix),
+        ];
+      }
+    }
+  }
+
+  if (estimateTokensForPrompt(value) < minimumTokens) return value;
+  return [buildAnthropicTextBlock(value, buildAnthropicCacheControl(normalizedPolicy))];
+}
+
+function normalizeStructuredOutputContract(contract = null) {
+  if (!isPlainObjectValue(contract)) return null;
+  const schema = isPlainObjectValue(contract.schema)
+    ? contract.schema
+    : (isPlainObjectValue(contract.jsonSchema)
+      ? contract.jsonSchema
+      : (isPlainObjectValue(contract.json_schema) ? contract.json_schema : null));
+  const rawType = String(contract.type || contract.outputType || contract.output_type || '').trim().toLowerCase();
+  const wantsJson = !rawType
+    || ['json', 'json_object', 'object', 'json_schema'].includes(rawType)
+    || schema;
+  if (!wantsJson) return null;
+  const rawName = String(contract.name || contract.schemaName || contract.schema_name || 'structured_output')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 64);
+  return {
+    type: schema ? 'json_schema' : 'json_object',
+    name: rawName || 'structured_output',
+    strict: contract.strict === true,
+    schema: schema || null,
+  };
+}
+
+function buildGenericJsonObjectSchema() {
+  return {
+    type: 'object',
+    additionalProperties: true,
+  };
+}
+
+function buildOpenAIStructuredResponseFormat(contract = null) {
+  const normalized = normalizeStructuredOutputContract(contract);
+  if (!normalized) return null;
+  if (normalized.schema) {
+    return {
+      type: 'json_schema',
+      json_schema: {
+        name: normalized.name,
+        strict: normalized.strict === true,
+        schema: normalized.schema,
+      },
+    };
+  }
+  return { type: 'json_object' };
+}
+
+function toGoogleResponseSchema(schema = null) {
+  if (!isPlainObjectValue(schema)) return schema;
+  const next = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (key === 'type' && typeof value === 'string') {
+      const mapped = {
+        object: 'OBJECT',
+        array: 'ARRAY',
+        string: 'STRING',
+        number: 'NUMBER',
+        integer: 'INTEGER',
+        boolean: 'BOOLEAN',
+      }[value.toLowerCase()];
+      next[key] = mapped || value;
+      continue;
+    }
+    if (key === 'properties' && isPlainObjectValue(value)) {
+      next[key] = Object.fromEntries(
+        Object.entries(value).map(([propertyKey, propertySchema]) => [
+          propertyKey,
+          toGoogleResponseSchema(propertySchema),
+        ])
+      );
+      continue;
+    }
+    if (key === 'items') {
+      next[key] = toGoogleResponseSchema(value);
+      continue;
+    }
+    if (Array.isArray(value)) {
+      next[key] = value.map((item) => toGoogleResponseSchema(item));
+      continue;
+    }
+    next[key] = value;
+  }
+  return next;
+}
+
+function applyGoogleStructuredOutputConfig(generationConfig = {}, contract = null) {
+  const normalized = normalizeStructuredOutputContract(contract);
+  if (!normalized) return generationConfig;
+  const next = {
+    ...generationConfig,
+    responseMimeType: 'application/json',
+  };
+  if (normalized.schema) next.responseSchema = toGoogleResponseSchema(normalized.schema);
+  return next;
+}
+
+function buildAnthropicStructuredTool(contract = null) {
+  const normalized = normalizeStructuredOutputContract(contract);
+  if (!normalized) return null;
+  return {
+    name: normalized.name,
+    description: 'Return the requested structured JSON object.',
+    input_schema: normalized.schema || buildGenericJsonObjectSchema(),
+  };
+}
+
+function extractAnthropicResponseContent(data = {}, contract = null) {
+  const structuredTool = buildAnthropicStructuredTool(contract);
+  const blocks = Array.isArray(data?.content) ? data.content : [];
+  if (structuredTool) {
+    const toolUse = blocks.find((block) => block?.type === 'tool_use' && block?.name === structuredTool.name)
+      || blocks.find((block) => block?.type === 'tool_use');
+    if (toolUse) {
+      return JSON.stringify(isPlainObjectValue(toolUse.input) ? toolUse.input : {});
+    }
+  }
+  return blocks.map((block) => block?.text || '').join('');
+}
+
 function stringifyDirectContext(context) {
   if (context === null || context === undefined) return null;
 
@@ -375,7 +565,7 @@ export async function executeTask(agent, task) {
  * Callback errors are logged and ignored so generation can continue.
  *
  * @param {Object} agent - Agent record from database
- * @param {Object} options - {title, description, projectId, context, maxTokens|max_tokens, onDelta, signal}
+ * @param {Object} options - {title, description, projectId, context, maxTokens|max_tokens, onDelta, signal, promptCache, structuredOutput}
  * @returns {Promise<Object>} Direct prompt execution result
  */
 export async function executeDirectAgentPrompt(agent, options = {}) {
@@ -390,7 +580,9 @@ export async function executeDirectAgentPrompt(agent, options = {}) {
 
     const result = await executeProviderPrompt(agent, apiKey, systemPrompt, userPrompt, maxTokens, {
       onDelta: options.onDelta,
-      signal: options.signal
+      signal: options.signal,
+      promptCache: options.promptCache,
+      structuredOutput: options.structuredOutput
     });
 
     return {
@@ -525,8 +717,24 @@ function classifyApiError(status, errorBody, provider) {
  * Execute using Anthropic API
  */
 async function executeAnthropic(apiKey, model, systemPrompt, userPrompt, maxTokens, temperature, options = {}) {
-  if (hasDeltaCallback(options)) {
+  if (hasDeltaCallback(options) && !normalizeStructuredOutputContract(options.structuredOutput)) {
     return await executeAnthropicStream(apiKey, model, systemPrompt, userPrompt, maxTokens, temperature, options);
+  }
+
+  const structuredTool = buildAnthropicStructuredTool(options.structuredOutput);
+  const body = {
+    model: model || 'claude-sonnet-4-5-20250929',
+    max_tokens: maxTokens || 4096,
+    temperature: temperature ?? 0.7,
+    system: maybeBuildAnthropicCachedTextContent(systemPrompt, options.promptCache),
+    messages: [{
+      role: 'user',
+      content: maybeBuildAnthropicCachedTextContent(userPrompt, options.promptCache, { splitStablePrefix: true })
+    }]
+  };
+  if (structuredTool) {
+    body.tools = [structuredTool];
+    body.tool_choice = { type: 'tool', name: structuredTool.name };
   }
 
   const controller = new AbortController();
@@ -540,13 +748,7 @@ async function executeAnthropic(apiKey, model, systemPrompt, userPrompt, maxToke
         'x-api-key': apiKey,
         'anthropic-version': '2023-06-01'
       },
-      body: JSON.stringify({
-        model: model || 'claude-sonnet-4-5-20250929',
-        max_tokens: maxTokens || 4096,
-        temperature: temperature ?? 0.7,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userPrompt }]
-      })
+      body: JSON.stringify(body)
     });
 
     if (!response.ok) {
@@ -557,7 +759,7 @@ async function executeAnthropic(apiKey, model, systemPrompt, userPrompt, maxToke
     const data = await response.json();
 
     return {
-      content: data.content[0]?.text || '',
+      content: extractAnthropicResponseContent(data, options.structuredOutput),
       usage: {
         inputTokens: data.usage?.input_tokens,
         outputTokens: data.usage?.output_tokens
@@ -584,8 +786,11 @@ async function executeAnthropicStream(apiKey, model, systemPrompt, userPrompt, m
         model: model || 'claude-sonnet-4-5-20250929',
         max_tokens: maxTokens || 4096,
         temperature: temperature ?? 0.7,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userPrompt }],
+        system: maybeBuildAnthropicCachedTextContent(systemPrompt, options.promptCache),
+        messages: [{
+          role: 'user',
+          content: maybeBuildAnthropicCachedTextContent(userPrompt, options.promptCache, { splitStablePrefix: true })
+        }],
         stream: true
       })
     });
@@ -669,20 +874,23 @@ async function executeOpenAI(apiKey, model, systemPrompt, userPrompt, maxTokens,
   try {
     const headers = { 'Content-Type': 'application/json' };
     if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+    const body = {
+      model: model || 'gpt-4o',
+      max_tokens: maxTokens || 4096,
+      temperature: temperature ?? 0.7,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ]
+    };
+    const responseFormat = buildOpenAIStructuredResponseFormat(options.structuredOutput);
+    if (responseFormat) body.response_format = responseFormat;
 
     const response = await fetch(`${base}/v1/chat/completions`, {
       method: 'POST',
       signal: controller.signal,
       headers,
-      body: JSON.stringify({
-        model: model || 'gpt-4o',
-        max_tokens: maxTokens || 4096,
-        temperature: temperature ?? 0.7,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
-        ]
-      })
+      body: JSON.stringify(body)
     });
 
     if (!response.ok) {
@@ -789,6 +997,10 @@ async function executeGoogle(apiKey, model, systemPrompt, userPrompt, maxTokens,
   }
 
   const modelId = model || 'gemini-2.5-pro';
+  const generationConfig = applyGoogleStructuredOutputConfig({
+    maxOutputTokens: maxTokens || 4096,
+    temperature: temperature ?? 0.7
+  }, options.structuredOutput);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), EXECUTION_TIMEOUT_MS);
   try {
@@ -805,10 +1017,7 @@ async function executeGoogle(apiKey, model, systemPrompt, userPrompt, maxTokens,
             parts: [{ text: `${systemPrompt}\n\n${userPrompt}` }]
           }
         ],
-        generationConfig: {
-          maxOutputTokens: maxTokens || 4096,
-          temperature: temperature ?? 0.7
-        }
+        generationConfig
       })
     });
 
