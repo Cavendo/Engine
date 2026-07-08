@@ -52,7 +52,7 @@ function ensureSupportedProvider(provider) {
   }
 }
 
-function resolveProviderApiKey(agent) {
+function resolveProviderApiKey(agent, options = {}) {
   if (agent.provider_api_key_encrypted) {
     let apiKey = null;
     try {
@@ -62,6 +62,8 @@ function resolveProviderApiKey(agent) {
     }
 
     if (apiKey) return apiKey;
+
+    if (options.allowMissing) return null;
 
     if (agent.provider === 'openai_compatible') {
       // For openai_compatible, API key is optional — continue without it
@@ -75,6 +77,8 @@ function resolveProviderApiKey(agent) {
       true
     );
   }
+
+  if (options.allowMissing) return null;
 
   if (agent.provider !== 'openai_compatible') {
     throw createExecutionError('Provider API key not configured', 'config_error', true);
@@ -101,6 +105,154 @@ async function executeProviderPrompt(agent, apiKey, systemPrompt, userPrompt, ma
 
   const baseUrl = resolveBaseUrl(agent);
   return await executeOpenAI(apiKey, agent.provider_model, systemPrompt, userPrompt, maxTokens, agent.temperature, baseUrl, options);
+}
+
+function normalizeProviderName(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function normalizeModelRoutes(value) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((entry, index) => {
+      if (!isPlainObjectValue(entry)) return null;
+      const provider = normalizeProviderName(entry.provider);
+      const model = String(entry.model || entry.provider_model || '').trim() || null;
+      const baseUrl = String(entry.baseUrl || entry.base_url || '').trim() || null;
+      const source = String(entry.source || entry.name || `route_${index + 1}`).trim() || `route_${index + 1}`;
+      const maxTokens = parsePositiveInteger(entry.maxTokens ?? entry.max_tokens, null);
+      const temperature = Number.isFinite(Number(entry.temperature)) ? Number(entry.temperature) : null;
+      const apiKey = typeof entry.apiKey === 'string'
+        ? entry.apiKey
+        : (typeof entry.api_key === 'string' ? entry.api_key : null);
+
+      if (!provider) return null;
+      return {
+        provider,
+        model,
+        baseUrl,
+        source,
+        maxTokens,
+        temperature,
+        apiKey: apiKey && apiKey.trim() ? apiKey : null,
+      };
+    })
+    .filter(Boolean);
+}
+
+function buildDefaultModelRoute(agent) {
+  return {
+    provider: normalizeProviderName(agent.provider),
+    model: agent.provider_model || null,
+    baseUrl: agent.provider_base_url || null,
+    source: 'agent_default',
+    maxTokens: null,
+    temperature: null,
+    apiKey: null,
+  };
+}
+
+function serializeModelRoute(route, status = {}) {
+  return {
+    provider: route.provider,
+    model: route.model || getDefaultProviderModel(route.provider),
+    baseUrl: route.baseUrl || null,
+    source: route.source || null,
+    ...status,
+  };
+}
+
+function resolveRouteApiKey(route, agent, agentApiKey) {
+  if (route.apiKey) return { apiKey: route.apiKey, source: 'route' };
+  if (route.provider === normalizeProviderName(agent.provider)) {
+    return { apiKey: agentApiKey, source: agentApiKey ? 'agent' : null };
+  }
+  return { apiKey: null, source: null };
+}
+
+function isRouteFallbackEligibleError(error) {
+  if (error?.retryable === true) return true;
+  return ['rate_limited', 'overloaded', 'timeout', 'provider_unavailable', 'model_not_found'].includes(error?.category);
+}
+
+async function executePromptWithRoutes(agent, agentApiKey, routes, systemPrompt, userPrompt, maxTokens, options = {}) {
+  const attempts = [];
+  let lastError = null;
+
+  for (let index = 0; index < routes.length; index += 1) {
+    const route = routes[index];
+    const routeAgent = {
+      ...agent,
+      provider: route.provider,
+      provider_model: route.model || agent.provider_model || getDefaultProviderModel(route.provider),
+      provider_base_url: route.baseUrl || agent.provider_base_url || null,
+      temperature: route.temperature ?? agent.temperature,
+    };
+
+    try {
+      ensureSupportedProvider(routeAgent.provider);
+    } catch (error) {
+      attempts.push(serializeModelRoute(route, {
+        status: 'failed',
+        category: error.category || 'config_error',
+        error: error.message,
+      }));
+      throw error;
+    }
+
+    const { apiKey, source: credentialSource } = resolveRouteApiKey(route, agent, agentApiKey);
+    if (routeAgent.provider !== 'openai_compatible' && !apiKey) {
+      attempts.push(serializeModelRoute(route, {
+        status: 'skipped',
+        reason: 'missing_credentials',
+      }));
+      continue;
+    }
+
+    try {
+      const result = await executeProviderPrompt(
+        routeAgent,
+        apiKey,
+        systemPrompt,
+        userPrompt,
+        route.maxTokens || maxTokens,
+        options
+      );
+      attempts.push(serializeModelRoute(route, {
+        status: 'selected',
+        credentialSource,
+      }));
+      return {
+        result,
+        provider: routeAgent.provider,
+        model: routeAgent.provider_model || getDefaultProviderModel(routeAgent.provider),
+        modelRouting: {
+          selectedRoute: serializeModelRoute(route, { credentialSource }),
+          attempts,
+        },
+      };
+    } catch (error) {
+      lastError = error;
+      attempts.push(serializeModelRoute(route, {
+        status: 'failed',
+        category: error.category || null,
+        error: error.message || 'execution_failed',
+      }));
+      const hasNextRoute = index < routes.length - 1;
+      if (!hasNextRoute || !isRouteFallbackEligibleError(error)) {
+        error.modelRouting = { attempts };
+        throw error;
+      }
+      console.warn(
+        `[AgentExecutor] Model route ${route.provider}/${route.model || getDefaultProviderModel(route.provider)} failed for direct prompt; trying fallback (${error.message})`
+      );
+    }
+  }
+
+  const error = createExecutionError('No executable model route is available', 'config_error', true);
+  error.modelRouting = { attempts };
+  if (lastError) error.cause = lastError;
+  throw error;
 }
 
 function isPlainObjectValue(value) {
@@ -565,41 +717,55 @@ export async function executeTask(agent, task) {
  * Callback errors are logged and ignored so generation can continue.
  *
  * @param {Object} agent - Agent record from database
- * @param {Object} options - {title, description, projectId, context, maxTokens|max_tokens, onDelta, signal, promptCache, structuredOutput}
+ * @param {Object} options - {title, description, projectId, context, maxTokens|max_tokens, onDelta, signal, promptCache, structuredOutput, modelRoutes}
  * @returns {Promise<Object>} Direct prompt execution result
  */
 export async function executeDirectAgentPrompt(agent, options = {}) {
   try {
     ensureSupportedProvider(agent.provider);
-    const apiKey = resolveProviderApiKey(agent);
+    const modelRoutes = normalizeModelRoutes(options.modelRoutes || options.model_routes);
+    const apiKey = resolveProviderApiKey(agent, { allowMissing: modelRoutes.length > 0 });
     const task = createDirectPromptTask(options);
     const context = await gatherTaskContext(task);
     const systemPrompt = agent.system_prompt || getDefaultSystemPrompt(agent);
     const userPrompt = buildTaskPrompt(task, context);
     const maxTokens = options.maxTokens ?? options.max_tokens ?? agent.max_tokens ?? 4096;
 
-    const result = await executeProviderPrompt(agent, apiKey, systemPrompt, userPrompt, maxTokens, {
-      onDelta: options.onDelta,
-      signal: options.signal,
-      promptCache: options.promptCache,
-      structuredOutput: options.structuredOutput
-    });
+    const routeExecution = await executePromptWithRoutes(
+      agent,
+      apiKey,
+      modelRoutes.length > 0 ? modelRoutes : [buildDefaultModelRoute(agent)],
+      systemPrompt,
+      userPrompt,
+      maxTokens,
+      {
+        onDelta: options.onDelta,
+        signal: options.signal,
+        promptCache: options.promptCache,
+        structuredOutput: options.structuredOutput
+      }
+    );
 
-    return {
+    const response = {
       success: true,
-      content: result.content,
-      usage: result.usage,
-      provider: agent.provider,
-      model: agent.provider_model || getDefaultProviderModel(agent.provider)
+      content: routeExecution.result.content,
+      usage: routeExecution.result.usage,
+      provider: routeExecution.provider,
+      model: routeExecution.model
     };
+    if (modelRoutes.length > 0) response.modelRouting = routeExecution.modelRouting;
+
+    return response;
   } catch (error) {
     console.error('[AgentExecutor] Direct prompt failed:', error);
-    return {
+    const response = {
       success: false,
       error: error.message,
       category: error.category || null,
       retryable: Boolean(error.retryable)
     };
+    if (error.modelRouting) response.modelRouting = error.modelRouting;
+    return response;
   }
 }
 

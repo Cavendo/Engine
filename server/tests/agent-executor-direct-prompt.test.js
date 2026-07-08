@@ -200,6 +200,114 @@ describe('executeDirectAgentPrompt', () => {
     expect(global.fetch.mock.calls[0][1].headers.Authorization).toBeUndefined();
   });
 
+  test('tries supplied model routes in order and falls back on retryable provider errors', async () => {
+    const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    global.fetch = jest.fn()
+      .mockResolvedValueOnce(jsonResponse(429, {
+        error: { message: 'Rate limit exceeded', code: 'rate_limit_exceeded' }
+      }))
+      .mockResolvedValueOnce(jsonResponse(200, successPayload('openai', 'fallback ok')));
+
+    const result = await executeDirectAgentPrompt(makeAgent('openai_compatible', {
+      keyless: true,
+      provider_base_url: 'http://unused.local'
+    }), {
+      title: 'Fallback route',
+      modelRoutes: [
+        {
+          provider: 'anthropic',
+          model: 'claude-route',
+          apiKey: 'sk-ant-route',
+          source: 'primary_route',
+        },
+        {
+          provider: 'openai_compatible',
+          model: 'local-route',
+          baseUrl: 'http://localhost:11434',
+          source: 'fallback_route',
+        },
+      ],
+    });
+
+    expect(result).toMatchObject({
+      success: true,
+      content: 'fallback ok',
+      provider: 'openai_compatible',
+      model: 'local-route',
+      modelRouting: {
+        selectedRoute: {
+          provider: 'openai_compatible',
+          model: 'local-route',
+          source: 'fallback_route',
+        },
+        attempts: [
+          {
+            provider: 'anthropic',
+            model: 'claude-route',
+            source: 'primary_route',
+            status: 'failed',
+            category: 'rate_limited',
+          },
+          {
+            provider: 'openai_compatible',
+            model: 'local-route',
+            source: 'fallback_route',
+            status: 'selected',
+          },
+        ],
+      },
+    });
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+    expect(global.fetch.mock.calls[0][0]).toBe('https://api.anthropic.com/v1/messages');
+    expect(global.fetch.mock.calls[0][1].headers['x-api-key']).toBe('sk-ant-route');
+    expect(global.fetch.mock.calls[1][0]).toBe('http://localhost:11434/v1/chat/completions');
+    warnSpy.mockRestore();
+  });
+
+  test('does not cascade past non-retryable model route failures', async () => {
+    errorSpy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    global.fetch = jest.fn(async () => jsonResponse(400, {
+      error: { message: 'Invalid tool schema', code: 'bad_request' }
+    }));
+
+    const result = await executeDirectAgentPrompt(makeAgent('openai_compatible', {
+      keyless: true,
+    }), {
+      title: 'Bad route',
+      modelRoutes: [
+        {
+          provider: 'openai_compatible',
+          model: 'local-primary',
+          baseUrl: 'http://localhost:11434',
+          source: 'primary_route',
+        },
+        {
+          provider: 'openai_compatible',
+          model: 'local-fallback',
+          baseUrl: 'http://localhost:11435',
+          source: 'fallback_route',
+        },
+      ],
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      category: 'bad_request',
+      retryable: false,
+      modelRouting: {
+        attempts: [
+          {
+            provider: 'openai_compatible',
+            model: 'local-primary',
+            status: 'failed',
+            category: 'bad_request',
+          },
+        ],
+      },
+    });
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
   test('assembles title, description, and context into the user prompt', async () => {
     global.fetch = jest.fn(async () => jsonResponse(200, successPayload('openai', 'prompt ok')));
 
