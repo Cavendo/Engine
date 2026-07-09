@@ -28,6 +28,12 @@ function jsonResponse(status, payload) {
   });
 }
 
+function abortError() {
+  const err = new Error('The operation was aborted');
+  err.name = 'AbortError';
+  return err;
+}
+
 function successPayload(provider, content = 'ok') {
   if (provider === 'anthropic') {
     return {
@@ -405,6 +411,83 @@ describe('executeDirectAgentPrompt', () => {
       attempts: [
         { index: 0, provider: 'openai', model: 'gpt-missing-key', status: 'skipped', category: 'config_error' },
         { index: 1, provider: 'openai_compatible', model: 'local-model', status: 'success' }
+      ]
+    });
+  });
+
+  test('falls back when non-streaming provider requests abort as timeouts', async () => {
+    global.fetch = jest.fn()
+      .mockRejectedValueOnce(abortError())
+      .mockResolvedValueOnce(jsonResponse(200, successPayload('openai', 'timeout fallback ok')));
+
+    const result = await executeDirectAgentPrompt(makeAgent('openai'), {
+      title: 'Route timeout',
+      modelRoutes: [
+        { provider: 'openai', model: 'gpt-timeout', apiKey: 'sk-timeout' },
+        { provider: 'openai', model: 'gpt-after-timeout', apiKey: 'sk-after-timeout' }
+      ]
+    });
+
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({
+      success: true,
+      content: 'timeout fallback ok',
+      model: 'gpt-after-timeout',
+      attempts: [
+        { index: 0, provider: 'openai', model: 'gpt-timeout', status: 'failed', category: 'timeout', retryable: true },
+        { index: 1, provider: 'openai', model: 'gpt-after-timeout', status: 'success' }
+      ]
+    });
+  });
+
+  test('classifies provider-unavailable errors as retryable for route fallback', async () => {
+    global.fetch = jest.fn()
+      .mockResolvedValueOnce(jsonResponse(502, {
+        error: { type: 'server_error', message: 'Provider temporarily unavailable' }
+      }))
+      .mockResolvedValueOnce(jsonResponse(200, successPayload('openai', 'provider fallback ok')));
+
+    const result = await executeDirectAgentPrompt(makeAgent('openai'), {
+      title: 'Route provider unavailable',
+      modelRoutes: [
+        { provider: 'openai', model: 'gpt-unavailable', apiKey: 'sk-unavailable' },
+        { provider: 'openai', model: 'gpt-available', apiKey: 'sk-available' }
+      ]
+    });
+
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+    expect(result).toMatchObject({
+      success: true,
+      content: 'provider fallback ok',
+      model: 'gpt-available',
+      attempts: [
+        { index: 0, provider: 'openai', model: 'gpt-unavailable', status: 'failed', category: 'provider_unavailable', retryable: true },
+        { index: 1, provider: 'openai', model: 'gpt-available', status: 'success' }
+      ]
+    });
+  });
+
+  test('classifies missing models as terminal and stops route fallback', async () => {
+    global.fetch = jest.fn(async () => jsonResponse(404, {
+      error: { code: 'model_not_found', message: "model 'gpt-missing' not found" }
+    }));
+
+    const result = await executeDirectAgentPrompt(makeAgent('openai'), {
+      title: 'Route missing model',
+      modelRoutes: [
+        { provider: 'openai', model: 'gpt-missing', apiKey: 'sk-missing' },
+        { provider: 'openai', model: 'gpt-unused', apiKey: 'sk-unused' }
+      ]
+    });
+
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({
+      success: false,
+      category: 'model_not_found',
+      retryable: false,
+      selectedRoute: null,
+      attempts: [
+        { index: 0, provider: 'openai', model: 'gpt-missing', status: 'failed', category: 'model_not_found', retryable: false }
       ]
     });
   });

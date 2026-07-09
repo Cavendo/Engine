@@ -391,6 +391,45 @@ function isAbortError(error) {
   return error?.name === 'AbortError' || error?.code === 'ABORT_ERR';
 }
 
+function createRequestAbortController(options = {}) {
+  const controller = new AbortController();
+  let abortReason = null;
+  const timeout = setTimeout(() => {
+    if (!controller.signal.aborted) {
+      abortReason = 'timeout';
+      controller.abort();
+    }
+  }, EXECUTION_TIMEOUT_MS);
+
+  const externalSignal = options.signal;
+  let externalAbortHandler = null;
+  if (externalSignal) {
+    externalAbortHandler = () => {
+      if (!controller.signal.aborted) {
+        abortReason = 'cancelled';
+        controller.abort();
+      }
+    };
+
+    if (externalSignal.aborted) {
+      externalAbortHandler();
+    } else {
+      externalSignal.addEventListener('abort', externalAbortHandler, { once: true });
+    }
+  }
+
+  return {
+    signal: controller.signal,
+    getAbortReason: () => abortReason,
+    cleanup: () => {
+      clearTimeout(timeout);
+      if (externalSignal && externalAbortHandler) {
+        externalSignal.removeEventListener('abort', externalAbortHandler);
+      }
+    }
+  };
+}
+
 function createStreamingAbortController(options = {}) {
   const controller = new AbortController();
   let abortReason = null;
@@ -444,6 +483,30 @@ function normalizeStreamingAbort(error, provider, abortReason) {
     return createExecutionError(`[${provider}] stream cancelled`, 'cancelled', false);
   }
   return createExecutionError(`[${provider}] stream timed out`, 'timeout', true);
+}
+
+function normalizeRequestAbort(error, provider, abortReason) {
+  if (!isAbortError(error)) return error;
+  if (abortReason === 'cancelled') {
+    return createExecutionError(`[${provider}] request cancelled`, 'cancelled', false);
+  }
+  return createExecutionError(`[${provider}] request timed out`, 'timeout', true);
+}
+
+function normalizeProviderTransportError(error, provider) {
+  if (error?.category) return error;
+  const message = String(error?.message || '').toLowerCase();
+  const code = String(error?.code || '').toLowerCase();
+  const isNetworkFailure = error?.name === 'TypeError'
+    || message.includes('fetch failed')
+    || message.includes('network')
+    || code.startsWith('econn')
+    || code === 'enotfound'
+    || code === 'eai_again'
+    || code === 'etimedout';
+
+  if (!isNetworkFailure) return error;
+  return createExecutionError(`[${provider}] provider unavailable: ${error.message || 'network error'}`, 'provider_unavailable', true);
 }
 
 /**
@@ -786,8 +849,9 @@ export async function testConnection(provider, apiKey, model, baseUrl) {
  * Returns an Error with category, status, and retryable properties.
  */
 function classifyApiError(status, errorBody, provider) {
-  const message = errorBody?.error?.message || 'Unknown API error';
-  const code = errorBody?.error?.code || errorBody?.error?.type || '';
+  const message = errorBody?.error?.message || errorBody?.message || 'Unknown API error';
+  const code = errorBody?.error?.code || errorBody?.error?.type || errorBody?.code || errorBody?.type || '';
+  const lowerCode = String(code).toLowerCase();
   const lowerMessage = message.toLowerCase();
 
   let category = 'unknown';
@@ -795,10 +859,24 @@ function classifyApiError(status, errorBody, provider) {
     category = 'auth_error';
   } else if (code === 'insufficient_quota') {
     category = 'quota_exceeded';
+  } else if (status === 404
+      || lowerCode.includes('model_not_found')
+      || lowerMessage.includes('model not found')
+      || lowerMessage.includes('unknown model')
+      || (lowerMessage.includes('model') && lowerMessage.includes('not found'))) {
+    category = 'model_not_found';
   } else if (status === 429 || code === 'rate_limit_exceeded') {
     category = 'rate_limited';
   } else if (status === 529 || status === 503 || code === 'overloaded_error') {
     category = 'overloaded';
+  } else if ([500, 502, 504].includes(Number(status))
+      || lowerCode.includes('server_error')
+      || lowerCode.includes('service_unavailable')
+      || lowerCode.includes('provider_unavailable')
+      || lowerMessage.includes('temporarily unavailable')
+      || lowerMessage.includes('provider unavailable')
+      || lowerMessage.includes('no healthy upstream')) {
+    category = 'provider_unavailable';
   } else if (status === 403
       || lowerMessage.includes('billing')
       || lowerMessage.includes('payment')
@@ -811,7 +889,7 @@ function classifyApiError(status, errorBody, provider) {
   const err = new Error(`[${provider}] ${message}`);
   err.category = category;
   err.status = status;
-  err.retryable = ['rate_limited', 'overloaded'].includes(category);
+  err.retryable = ['rate_limited', 'overloaded', 'provider_unavailable'].includes(category);
   return err;
 }
 
@@ -823,8 +901,7 @@ async function executeAnthropic(apiKey, model, systemPrompt, userPrompt, maxToke
     return await executeAnthropicStream(apiKey, model, systemPrompt, userPrompt, maxTokens, temperature, options);
   }
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), EXECUTION_TIMEOUT_MS);
+  const request = createRequestAbortController(options);
   try {
     const promptParts = buildAnthropicPromptParts(systemPrompt, userPrompt, options.promptCache);
     const body = {
@@ -842,7 +919,7 @@ async function executeAnthropic(apiKey, model, systemPrompt, userPrompt, maxToke
 
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
-      signal: controller.signal,
+      signal: request.signal,
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': apiKey,
@@ -865,8 +942,13 @@ async function executeAnthropic(apiKey, model, systemPrompt, userPrompt, maxToke
         outputTokens: data.usage?.output_tokens
       }
     };
+  } catch (error) {
+    throw normalizeProviderTransportError(
+      normalizeRequestAbort(error, 'anthropic', request.getAbortReason()),
+      'anthropic'
+    );
   } finally {
-    clearTimeout(timeout);
+    request.cleanup();
   }
 }
 
@@ -959,7 +1041,10 @@ async function executeAnthropicStream(apiKey, model, systemPrompt, userPrompt, m
 
     return { content, usage };
   } catch (error) {
-    throw normalizeStreamingAbort(error, 'anthropic', stream.getAbortReason());
+    throw normalizeProviderTransportError(
+      normalizeStreamingAbort(error, 'anthropic', stream.getAbortReason()),
+      'anthropic'
+    );
   } finally {
     stream.cleanup();
   }
@@ -974,8 +1059,7 @@ async function executeOpenAI(apiKey, model, systemPrompt, userPrompt, maxTokens,
   }
 
   const base = (baseUrl || 'https://api.openai.com').replace(/\/+$/, '');
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), EXECUTION_TIMEOUT_MS);
+  const request = createRequestAbortController(options);
   try {
     const headers = { 'Content-Type': 'application/json' };
     if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
@@ -993,7 +1077,7 @@ async function executeOpenAI(apiKey, model, systemPrompt, userPrompt, maxTokens,
 
     const response = await fetch(`${base}/v1/chat/completions`, {
       method: 'POST',
-      signal: controller.signal,
+      signal: request.signal,
       headers,
       body: JSON.stringify(body)
     });
@@ -1012,8 +1096,13 @@ async function executeOpenAI(apiKey, model, systemPrompt, userPrompt, maxTokens,
         outputTokens: data.usage?.completion_tokens
       }
     };
+  } catch (error) {
+    throw normalizeProviderTransportError(
+      normalizeRequestAbort(error, 'openai', request.getAbortReason()),
+      'openai'
+    );
   } finally {
-    clearTimeout(timeout);
+    request.cleanup();
   }
 }
 
@@ -1089,7 +1178,10 @@ async function executeOpenAIStream(apiKey, model, systemPrompt, userPrompt, maxT
 
     return { content, usage };
   } catch (error) {
-    throw normalizeStreamingAbort(error, 'openai', stream.getAbortReason());
+    throw normalizeProviderTransportError(
+      normalizeStreamingAbort(error, 'openai', stream.getAbortReason()),
+      'openai'
+    );
   } finally {
     stream.cleanup();
   }
@@ -1104,12 +1196,11 @@ async function executeGoogle(apiKey, model, systemPrompt, userPrompt, maxTokens,
   }
 
   const modelId = model || 'gemini-2.5-pro';
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), EXECUTION_TIMEOUT_MS);
+  const request = createRequestAbortController(options);
   try {
     const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelId)}:generateContent?key=${encodeURIComponent(apiKey)}`, {
       method: 'POST',
-      signal: controller.signal,
+      signal: request.signal,
       headers: {
         'Content-Type': 'application/json'
       },
@@ -1141,8 +1232,13 @@ async function executeGoogle(apiKey, model, systemPrompt, userPrompt, maxTokens,
         outputTokens: data?.usageMetadata?.candidatesTokenCount
       }
     };
+  } catch (error) {
+    throw normalizeProviderTransportError(
+      normalizeRequestAbort(error, 'google', request.getAbortReason()),
+      'google'
+    );
   } finally {
-    clearTimeout(timeout);
+    request.cleanup();
   }
 }
 
@@ -1206,7 +1302,10 @@ async function executeGoogleStream(apiKey, model, systemPrompt, userPrompt, maxT
       }
     };
   } catch (error) {
-    throw normalizeStreamingAbort(error, 'google', stream.getAbortReason());
+    throw normalizeProviderTransportError(
+      normalizeStreamingAbort(error, 'google', stream.getAbortReason()),
+      'google'
+    );
   } finally {
     stream.cleanup();
   }
