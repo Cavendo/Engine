@@ -89,6 +89,240 @@ function getDefaultProviderModel(provider) {
   return 'gpt-4o';
 }
 
+function getProviderModel(agent) {
+  return agent.provider_model || getDefaultProviderModel(agent.provider);
+}
+
+function normalizePromptCache(promptCache) {
+  if (!promptCache) return { enabled: false };
+  if (promptCache === true) {
+    return { enabled: true, system: true, user: true };
+  }
+
+  return {
+    enabled: promptCache.enabled !== false,
+    system: promptCache.system !== false,
+    user: Boolean(promptCache.user || promptCache.userPrefix || promptCache.stableUserPrefix || promptCache.stablePrefix),
+    userPrefix: promptCache.userPrefix || promptCache.stableUserPrefix || promptCache.stablePrefix || ''
+  };
+}
+
+function normalizeStructuredOutput(structuredOutput) {
+  if (!structuredOutput) return null;
+  if (structuredOutput === true) {
+    return {
+      enabled: true,
+      name: 'structured_output',
+      description: 'Return the requested JSON object.',
+      schema: null,
+      strict: false
+    };
+  }
+
+  const schema = structuredOutput.schema || structuredOutput.jsonSchema || structuredOutput.responseSchema || null;
+  return {
+    enabled: structuredOutput.enabled !== false,
+    name: structuredOutput.name || 'structured_output',
+    description: structuredOutput.description || 'Return the requested JSON object.',
+    schema: schema || { type: 'object', additionalProperties: true },
+    strict: Boolean(structuredOutput.strict),
+    responseFormat: structuredOutput.responseFormat || structuredOutput.response_format || null
+  };
+}
+
+function buildOpenAIResponseFormat(structuredOutput) {
+  const normalized = normalizeStructuredOutput(structuredOutput);
+  if (!normalized?.enabled) return null;
+  if (normalized.responseFormat) return normalized.responseFormat;
+
+  if (normalized.schema) {
+    return {
+      type: 'json_schema',
+      json_schema: {
+        name: normalized.name,
+        strict: normalized.strict,
+        schema: normalized.schema
+      }
+    };
+  }
+
+  return { type: 'json_object' };
+}
+
+function normalizeGeminiSchema(schema) {
+  if (!schema || typeof schema !== 'object') return undefined;
+  if (Array.isArray(schema)) return schema.map(normalizeGeminiSchema);
+
+  const normalized = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (['$schema', '$id', 'additionalProperties', 'default', 'examples'].includes(key)) continue;
+    if (key === 'type' && typeof value === 'string') {
+      normalized.type = value.toUpperCase();
+      continue;
+    }
+    if (key === 'properties' && value && typeof value === 'object' && !Array.isArray(value)) {
+      normalized.properties = Object.fromEntries(
+        Object.entries(value).map(([propKey, propValue]) => [propKey, normalizeGeminiSchema(propValue)])
+      );
+      continue;
+    }
+    if (key === 'items') {
+      normalized.items = normalizeGeminiSchema(value);
+      continue;
+    }
+    if (key === 'anyOf' || key === 'oneOf') {
+      normalized.anyOf = Array.isArray(value) ? value.map(normalizeGeminiSchema) : value;
+      continue;
+    }
+    normalized[key] = value;
+  }
+
+  return normalized;
+}
+
+function buildGeminiGenerationConfig(maxTokens, temperature, structuredOutput) {
+  const generationConfig = {
+    maxOutputTokens: maxTokens || 4096,
+    temperature: temperature ?? 0.7
+  };
+
+  const normalized = normalizeStructuredOutput(structuredOutput);
+  if (normalized?.enabled) {
+    generationConfig.responseMimeType = 'application/json';
+    const responseSchema = normalizeGeminiSchema(normalized.schema);
+    if (responseSchema) generationConfig.responseSchema = responseSchema;
+  }
+
+  return generationConfig;
+}
+
+function buildAnthropicPromptParts(systemPrompt, userPrompt, promptCache) {
+  const cache = normalizePromptCache(promptCache);
+  const system = cache.enabled && cache.system
+    ? [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }]
+    : systemPrompt;
+
+  if (!cache.enabled || !cache.user) {
+    return {
+      system,
+      messages: [{ role: 'user', content: userPrompt }]
+    };
+  }
+
+  const content = [];
+  if (cache.userPrefix) {
+    content.push({
+      type: 'text',
+      text: cache.userPrefix,
+      cache_control: { type: 'ephemeral' }
+    });
+    if (userPrompt) {
+      content.push({ type: 'text', text: userPrompt });
+    }
+  } else {
+    content.push({
+      type: 'text',
+      text: userPrompt,
+      cache_control: { type: 'ephemeral' }
+    });
+  }
+
+  return {
+    system,
+    messages: [{ role: 'user', content }]
+  };
+}
+
+function buildAnthropicStructuredTool(structuredOutput) {
+  const normalized = normalizeStructuredOutput(structuredOutput);
+  if (!normalized?.enabled) return null;
+  const name = normalized.name.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64) || 'structured_output';
+
+  return {
+    tool: {
+      name,
+      description: normalized.description,
+      input_schema: normalized.schema || { type: 'object' }
+    },
+    toolChoice: {
+      type: 'tool',
+      name
+    }
+  };
+}
+
+function extractAnthropicContent(data, structuredOutput) {
+  const structuredTool = buildAnthropicStructuredTool(structuredOutput);
+  if (structuredTool) {
+    const toolUse = data.content?.find(block => block?.type === 'tool_use' && block?.name === structuredTool.tool.name)
+      || data.content?.find(block => block?.type === 'tool_use');
+    if (toolUse) return JSON.stringify(toolUse.input ?? {});
+  }
+
+  return data.content
+    ?.map(block => block?.text || '')
+    .join('') || '';
+}
+
+function routeValue(route, ...keys) {
+  for (const key of keys) {
+    if (route?.[key] !== undefined && route?.[key] !== null) return route[key];
+  }
+  return undefined;
+}
+
+function applyModelRoute(agent, route = {}, index = 0) {
+  const provider = routeValue(route, 'provider') || agent.provider;
+  const model = routeValue(route, 'model', 'provider_model', 'providerModel') || agent.provider_model;
+  const baseUrl = routeValue(route, 'baseUrl', 'base_url', 'provider_base_url', 'providerBaseUrl');
+  const apiKey = routeValue(route, 'apiKey', 'api_key', 'provider_api_key');
+  const encryptedKey = routeValue(route, 'provider_api_key_encrypted', 'providerApiKeyEncrypted');
+  const keyIv = routeValue(route, 'provider_api_key_iv', 'providerApiKeyIv');
+  const keyVersion = routeValue(route, 'encryption_key_version', 'encryptionKeyVersion');
+
+  return {
+    ...agent,
+    provider,
+    provider_model: model,
+    provider_base_url: baseUrl !== undefined ? baseUrl : (provider === agent.provider ? agent.provider_base_url : null),
+    provider_api_key_encrypted: encryptedKey !== undefined ? encryptedKey : (apiKey ? null : (provider === agent.provider ? agent.provider_api_key_encrypted : null)),
+    provider_api_key_iv: keyIv !== undefined ? keyIv : (provider === agent.provider ? agent.provider_api_key_iv : null),
+    encryption_key_version: keyVersion !== undefined ? keyVersion : (provider === agent.provider ? agent.encryption_key_version : null),
+    _plainProviderApiKey: apiKey || null,
+    _routeIndex: index,
+    _routeId: routeValue(route, 'id', 'routeId', 'name') || null
+  };
+}
+
+function normalizeDirectPromptRoutes(agent, options) {
+  const routes = options.modelRoutes || options.model_routes;
+  if (!Array.isArray(routes) || routes.length === 0) {
+    return [applyModelRoute(agent, {}, 0)];
+  }
+  return routes.map((route, index) => applyModelRoute(agent, route, index));
+}
+
+function describeRoute(agent) {
+  return {
+    index: agent._routeIndex ?? 0,
+    id: agent._routeId || undefined,
+    provider: agent.provider,
+    model: getProviderModel(agent),
+    baseUrl: agent.provider_base_url || undefined
+  };
+}
+
+function resolveRouteApiKey(agent) {
+  if (agent._plainProviderApiKey) return agent._plainProviderApiKey;
+  return resolveProviderApiKey(agent);
+}
+
+function isMissingRouteCredentialError(error) {
+  if (error?.category !== 'config_error') return false;
+  const message = String(error.message || '').toLowerCase();
+  return message.includes('api key') || message.includes('decrypt');
+}
+
 async function executeProviderPrompt(agent, apiKey, systemPrompt, userPrompt, maxTokens, options = {}) {
   ensureSupportedProvider(agent.provider);
 
@@ -375,30 +609,90 @@ export async function executeTask(agent, task) {
  * Callback errors are logged and ignored so generation can continue.
  *
  * @param {Object} agent - Agent record from database
- * @param {Object} options - {title, description, projectId, context, maxTokens|max_tokens, onDelta, signal}
+ * @param {Object} options - {title, description, projectId, context, maxTokens|max_tokens, onDelta, signal, promptCache, structuredOutput, modelRoutes}
  * @returns {Promise<Object>} Direct prompt execution result
  */
 export async function executeDirectAgentPrompt(agent, options = {}) {
+  const explicitRoutes = Array.isArray(options.modelRoutes || options.model_routes)
+    && (options.modelRoutes || options.model_routes).length > 0;
+  const attempts = [];
+
   try {
-    ensureSupportedProvider(agent.provider);
-    const apiKey = resolveProviderApiKey(agent);
     const task = createDirectPromptTask(options);
     const context = await gatherTaskContext(task);
     const systemPrompt = agent.system_prompt || getDefaultSystemPrompt(agent);
     const userPrompt = buildTaskPrompt(task, context);
     const maxTokens = options.maxTokens ?? options.max_tokens ?? agent.max_tokens ?? 4096;
+    const routes = normalizeDirectPromptRoutes(agent, options);
 
-    const result = await executeProviderPrompt(agent, apiKey, systemPrompt, userPrompt, maxTokens, {
-      onDelta: options.onDelta,
-      signal: options.signal
-    });
+    for (const routeAgent of routes) {
+      const route = describeRoute(routeAgent);
+      let apiKey = null;
+
+      try {
+        ensureSupportedProvider(routeAgent.provider);
+        apiKey = resolveRouteApiKey(routeAgent);
+      } catch (error) {
+        if (explicitRoutes && isMissingRouteCredentialError(error)) {
+          attempts.push({
+            ...route,
+            status: 'skipped',
+            error: error.message,
+            category: error.category,
+            retryable: Boolean(error.retryable)
+          });
+          continue;
+        }
+        throw error;
+      }
+
+      try {
+        const result = await executeProviderPrompt(routeAgent, apiKey, systemPrompt, userPrompt, maxTokens, {
+          onDelta: options.onDelta,
+          signal: options.signal,
+          promptCache: options.promptCache,
+          structuredOutput: options.structuredOutput
+        });
+
+        const successAttempt = { ...route, status: 'success' };
+        attempts.push(successAttempt);
+        return {
+          success: true,
+          content: result.content,
+          usage: result.usage,
+          provider: routeAgent.provider,
+          model: getProviderModel(routeAgent),
+          ...(explicitRoutes ? { selectedRoute: route, attempts } : {})
+        };
+      } catch (error) {
+        const failedAttempt = {
+          ...route,
+          status: 'failed',
+          error: error.message,
+          category: error.category || null,
+          retryable: Boolean(error.retryable)
+        };
+        attempts.push(failedAttempt);
+
+        if (!explicitRoutes || !error.retryable) {
+          return {
+            success: false,
+            error: error.message,
+            category: error.category || null,
+            retryable: Boolean(error.retryable),
+            ...(explicitRoutes ? { selectedRoute: null, attempts } : {})
+          };
+        }
+      }
+    }
 
     return {
-      success: true,
-      content: result.content,
-      usage: result.usage,
-      provider: agent.provider,
-      model: agent.provider_model || getDefaultProviderModel(agent.provider)
+      success: false,
+      error: 'No usable model routes were available',
+      category: 'config_error',
+      retryable: false,
+      selectedRoute: null,
+      attempts
     };
   } catch (error) {
     console.error('[AgentExecutor] Direct prompt failed:', error);
@@ -532,6 +826,20 @@ async function executeAnthropic(apiKey, model, systemPrompt, userPrompt, maxToke
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), EXECUTION_TIMEOUT_MS);
   try {
+    const promptParts = buildAnthropicPromptParts(systemPrompt, userPrompt, options.promptCache);
+    const body = {
+      model: model || 'claude-sonnet-4-5-20250929',
+      max_tokens: maxTokens || 4096,
+      temperature: temperature ?? 0.7,
+      system: promptParts.system,
+      messages: promptParts.messages
+    };
+    const structuredTool = buildAnthropicStructuredTool(options.structuredOutput);
+    if (structuredTool) {
+      body.tools = [structuredTool.tool];
+      body.tool_choice = structuredTool.toolChoice;
+    }
+
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       signal: controller.signal,
@@ -540,13 +848,7 @@ async function executeAnthropic(apiKey, model, systemPrompt, userPrompt, maxToke
         'x-api-key': apiKey,
         'anthropic-version': '2023-06-01'
       },
-      body: JSON.stringify({
-        model: model || 'claude-sonnet-4-5-20250929',
-        max_tokens: maxTokens || 4096,
-        temperature: temperature ?? 0.7,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userPrompt }]
-      })
+      body: JSON.stringify(body)
     });
 
     if (!response.ok) {
@@ -557,7 +859,7 @@ async function executeAnthropic(apiKey, model, systemPrompt, userPrompt, maxToke
     const data = await response.json();
 
     return {
-      content: data.content[0]?.text || '',
+      content: extractAnthropicContent(data, options.structuredOutput),
       usage: {
         inputTokens: data.usage?.input_tokens,
         outputTokens: data.usage?.output_tokens
@@ -572,6 +874,21 @@ async function executeAnthropicStream(apiKey, model, systemPrompt, userPrompt, m
   const stream = createStreamingAbortController(options);
 
   try {
+    const promptParts = buildAnthropicPromptParts(systemPrompt, userPrompt, options.promptCache);
+    const body = {
+      model: model || 'claude-sonnet-4-5-20250929',
+      max_tokens: maxTokens || 4096,
+      temperature: temperature ?? 0.7,
+      system: promptParts.system,
+      messages: promptParts.messages,
+      stream: true
+    };
+    const structuredTool = buildAnthropicStructuredTool(options.structuredOutput);
+    if (structuredTool) {
+      body.tools = [structuredTool.tool];
+      body.tool_choice = structuredTool.toolChoice;
+    }
+
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       signal: stream.signal,
@@ -580,14 +897,7 @@ async function executeAnthropicStream(apiKey, model, systemPrompt, userPrompt, m
         'x-api-key': apiKey,
         'anthropic-version': '2023-06-01'
       },
-      body: JSON.stringify({
-        model: model || 'claude-sonnet-4-5-20250929',
-        max_tokens: maxTokens || 4096,
-        temperature: temperature ?? 0.7,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userPrompt }],
-        stream: true
-      })
+      body: JSON.stringify(body)
     });
 
     if (!response.ok) {
@@ -669,20 +979,23 @@ async function executeOpenAI(apiKey, model, systemPrompt, userPrompt, maxTokens,
   try {
     const headers = { 'Content-Type': 'application/json' };
     if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+    const body = {
+      model: model || 'gpt-4o',
+      max_tokens: maxTokens || 4096,
+      temperature: temperature ?? 0.7,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ]
+    };
+    const responseFormat = buildOpenAIResponseFormat(options.structuredOutput);
+    if (responseFormat) body.response_format = responseFormat;
 
     const response = await fetch(`${base}/v1/chat/completions`, {
       method: 'POST',
       signal: controller.signal,
       headers,
-      body: JSON.stringify({
-        model: model || 'gpt-4o',
-        max_tokens: maxTokens || 4096,
-        temperature: temperature ?? 0.7,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt }
-        ]
-      })
+      body: JSON.stringify(body)
     });
 
     if (!response.ok) {
@@ -722,6 +1035,8 @@ async function executeOpenAIStream(apiKey, model, systemPrompt, userPrompt, maxT
         { role: 'user', content: userPrompt }
       ]
     };
+    const responseFormat = buildOpenAIResponseFormat(options.structuredOutput);
+    if (responseFormat) body.response_format = responseFormat;
 
     if (base === 'https://api.openai.com') {
       body.stream_options = { include_usage: true };
@@ -805,10 +1120,7 @@ async function executeGoogle(apiKey, model, systemPrompt, userPrompt, maxTokens,
             parts: [{ text: `${systemPrompt}\n\n${userPrompt}` }]
           }
         ],
-        generationConfig: {
-          maxOutputTokens: maxTokens || 4096,
-          temperature: temperature ?? 0.7
-        }
+        generationConfig: buildGeminiGenerationConfig(maxTokens, temperature, options.structuredOutput)
       })
     });
 
@@ -852,10 +1164,7 @@ async function executeGoogleStream(apiKey, model, systemPrompt, userPrompt, maxT
             parts: [{ text: `${systemPrompt}\n\n${userPrompt}` }]
           }
         ],
-        generationConfig: {
-          maxOutputTokens: maxTokens || 4096,
-          temperature: temperature ?? 0.7
-        }
+        generationConfig: buildGeminiGenerationConfig(maxTokens, temperature, options.structuredOutput)
       })
     });
 

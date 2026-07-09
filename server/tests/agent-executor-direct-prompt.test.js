@@ -228,4 +228,209 @@ describe('executeDirectAgentPrompt', () => {
     expect(result.error).toMatch(/Unsupported provider/);
     expect(global.fetch).not.toHaveBeenCalled();
   });
+
+  test('adds Anthropic ephemeral cache blocks for system and stable user prefix', async () => {
+    global.fetch = jest.fn(async () => jsonResponse(200, successPayload('anthropic', 'cache ok')));
+
+    await executeDirectAgentPrompt(makeAgent('anthropic'), {
+      title: 'Cache me',
+      promptCache: {
+        system: true,
+        userPrefix: 'Stable reusable task prefix'
+      }
+    });
+
+    const body = JSON.parse(global.fetch.mock.calls[0][1].body);
+    expect(body.system).toEqual([{
+      type: 'text',
+      text: 'Custom system prompt',
+      cache_control: { type: 'ephemeral' }
+    }]);
+    expect(body.messages[0].content[0]).toEqual({
+      type: 'text',
+      text: 'Stable reusable task prefix',
+      cache_control: { type: 'ephemeral' }
+    });
+    expect(body.messages[0].content[1].text).toContain('# Task: Cache me');
+  });
+
+  test('uses Anthropic forced tool-use for structured JSON output', async () => {
+    global.fetch = jest.fn(async () => jsonResponse(200, {
+      content: [{
+        type: 'tool_use',
+        id: 'toolu_test',
+        name: 'answer_json',
+        input: { answer: 'yes', count: 2 }
+      }],
+      usage: { input_tokens: 3, output_tokens: 4 }
+    }));
+
+    const result = await executeDirectAgentPrompt(makeAgent('anthropic'), {
+      title: 'Structured Anthropic',
+      structuredOutput: {
+        name: 'answer_json',
+        description: 'Return the answer object',
+        schema: {
+          type: 'object',
+          properties: {
+            answer: { type: 'string' },
+            count: { type: 'integer' }
+          },
+          required: ['answer']
+        }
+      }
+    });
+
+    const body = JSON.parse(global.fetch.mock.calls[0][1].body);
+    expect(body.tools).toEqual([{
+      name: 'answer_json',
+      description: 'Return the answer object',
+      input_schema: {
+        type: 'object',
+        properties: {
+          answer: { type: 'string' },
+          count: { type: 'integer' }
+        },
+        required: ['answer']
+      }
+    }]);
+    expect(body.tool_choice).toEqual({ type: 'tool', name: 'answer_json' });
+    expect(result).toMatchObject({
+      success: true,
+      content: JSON.stringify({ answer: 'yes', count: 2 }),
+      usage: { inputTokens: 3, outputTokens: 4 }
+    });
+  });
+
+  test('sends OpenAI JSON response_format for structured output', async () => {
+    global.fetch = jest.fn(async () => jsonResponse(200, successPayload('openai', '{"ok":true}')));
+
+    await executeDirectAgentPrompt(makeAgent('openai'), {
+      title: 'OpenAI JSON',
+      structuredOutput: true
+    });
+
+    const body = JSON.parse(global.fetch.mock.calls[0][1].body);
+    expect(body.response_format).toEqual({ type: 'json_object' });
+  });
+
+  test('sends Gemini JSON mime type and normalized response schema', async () => {
+    global.fetch = jest.fn(async () => jsonResponse(200, successPayload('google', '{"answer":"yes"}')));
+
+    await executeDirectAgentPrompt(makeAgent('google'), {
+      title: 'Gemini JSON',
+      structuredOutput: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            answer: { type: 'string' },
+            count: { type: 'integer' },
+            scores: {
+              type: 'array',
+              items: { type: 'number' }
+            }
+          },
+          required: ['answer']
+        }
+      }
+    });
+
+    const body = JSON.parse(global.fetch.mock.calls[0][1].body);
+    expect(body.generationConfig.responseMimeType).toBe('application/json');
+    expect(body.generationConfig.responseSchema).toEqual({
+      type: 'OBJECT',
+      properties: {
+        answer: { type: 'STRING' },
+        count: { type: 'INTEGER' },
+        scores: {
+          type: 'ARRAY',
+          items: { type: 'NUMBER' }
+        }
+      },
+      required: ['answer']
+    });
+  });
+
+  test('falls back to the next model route on retryable provider errors', async () => {
+    global.fetch = jest.fn()
+      .mockResolvedValueOnce(jsonResponse(429, {
+        error: { type: 'rate_limit_exceeded', message: 'Slow down' }
+      }))
+      .mockResolvedValueOnce(jsonResponse(200, successPayload('openai', 'route ok')));
+
+    const result = await executeDirectAgentPrompt(makeAgent('openai'), {
+      title: 'Route retry',
+      modelRoutes: [
+        { provider: 'openai', model: 'gpt-first', apiKey: 'sk-first' },
+        { provider: 'openai', model: 'gpt-second', apiKey: 'sk-second' }
+      ]
+    });
+
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+    expect(global.fetch.mock.calls[0][1].headers.Authorization).toBe('Bearer sk-first');
+    expect(global.fetch.mock.calls[1][1].headers.Authorization).toBe('Bearer sk-second');
+    expect(result).toMatchObject({
+      success: true,
+      content: 'route ok',
+      provider: 'openai',
+      model: 'gpt-second',
+      selectedRoute: { index: 1, provider: 'openai', model: 'gpt-second' },
+      attempts: [
+        { index: 0, provider: 'openai', model: 'gpt-first', status: 'failed', category: 'rate_limited', retryable: true },
+        { index: 1, provider: 'openai', model: 'gpt-second', status: 'success' }
+      ]
+    });
+  });
+
+  test('skips model routes with missing credentials', async () => {
+    global.fetch = jest.fn(async () => jsonResponse(200, successPayload('openai', 'local ok')));
+
+    const result = await executeDirectAgentPrompt(makeAgent('openai_compatible', {
+      keyless: true,
+      provider_base_url: 'http://localhost:11434'
+    }), {
+      title: 'Route skip',
+      modelRoutes: [
+        { provider: 'openai', model: 'gpt-missing-key' },
+        { provider: 'openai_compatible', model: 'local-model', baseUrl: 'http://localhost:11434' }
+      ]
+    });
+
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(global.fetch.mock.calls[0][0]).toBe('http://localhost:11434/v1/chat/completions');
+    expect(result).toMatchObject({
+      success: true,
+      model: 'local-model',
+      attempts: [
+        { index: 0, provider: 'openai', model: 'gpt-missing-key', status: 'skipped', category: 'config_error' },
+        { index: 1, provider: 'openai_compatible', model: 'local-model', status: 'success' }
+      ]
+    });
+  });
+
+  test('does not fall back to later routes on non-retryable bad requests', async () => {
+    global.fetch = jest.fn(async () => jsonResponse(400, {
+      error: { message: 'Bad structured output schema' }
+    }));
+
+    const result = await executeDirectAgentPrompt(makeAgent('openai'), {
+      title: 'Route bad request',
+      modelRoutes: [
+        { provider: 'openai', model: 'gpt-bad', apiKey: 'sk-bad' },
+        { provider: 'openai', model: 'gpt-unused', apiKey: 'sk-unused' }
+      ]
+    });
+
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({
+      success: false,
+      category: 'bad_request',
+      retryable: false,
+      selectedRoute: null,
+      attempts: [
+        { index: 0, provider: 'openai', model: 'gpt-bad', status: 'failed', category: 'bad_request', retryable: false }
+      ]
+    });
+  });
 });
