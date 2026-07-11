@@ -74,11 +74,11 @@ For production, build the UI first: `npm run build`, then `npm start`.
 
 ### First Login
 
-Default admin credentials:
+Development-only bootstrap credentials:
 - **Email**: `admin@cavendo.local`
 - **Password**: `admin`
 
-Change the password immediately after first login.
+They are forced through a password change before they can use the API. Production startup refuses this account and requires `BOOTSTRAP_ADMIN_EMAIL` plus `BOOTSTRAP_ADMIN_PASSWORD` (or `BOOTSTRAP_ADMIN_PASSWORD_FILE`) when no administrator exists.
 
 ## API Overview
 
@@ -554,7 +554,7 @@ data/cavendo.db
 
 All configuration is via environment variables in `.env`. See [`.env.example`](.env.example) for a ready-to-copy template.
 
-> **Production security:** Always set strong, unique values for `JWT_SECRET`, `SESSION_SECRET`, `SESSION_HASH_SECRET`, and encryption key material (`ENCRYPTION_KEY` or `ENCRYPTION_KEYRING`). If `SESSION_SECRET` is not set, the server falls back to `JWT_SECRET` for key derivation; session token hashing falls back through those secrets and then stable encryption key material. Set these explicitly in production to separate concerns.
+> **Production security:** Always set strong, unique values for `JWT_SECRET`, `SESSION_SECRET`, `SESSION_HASH_SECRET`, and encryption key material (`ENCRYPTION_KEY` or `ENCRYPTION_KEYRING`). Set `BOOTSTRAP_ADMIN_EMAIL` and `BOOTSTRAP_ADMIN_PASSWORD` (or `BOOTSTRAP_ADMIN_PASSWORD_FILE`) for a fresh production deployment. If `SESSION_SECRET` is not set, the server falls back to `JWT_SECRET` for key derivation; session token hashing falls back through those secrets and then stable encryption key material. Set these explicitly in production to separate concerns.
 
 ### Core
 
@@ -573,6 +573,8 @@ All configuration is via environment variables in `.env`. See [`.env.example`](.
 | `JWT_SECRET` | Server secret used as fallback entropy for encryption key derivation | Auto-generated on first run | Yes (prod) |
 | `SESSION_SECRET` | Preferred secret for encryption key derivation (takes priority over `JWT_SECRET`) | Falls back to `JWT_SECRET` | Recommended (prod) |
 | `SESSION_HASH_SECRET` | Dedicated HMAC secret for stored session token hashes | Falls back to session/JWT/encryption key material | Recommended (prod) |
+| `BOOTSTRAP_ADMIN_EMAIL` | Initial administrator email when no admin exists | — | Yes (fresh prod install) |
+| `BOOTSTRAP_ADMIN_PASSWORD` / `_FILE` | Initial administrator password (minimum 14 characters) | — | Yes (fresh prod install) |
 | `API_KEY_PREFIX` | Prefix for agent API keys | `cav_ak` | No |
 | `RATE_LIMIT_API` | Pre-auth API requests per minute, keyed by resolved client IP | `300` | No |
 | `RATE_LIMIT_AUTHENTICATED` | Post-auth API requests per minute, keyed by verified user or agent identity | `3000` | No |

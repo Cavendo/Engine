@@ -7,7 +7,7 @@ import { agentAuth, dualAuth, logAgentActivity } from '../middleware/agentAuth.j
 import { triggerWebhook } from '../services/webhooks.js';
 import { dispatchEvent } from '../services/routeDispatcher.js';
 import { logActivity } from '../services/activityLogger.js';
-import { canAccessDeliverable } from '../utils/authorization.js';
+import { canAccessDeliverable, requireActorAccess } from '../utils/authorization.js';
 import {
   validateBody,
   submitDeliverableSchema,
@@ -22,9 +22,7 @@ import {
   sanitizeFilename,
   saveDeliverableFile,
   ensureUploadsDir,
-  UPLOADS_DIR,
-  MAX_FILE_SIZE,
-  MAX_TOTAL_FILES_SIZE
+  validateFileAttachments
 } from '../utils/deliverableFiles.js';
 
 const router = Router();
@@ -220,7 +218,7 @@ ensureUploadsDir().catch(console.error);
  * List all deliverables with filtering
  * Supports browser sessions and API keys.
  */
-router.get('/', dualAuth, async (req, res) => {
+router.get('/', dualAuth, requireActorAccess(), async (req, res) => {
   try {
     const { status, taskId, agentId, projectId } = req.query;
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
@@ -300,7 +298,7 @@ router.get('/', dualAuth, async (req, res) => {
  * List deliverables pending review
  * Supports browser sessions and API keys.
  */
-router.get('/pending', dualAuth, async (req, res) => {
+router.get('/pending', dualAuth, requireActorAccess(), async (req, res) => {
   try {
     let query = `
       SELECT
@@ -356,7 +354,7 @@ router.get('/pending', dualAuth, async (req, res) => {
  * - For agent keys: returns deliverables where agent_id matches
  * - For user keys: returns deliverables from agents owned by this user
  */
-router.get('/mine', agentAuth, async (req, res) => {
+router.get('/mine', agentAuth, requireActorAccess(), async (req, res) => {
   try {
     const { status } = req.query;
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 50));
@@ -436,7 +434,7 @@ router.get('/mine', agentAuth, async (req, res) => {
  * Get deliverable details
  * Supports both user auth (session/user keys) and agent auth (agent keys)
  */
-router.get('/:id', dualAuth, async (req, res) => {
+router.get('/:id', dualAuth, requireActorAccess(), async (req, res) => {
   try {
     // Authorization check
     const access = await canAccessDeliverable(req, req.params.id);
@@ -535,7 +533,7 @@ router.get('/:id', dualAuth, async (req, res) => {
  * GET /api/deliverables/:id/feedback
  * Get feedback for a deliverable (for revisions)
  */
-router.get('/:id/feedback', dualAuth, async (req, res) => {
+router.get('/:id/feedback', dualAuth, requireActorAccess(), async (req, res) => {
   try {
     const deliverable = await db.one(`
       SELECT id, task_id, agent_id, status, feedback, reviewed_by, reviewed_at
@@ -781,7 +779,7 @@ router.patch('/:id/review', dualAuth, requireUserOrUserKeyRoles('admin', 'review
  * Submit a deliverable (agent endpoint)
  * Supports task-linked or standalone deliverables with files and actions
  */
-router.post('/', agentAuth, validateBody(submitDeliverableSchema), logAgentActivity('deliverable.submitted', (req, data) => ({
+router.post('/', agentAuth, requireActorAccess({ roles: ['admin', 'operator', 'reviewer'], agentScope: 'write' }), validateBody(submitDeliverableSchema), logAgentActivity('deliverable.submitted', (req, data) => ({
   type: 'deliverable',
   id: data?.data?.id,
   details: { taskId: req.body.taskId, projectId: req.body.projectId, title: req.body.title }
@@ -852,16 +850,9 @@ router.post('/', agentAuth, validateBody(submitDeliverableSchema), logAgentActiv
 
     // Validate file sizes BEFORE inserting to prevent orphan rows
     if (files && files.length > 0) {
-      let totalSize = 0;
-      for (const file of files) {
-        const fileSize = Buffer.byteLength(file.content, 'utf8');
-        if (fileSize > MAX_FILE_SIZE) {
-          return response.validationError(res, `File ${file.filename} exceeds maximum size of 10MB`);
-        }
-        totalSize += fileSize;
-      }
-      if (totalSize > MAX_TOTAL_FILES_SIZE) {
-        return response.validationError(res, 'Total file size exceeds maximum of 50MB');
+      const filePolicy = validateFileAttachments(files);
+      if (!filePolicy.valid) {
+        return response.validationError(res, filePolicy.errors.join('; '));
       }
     }
 
@@ -1036,7 +1027,7 @@ router.post('/', agentAuth, validateBody(submitDeliverableSchema), logAgentActiv
  * POST /api/deliverables/:id/revision
  * Submit a revision (agent endpoint)
  */
-router.post('/:id/revision', agentAuth, validateBody(submitRevisionSchema), logAgentActivity('deliverable.revision_submitted', (req, data) => ({
+router.post('/:id/revision', agentAuth, requireActorAccess({ roles: ['admin', 'operator', 'reviewer'], agentScope: 'write' }), validateBody(submitRevisionSchema), logAgentActivity('deliverable.revision_submitted', (req, data) => ({
   type: 'deliverable',
   id: data?.data?.id,
   details: { parentId: parseInt(req.params.id) }
@@ -1073,16 +1064,9 @@ router.post('/:id/revision', agentAuth, validateBody(submitRevisionSchema), logA
 
     // Validate file sizes BEFORE inserting to prevent orphan rows
     if (files && files.length > 0) {
-      let totalSize = 0;
-      for (const file of files) {
-        const fileSize = Buffer.byteLength(file.content, 'utf8');
-        if (fileSize > MAX_FILE_SIZE) {
-          return response.validationError(res, `File ${file.filename} exceeds maximum size of 10MB`);
-        }
-        totalSize += fileSize;
-      }
-      if (totalSize > MAX_TOTAL_FILES_SIZE) {
-        return response.validationError(res, 'Total file size exceeds maximum of 50MB');
+      const filePolicy = validateFileAttachments(files);
+      if (!filePolicy.valid) {
+        return response.validationError(res, filePolicy.errors.join('; '));
       }
     }
 
@@ -1235,7 +1219,7 @@ router.post('/:id/revision', agentAuth, validateBody(submitRevisionSchema), logA
  * GET /api/deliverables/:id/activity
  * Get activity log for a deliverable
  */
-router.get('/:id/activity', dualAuth, async (req, res) => {
+router.get('/:id/activity', dualAuth, requireActorAccess(), async (req, res) => {
   try {
     // Authorization check
     const access = await canAccessDeliverable(req, req.params.id);

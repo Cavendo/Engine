@@ -36,11 +36,11 @@ npm run dev
 
 Open [http://localhost:5173](http://localhost:5173) (development) or [http://localhost:3001](http://localhost:3001) (production).
 
-**Default credentials:**
+**Development-only bootstrap credentials:**
 - Email: `admin@cavendo.local`
 - Password: `admin`
 
-> **Important:** Change the default password immediately in production.
+> **Important:** Production does not permit these credentials. For a fresh production install, set `BOOTSTRAP_ADMIN_EMAIL` plus `BOOTSTRAP_ADMIN_PASSWORD` (or `BOOTSTRAP_ADMIN_PASSWORD_FILE`) before startup.
 
 ## Getting Started
 

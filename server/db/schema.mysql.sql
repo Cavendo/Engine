@@ -188,6 +188,7 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
     response_status INT,
     response_body LONGTEXT,
     error TEXT,
+    delivery_claim_until DATETIME(3),
     created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3)
 );
 
@@ -446,6 +447,7 @@ CREATE INDEX idx_sessions_expires ON sessions(expires_at);
 CREATE INDEX idx_sessions_user ON sessions(user_id);
 CREATE INDEX idx_webhooks_agent ON webhooks(agent_id);
 CREATE INDEX idx_webhooks_status ON webhooks(status);
+CREATE INDEX idx_webhook_deliveries_claim ON webhook_deliveries(status, delivery_claim_until);
 CREATE INDEX idx_projects_status ON projects(status);
 CREATE INDEX idx_deliverables_parent ON deliverables(parent_id);
 CREATE INDEX idx_knowledge_category ON knowledge(category);

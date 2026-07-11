@@ -145,6 +145,77 @@ export function validateArtifactPolicy(artifacts) {
   return { valid: errors.length === 0, errors };
 }
 
+function isValidBase64(value) {
+  if (typeof value !== 'string' || value.length === 0 || value.length % 4 !== 0) return false;
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(value)) return false;
+  return Buffer.from(value, 'base64').toString('base64') === value;
+}
+
+/**
+ * Validate direct JSON attachment submissions. The API accepts plain UTF-8
+ * content and an explicit `base64:` prefix, so this intentionally differs
+ * from the agent-envelope policy while enforcing the same allowlist, count,
+ * extension, and decoded-size boundaries.
+ */
+export function validateFileAttachments(files) {
+  if (!Array.isArray(files)) return { valid: false, errors: ['files must be an array'] };
+
+  const errors = [];
+  if (files.length > MAX_ARTIFACT_COUNT) {
+    errors.push(`Too many files: ${files.length} exceeds maximum of ${MAX_ARTIFACT_COUNT}`);
+  }
+
+  let totalSize = 0;
+  for (const file of files) {
+    if (!file || typeof file !== 'object') {
+      errors.push('Each file must be an object');
+      continue;
+    }
+    const filename = typeof file.filename === 'string' ? file.filename.trim() : '';
+    if (!filename || filename.length > 255) {
+      errors.push('Each filename must be between 1 and 255 characters');
+      continue;
+    }
+    if (typeof file.content !== 'string' || file.content.length === 0) {
+      errors.push(`File ${filename} must contain non-empty string content`);
+      continue;
+    }
+
+    const extensionMime = getMimeType(filename);
+    const mimeType = file.mimeType || extensionMime;
+    if (!isAllowedMimeType(mimeType)) {
+      errors.push(`File ${filename} has unsupported MIME type '${mimeType}'`);
+      continue;
+    }
+    if (file.mimeType && extensionMime !== 'application/octet-stream' && file.mimeType !== extensionMime) {
+      errors.push(`File ${filename} MIME type does not match its extension`);
+      continue;
+    }
+
+    let size;
+    if (file.content.startsWith('base64:')) {
+      const raw = file.content.slice('base64:'.length);
+      if (!isValidBase64(raw)) {
+        errors.push(`File ${filename} contains invalid base64 data`);
+        continue;
+      }
+      size = Buffer.from(raw, 'base64').length;
+    } else {
+      size = Buffer.byteLength(file.content, 'utf8');
+    }
+
+    if (size > MAX_FILE_SIZE) {
+      errors.push(`File ${filename} exceeds maximum size of 10MB`);
+    }
+    totalSize += size;
+  }
+
+  if (totalSize > MAX_TOTAL_FILES_SIZE) {
+    errors.push('Total file size exceeds maximum of 50MB');
+  }
+  return { valid: errors.length === 0, errors };
+}
+
 /**
  * Save a deliverable file attachment to disk.
  * @param {string} filename - Original filename
@@ -187,6 +258,7 @@ export async function saveDeliverableFile(filename, content, deliverableId, opts
   return {
     filename: safeName,
     path: `/uploads/deliverables/${deliverableId}/${safeName}`,
+    downloadUrl: `/uploads/deliverables/${deliverableId}/${safeName}`,
     size: stats.size
   };
 }

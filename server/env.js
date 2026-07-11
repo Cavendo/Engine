@@ -2,7 +2,7 @@
 import crypto from 'crypto';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, readFileSync, writeFileSync } from 'fs';
 import { loadEnvFromFile, loadEnvFromString } from './utils/envLoader.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -30,12 +30,17 @@ if (!existsSync(envPath) && existsSync(envExamplePath)) {
     `ENCRYPTION_KEY=${encryptionKey}`
   );
 
-  writeFileSync(envPath, envContent, 'utf-8');
+  writeFileSync(envPath, envContent, { encoding: 'utf-8', mode: 0o600 });
   console.log('[Setup] .env created with unique secrets. Review and customize as needed.');
 
   // Load env vars from the newly created file
   loadEnvFromString(envContent);
 } else if (existsSync(envPath)) {
+  // Configuration commonly contains JWT, encryption, and provider secrets.
+  // Tighten an existing file as well, including files created by older releases.
+  try { chmodSync(envPath, 0o600); } catch (err) {
+    console.warn(`[Setup] Unable to set restrictive permissions on ${envPath}: ${err.message}`);
+  }
   // Load existing .env file into process.env (values already set take precedence)
   loadEnvFromFile(envPath);
 }

@@ -6,7 +6,7 @@ import * as response from '../utils/response.js';
 import { userAuth, requireRoles } from '../middleware/userAuth.js';
 import { getConfig, isConfigured, sendEmail, reloadConfig } from '../services/emailProvider.js';
 import { getDispatcherStatus } from '../services/taskDispatcher.js';
-import { runCryptoHealthCheck } from '../utils/crypto.js';
+import { encryptEnvSecret, runCryptoHealthCheck } from '../utils/crypto.js';
 import db from '../db/adapter.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -125,7 +125,7 @@ router.post('/email', userAuth, requireRoles('admin'), (req, res) => {
       // Skip masked values (user didn't change the sensitive field)
       if (SENSITIVE_KEYS.includes(key) && typeof value === 'string' && value.startsWith('••')) continue;
 
-      setEnvVar(lines, vars, key, value ?? '');
+      setEnvVar(lines, vars, key, SENSITIVE_KEYS.includes(key) ? encryptEnvSecret(value ?? '') : (value ?? ''));
     }
 
     // Write the file back
@@ -134,7 +134,7 @@ router.post('/email', userAuth, requireRoles('admin'), (req, res) => {
     // Reload env vars from the updated .env into process.env
     for (const [key, value] of Object.entries(updates)) {
       if (EMAIL_KEYS.includes(key) && !(SENSITIVE_KEYS.includes(key) && typeof value === 'string' && value.startsWith('••'))) {
-        process.env[key] = value ?? '';
+        process.env[key] = SENSITIVE_KEYS.includes(key) ? encryptEnvSecret(value ?? '') : (value ?? '');
       }
     }
 

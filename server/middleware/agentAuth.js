@@ -64,7 +64,8 @@ function buildAgentKeyActor(agentKey) {
     scopes,
     ownerUserId: agentKey.owner_user_id,
     ownerName: agentKey.owner_name,
-    ownerEmail: agentKey.owner_email
+    ownerEmail: agentKey.owner_email,
+    projectAccess: safeJsonParse(agentKey.project_access, ['*'])
   };
 }
 
@@ -78,7 +79,8 @@ async function loadUserKeyAgent(keyHash) {
       u.name as user_name,
       u.email,
       u.role,
-      u.status
+      u.status,
+      u.force_password_change
     FROM user_keys uk
     JOIN users u ON u.id = uk.user_id
     WHERE uk.key_hash = ?
@@ -101,6 +103,12 @@ async function loadUserKeyAgent(keyHash) {
 
   if (userKey.status !== 'active') {
     const err = new Error(`User account is ${userKey.status}`);
+    err.status = 403;
+    throw err;
+  }
+
+  if (userKey.force_password_change) {
+    const err = new Error('Password change required before using API keys');
     err.status = 403;
     throw err;
   }
@@ -132,6 +140,7 @@ async function loadAgentKeyActor(keyHash) {
       a.capabilities,
       a.status,
       a.max_concurrent_tasks,
+      a.project_access,
       a.owner_user_id,
       u.name as owner_name,
       u.email as owner_email

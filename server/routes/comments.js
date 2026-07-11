@@ -2,7 +2,7 @@ import { Router } from 'express';
 import db from '../db/adapter.js';
 import * as response from '../utils/response.js';
 import { dualAuth } from '../middleware/agentAuth.js';
-import { canAccessTask, canAccessDeliverable } from '../utils/authorization.js';
+import { canAccessTask, canAccessDeliverable, requireActorAccess } from '../utils/authorization.js';
 import { toISOTimestamp as formatTimestamp } from '../utils/routeHelpers.js';
 
 const router = Router();
@@ -124,7 +124,7 @@ router.get('/tasks/:id/comments', dualAuth, async (req, res) => {
  * POST /api/tasks/:id/comments
  * Add a comment to a task
  */
-router.post('/tasks/:id/comments', dualAuth, async (req, res) => {
+router.post('/tasks/:id/comments', dualAuth, requireActorAccess({ roles: ['admin', 'operator', 'reviewer'], agentScope: 'write' }), async (req, res) => {
   try {
     const taskId = parseInt(req.params.id);
     const { content } = req.body;
@@ -136,10 +136,11 @@ router.post('/tasks/:id/comments', dualAuth, async (req, res) => {
       return response.validationError(res, 'Content must be 50,000 characters or fewer');
     }
 
-    // Verify task exists
-    const task = await db.one('SELECT id FROM tasks WHERE id = ?', [taskId]);
-    if (!task) {
-      return response.notFound(res, 'Task');
+    const access = await canAccessTask(req, taskId);
+    if (!access.allowed) {
+      return access.reason === 'not_found'
+        ? response.notFound(res, 'Task')
+        : response.forbidden(res, 'Access denied');
     }
 
     const author = getAuthorInfo(req);
@@ -171,10 +172,17 @@ router.post('/tasks/:id/comments', dualAuth, async (req, res) => {
  * DELETE /api/tasks/:taskId/comments/:commentId
  * Delete a comment from a task (only own comments, or admin)
  */
-router.delete('/tasks/:taskId/comments/:commentId', dualAuth, async (req, res) => {
+router.delete('/tasks/:taskId/comments/:commentId', dualAuth, requireActorAccess({ roles: ['admin', 'operator', 'reviewer'], agentScope: 'write' }), async (req, res) => {
   try {
     const taskId = parseInt(req.params.taskId);
     const commentId = parseInt(req.params.commentId);
+
+    const access = await canAccessTask(req, taskId);
+    if (!access.allowed) {
+      return access.reason === 'not_found'
+        ? response.notFound(res, 'Task')
+        : response.forbidden(res, 'Access denied');
+    }
 
     // Verify comment exists and belongs to this task
     const comment = await db.one(`
@@ -243,7 +251,7 @@ router.get('/deliverables/:id/comments', dualAuth, async (req, res) => {
  * POST /api/deliverables/:id/comments
  * Add a comment to a deliverable
  */
-router.post('/deliverables/:id/comments', dualAuth, async (req, res) => {
+router.post('/deliverables/:id/comments', dualAuth, requireActorAccess({ roles: ['admin', 'operator', 'reviewer'], agentScope: 'write' }), async (req, res) => {
   try {
     const deliverableId = parseInt(req.params.id);
     const { content } = req.body;
@@ -255,10 +263,11 @@ router.post('/deliverables/:id/comments', dualAuth, async (req, res) => {
       return response.validationError(res, 'Content must be 50,000 characters or fewer');
     }
 
-    // Verify deliverable exists
-    const deliverable = await db.one('SELECT id FROM deliverables WHERE id = ?', [deliverableId]);
-    if (!deliverable) {
-      return response.notFound(res, 'Deliverable');
+    const access = await canAccessDeliverable(req, deliverableId);
+    if (!access.allowed) {
+      return access.reason === 'not_found'
+        ? response.notFound(res, 'Deliverable')
+        : response.forbidden(res, 'Access denied');
     }
 
     const author = getAuthorInfo(req);
@@ -290,10 +299,17 @@ router.post('/deliverables/:id/comments', dualAuth, async (req, res) => {
  * DELETE /api/deliverables/:deliverableId/comments/:commentId
  * Delete a comment from a deliverable (only own comments, or admin)
  */
-router.delete('/deliverables/:deliverableId/comments/:commentId', dualAuth, async (req, res) => {
+router.delete('/deliverables/:deliverableId/comments/:commentId', dualAuth, requireActorAccess({ roles: ['admin', 'operator', 'reviewer'], agentScope: 'write' }), async (req, res) => {
   try {
     const deliverableId = parseInt(req.params.deliverableId);
     const commentId = parseInt(req.params.commentId);
+
+    const access = await canAccessDeliverable(req, deliverableId);
+    if (!access.allowed) {
+      return access.reason === 'not_found'
+        ? response.notFound(res, 'Deliverable')
+        : response.forbidden(res, 'Access denied');
+    }
 
     // Verify comment exists and belongs to this deliverable
     const comment = await db.one(`

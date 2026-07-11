@@ -9,7 +9,9 @@ import { sendEmail, isConfigured as isEmailConfigured } from './emailProvider.js
 import { uploadToS3, testS3Connection } from './s3Provider.js';
 import { sendSlackMessage, testSlackConnection } from './slackProvider.js';
 import { validateWebhookUrl } from './webhooks.js';
+import { fetchPinned } from '../utils/outboundHttp.js';
 import { decrypt } from '../utils/crypto.js';
+import { decryptDestinationConfig } from '../utils/routeSecrets.js';
 import _Handlebars from 'handlebars';
 
 // Sandboxed Handlebars instance — no prototype access, no custom helpers
@@ -308,19 +310,13 @@ async function deliverWebhook(config, payload) {
     requestHeaders['X-Cavendo-Delivery-Id'] = payload.delivery_id;
   }
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeout_ms || 10000);
-
   try {
-    const response = await fetch(url, {
+    const response = await fetchPinned(urlCheck, {
       method: method || 'POST',
       headers: requestHeaders,
       body: JSON.stringify(payload),
-      signal: controller.signal,
-      redirect: 'manual'
+      timeoutMs: timeout_ms || 10000
     });
-
-    clearTimeout(timeoutId);
 
     const body = await response.text();
 
@@ -330,8 +326,7 @@ async function deliverWebhook(config, payload) {
 
     return { status: response.status, body };
   } catch (error) {
-    clearTimeout(timeoutId);
-    if (error.name === 'AbortError') {
+    if (error.message === `Request timeout after ${timeout_ms || 10000}ms`) {
       throw new Error(`Request timeout after ${timeout_ms || 10000}ms`);
     }
     throw error;
@@ -690,7 +685,7 @@ function formatRoute(route) {
   return {
     ...route,
     trigger_conditions: safeJsonParse(route.trigger_conditions, null),
-    destination_config: safeJsonParse(route.destination_config, {}),
+    destination_config: decryptDestinationConfig(safeJsonParse(route.destination_config, {})),
     field_mapping: safeJsonParse(route.field_mapping, null),
     retry_policy: safeJsonParse(route.retry_policy, { max_retries: 3, backoff_type: 'exponential', initial_delay_ms: 1000 }),
     enabled: !!route.enabled
@@ -855,8 +850,15 @@ async function retrySweep() {
         }
       }
 
-      // Clear next_retry_at before dispatching (prevent double-pickup)
-      await db.exec('UPDATE delivery_logs SET next_retry_at = NULL WHERE id = ?', [log.id]);
+      // Atomically lease a due retry. A second process may have selected the
+      // same row, but it cannot dispatch it after this conditional claim.
+      const claim = await db.exec(`
+        UPDATE delivery_logs
+        SET next_retry_at = NULL
+        WHERE id = ? AND status = 'retrying'
+          AND next_retry_at IS NOT NULL AND next_retry_at <= datetime('now')
+      `, [log.id]);
+      if (claim.changes !== 1) continue;
 
       try {
         await dispatchRoute(route, eventData, log.id);

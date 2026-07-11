@@ -3,6 +3,7 @@ import db from '../db/adapter.js';
 import * as response from '../utils/response.js';
 import { userAuth, requireRoles } from '../middleware/userAuth.js';
 import { dualAuth } from '../middleware/agentAuth.js';
+import { hasProjectAccess, projectScopeFilter, requireActorAccess } from '../utils/authorization.js';
 import { dispatchEvent } from '../services/routeDispatcher.js';
 import {
   validateBody,
@@ -46,7 +47,7 @@ function normalizeProjectTimestamps(project) {
  * GET /api/projects
  * List all projects (accessible by both users and agents)
  */
-router.get('/', dualAuth, async (req, res) => {
+router.get('/', dualAuth, requireActorAccess(), async (req, res) => {
   try {
     const { status } = req.query;
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
@@ -58,6 +59,12 @@ router.get('/', dualAuth, async (req, res) => {
     if (status) {
       query += ' AND status = ?';
       params.push(status);
+    }
+
+    const projectScope = projectScopeFilter(req, 'projects.id');
+    if (projectScope.sql) {
+      query += ` AND ${projectScope.sql}`;
+      params.push(...projectScope.params);
     }
 
     query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
@@ -125,11 +132,14 @@ router.post('/', userAuth, requireRoles('admin'), validateBody(createProjectSche
  * GET /api/projects/:id
  * Get project details (accessible by both users and agents)
  */
-router.get('/:id', dualAuth, async (req, res) => {
+router.get('/:id', dualAuth, requireActorAccess(), async (req, res) => {
   try {
     const project = await db.one('SELECT * FROM projects WHERE id = ?', [req.params.id]);
 
     if (!project) {
+      return response.notFound(res, 'Project');
+    }
+    if (!hasProjectAccess(req, project.id)) {
       return response.notFound(res, 'Project');
     }
 
@@ -244,10 +254,13 @@ router.delete('/:id', userAuth, requireRoles('admin'), async (req, res) => {
  * GET /api/projects/:id/knowledge
  * Get project knowledge base (accessible by agents)
  */
-router.get('/:id/knowledge', dualAuth, async (req, res) => {
+router.get('/:id/knowledge', dualAuth, requireActorAccess(), async (req, res) => {
   try {
     const project = await db.one('SELECT id, name FROM projects WHERE id = ?', [req.params.id]);
     if (!project) {
+      return response.notFound(res, 'Project');
+    }
+    if (!hasProjectAccess(req, project.id)) {
       return response.notFound(res, 'Project');
     }
 

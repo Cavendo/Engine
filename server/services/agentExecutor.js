@@ -574,18 +574,24 @@ async function gatherTaskContext(task) {
  * @param {Object} task - Task record from database
  * @returns {Promise<Object>} Execution result
  */
-export async function executeTask(agent, task) {
+export async function executeTask(agent, task, { taskAlreadyClaimed = false } = {}) {
   let result;
   try {
     ensureSupportedProvider(agent.provider);
     const apiKey = resolveProviderApiKey(agent);
 
-    // Update task status to in_progress
-    await db.exec(`
-      UPDATE tasks
-      SET status = 'in_progress', started_at = datetime('now'), updated_at = datetime('now')
-      WHERE id = ?
-    `, [task.id]);
+    // Direct executor users also receive an atomic claim; dispatcher/manual
+    // callers claim before incrementing capacity and pass taskAlreadyClaimed.
+    if (!taskAlreadyClaimed) {
+      const claim = await db.exec(`
+        UPDATE tasks
+        SET status = 'in_progress', started_at = COALESCE(started_at, datetime('now')), updated_at = datetime('now')
+        WHERE id = ? AND status IN ('pending', 'assigned')
+      `, [task.id]);
+      if (claim.changes !== 1) {
+        return { success: false, error: 'Task is already executing or is no longer eligible', category: 'conflict' };
+      }
+    }
 
     // Gather full context — same data MCP agents get via cavendo_get_task_context
     const context = await gatherTaskContext(task);
@@ -643,7 +649,7 @@ export async function executeTask(agent, task) {
     await db.exec(`
       UPDATE tasks
       SET status = 'review', updated_at = datetime('now')
-      WHERE id = ?
+      WHERE id = ? AND status = 'in_progress'
     `, [task.id]);
 
     return {

@@ -177,6 +177,19 @@ export async function findEligibleTasks() {
 async function dispatchTask(eligible) {
   const { task_id, task_title, agent_id, agent_name } = eligible;
 
+  // This conditional update is the cross-process execution claim. A polling
+  // worker, manual execution, or a second process can all observe the task,
+  // but exactly one may move it out of pending/assigned.
+  const claim = await db.exec(`
+    UPDATE tasks
+    SET status = 'in_progress', started_at = COALESCE(started_at, datetime('now')), updated_at = datetime('now')
+    WHERE id = ? AND assigned_agent_id = ? AND status IN ('pending', 'assigned')
+  `, [task_id, agent_id]);
+  if (claim.changes !== 1) {
+    console.log(`[Dispatcher] Task #${task_id} was claimed by another worker`);
+    return;
+  }
+
   console.log(`[Dispatcher] Executing task #${task_id} "${task_title}" via agent "${agent_name}"`);
 
   // Increment active_task_count while executing
@@ -204,7 +217,7 @@ async function dispatchTask(eligible) {
   }
 
   try {
-    const result = await executeTask(agent, task);
+    const result = await executeTask(agent, task, { taskAlreadyClaimed: true });
 
     // Decrement active_task_count — task is no longer being actively executed
     await decrementActiveTaskCount(agent_id);
@@ -314,7 +327,8 @@ export async function flagTaskError(taskId, agentName, errorMessage, errorCatego
     const failure = buildFailureMetadata(context, agentName, errorMessage, errorCategory);
 
     await db.exec(`
-      UPDATE tasks SET status = ?, context = ?, updated_at = datetime('now') WHERE id = ?
+      UPDATE tasks SET status = ?, context = ?, updated_at = datetime('now')
+      WHERE id = ?
     `, [failure.status, JSON.stringify(failure.context), taskId]);
 
     if (failure.quarantined) {
@@ -324,7 +338,8 @@ export async function flagTaskError(taskId, agentName, errorMessage, errorCatego
     console.error(`[Dispatcher] Failed to store error context for task #${taskId}:`, err);
     try {
       await db.exec(`
-        UPDATE tasks SET status = 'assigned', updated_at = datetime('now') WHERE id = ?
+        UPDATE tasks SET status = 'assigned', updated_at = datetime('now')
+        WHERE id = ?
       `, [taskId]);
     } catch (statusErr) {
       console.error(`[Dispatcher] CRITICAL: Failed to reset task #${taskId} status from in_progress:`, statusErr);
@@ -757,6 +772,15 @@ export async function executeTaskNow(taskId) {
   // Managed-routing employees may not carry a direct provider or BYOK key on the
   // agent record. Let the executor resolve env-backed routes instead of failing here.
 
+  const claim = await db.exec(`
+    UPDATE tasks
+    SET status = 'in_progress', started_at = COALESCE(started_at, datetime('now')), updated_at = datetime('now')
+    WHERE id = ? AND assigned_agent_id = ? AND status IN ('pending', 'assigned')
+  `, [taskId, agent.id]);
+  if (claim.changes !== 1) {
+    throw new Error('Task is already executing or is no longer eligible for execution');
+  }
+
   // Increment active_task_count while executing
   await incrementActiveTaskCount(agent.id);
 
@@ -773,7 +797,7 @@ export async function executeTaskNow(taskId) {
 
   let result;
   try {
-    result = await executeTask(agent, task);
+    result = await executeTask(agent, task, { taskAlreadyClaimed: true });
   } catch (err) {
     await decrementActiveTaskCount(agent.id);
     await logAgentActivity(agent.id, 'task.execution_failed', 'task', taskId, {

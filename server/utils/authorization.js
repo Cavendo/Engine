@@ -10,6 +10,83 @@
  */
 
 import db from '../db/adapter.js';
+import * as response from './response.js';
+
+const HUMAN_READ_ROLES = ['admin', 'operator', 'reviewer', 'viewer'];
+
+/**
+ * Parse an agent project-access value. Missing values preserve the historic
+ * wildcard default; malformed values fail closed.
+ */
+export function parseProjectAccess(rawValue) {
+  if (rawValue === null || rawValue === undefined || rawValue === '') {
+    return { all: true, ids: [] };
+  }
+
+  const parsed = Array.isArray(rawValue)
+    ? rawValue
+    : (() => {
+      try { return JSON.parse(rawValue); } catch { return null; }
+    })();
+
+  if (!Array.isArray(parsed)) return { all: false, ids: [] };
+  const ids = parsed.map((value) => String(value || '').trim()).filter(Boolean);
+  return { all: ids.includes('*'), ids: ids.filter((id) => id !== '*') };
+}
+
+export function isRegularAgentKey(req) {
+  return Boolean(req.agent?.id && !req.agent?.isUserKey);
+}
+
+export function hasAgentScope(req, scope) {
+  if (!isRegularAgentKey(req)) return false;
+  const scopes = Array.isArray(req.agent.scopes) ? req.agent.scopes : [];
+  return scopes.includes('*') || scopes.includes(scope);
+}
+
+/**
+ * Human sessions and user keys are role-governed. Regular agent keys must
+ * hold the requested generic read/write scope.
+ */
+export function requireActorAccess({ roles = HUMAN_READ_ROLES, agentScope = 'read' } = {}) {
+  return (req, res, next) => {
+    if (isRegularAgentKey(req)) {
+      if (!hasAgentScope(req, agentScope)) {
+        return response.forbidden(res, `Missing required scope: ${agentScope}`);
+      }
+      return next();
+    }
+
+    const role = req.user?.role || (req.agent?.isUserKey ? req.agent.userRole : null);
+    if (!role) return response.unauthorized(res, 'Authentication required');
+    if (!roles.includes(role)) return response.forbidden(res, 'Insufficient permissions');
+    return next();
+  };
+}
+
+export function hasProjectAccess(req, projectId) {
+  if (!isRegularAgentKey(req) || projectId === null || projectId === undefined) return true;
+  const access = parseProjectAccess(req.agent.projectAccess);
+  return access.all || access.ids.includes(String(projectId));
+}
+
+/**
+ * SQL fragment for project-scoped lists. Shared records without a project
+ * remain visible only when explicitly requested by the caller.
+ */
+export function projectScopeFilter(req, column, { includeUnscoped = false } = {}) {
+  if (!isRegularAgentKey(req)) return { sql: '', params: [] };
+  const access = parseProjectAccess(req.agent.projectAccess);
+  if (access.all) return { sql: '', params: [] };
+  if (access.ids.length === 0) {
+    return { sql: includeUnscoped ? `${column} IS NULL` : '1 = 0', params: [] };
+  }
+  const scoped = `${column} IN (${access.ids.map(() => '?').join(', ')})`;
+  return {
+    sql: includeUnscoped ? `(${column} IS NULL OR ${scoped})` : scoped,
+    params: access.ids
+  };
+}
 
 /**
  * Check if the current request has access to a task.

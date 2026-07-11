@@ -3,6 +3,12 @@ import * as response from '../utils/response.js';
 import { hashSessionToken } from '../utils/crypto.js';
 import { authenticatedApiLimiter } from './security.js';
 
+const PASSWORD_CHANGE_ALLOWED_PATHS = new Set([
+  '/api/auth/me',
+  '/api/auth/csrf',
+  '/api/auth/change-password',
+]);
+
 async function resolveUserSession(req) {
   const sessionToken = String(req.cookies?.session || '');
 
@@ -69,6 +75,9 @@ export async function userAuthProbe(req) {
   if (!result.ok) {
     return { ok: false, reason: result.reason };
   }
+  if (result.user.forcePasswordChange) {
+    return { ok: false, reason: 'password_change_required' };
+  }
   return {
     ok: true,
     user: result.user,
@@ -109,6 +118,11 @@ export async function userAuth(req, res, next) {
     actorId: `user:${result.user.id}`
   };
   req.session = { id: result.sessionId };
+
+  const requestPath = req.originalUrl?.split('?')[0] || req.path;
+  if (result.user.forcePasswordChange && !PASSWORD_CHANGE_ALLOWED_PATHS.has(requestPath)) {
+    return response.forbidden(res, 'Password change required before accessing this resource');
+  }
 
   return authenticatedApiLimiter(req, res, next);
 }

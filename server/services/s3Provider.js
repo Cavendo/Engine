@@ -4,13 +4,15 @@
  */
 
 import { S3Client, PutObjectCommand, HeadBucketCommand } from '@aws-sdk/client-s3';
+import { NodeHttpHandler } from '@smithy/node-http-handler';
+import { createPinnedAgents, validateOutboundHttpUrl } from '../utils/outboundHttp.js';
 
 /**
  * Create an S3 client from route config (per-call, no global state)
  * @param {Object} config - Storage config from route
  * @returns {S3Client}
  */
-function createClient(config) {
+async function createClient(config) {
   const clientConfig = {
     region: config.region || 'us-east-1',
     credentials: {
@@ -21,8 +23,20 @@ function createClient(config) {
 
   // Custom endpoint for MinIO, Backblaze B2, etc.
   if (config.endpoint) {
+    // Validate at connection time, then pin the SDK's socket lookup to the
+    // resolved public IP. This protects route delivery against DNS rebinding
+    // even if the endpoint was validated when it was saved.
+    const endpointCheck = await validateOutboundHttpUrl(config.endpoint, {
+      allowPrivate: false,
+      requireHttpsInProduction: true
+    });
+    if (!endpointCheck.valid) {
+      throw new Error(`Storage endpoint blocked: ${endpointCheck.reason}`);
+    }
+    const { httpAgent, httpsAgent } = createPinnedAgents(endpointCheck);
     clientConfig.endpoint = config.endpoint;
     clientConfig.forcePathStyle = true; // Required for MinIO
+    clientConfig.requestHandler = new NodeHttpHandler({ httpAgent, httpsAgent });
   }
 
   return new S3Client(clientConfig);
@@ -37,7 +51,7 @@ function createClient(config) {
  * @returns {Promise<{key: string, bucket: string, size: number}>}
  */
 export async function uploadToS3(config, key, body, contentType) {
-  const client = createClient(config);
+  const client = await createClient(config);
 
   const command = new PutObjectCommand({
     Bucket: config.bucket,
@@ -59,7 +73,12 @@ export async function uploadToS3(config, key, body, contentType) {
  * @returns {Promise<{success: boolean, message: string}>}
  */
 export async function testS3Connection(config) {
-  const client = createClient(config);
+  let client;
+  try {
+    client = await createClient(config);
+  } catch (err) {
+    return { success: false, message: err.message, detail: { code: 'ENDPOINT_BLOCKED', message: err.message } };
+  }
 
   try {
     await client.send(new HeadBucketCommand({ Bucket: config.bucket }));

@@ -3,6 +3,7 @@ import db from '../db/adapter.js';
 import * as response from '../utils/response.js';
 import { userAuth, requireRoles } from '../middleware/userAuth.js';
 import { dualAuth } from '../middleware/agentAuth.js';
+import { hasProjectAccess, projectScopeFilter, requireActorAccess } from '../utils/authorization.js';
 import {
   validateBody,
   createSprintSchema,
@@ -64,7 +65,7 @@ async function getTaskSummary(sprintId) {
  * GET /api/sprints
  * List all sprints with filtering
  */
-router.get('/', dualAuth, async (req, res) => {
+router.get('/', dualAuth, requireActorAccess(), async (req, res) => {
   try {
     const { status, projectId } = req.query;
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
@@ -79,6 +80,12 @@ router.get('/', dualAuth, async (req, res) => {
       WHERE 1=1
     `;
     const params = [];
+
+    const projectScope = projectScopeFilter(req, 's.project_id', { includeUnscoped: true });
+    if (projectScope.sql) {
+      query += ` AND ${projectScope.sql}`;
+      params.push(...projectScope.params);
+    }
 
     if (status) {
       query += ' AND s.status = ?';
@@ -115,7 +122,7 @@ router.get('/', dualAuth, async (req, res) => {
  * GET /api/sprints/:id
  * Get sprint details with task summary
  */
-router.get('/:id', dualAuth, async (req, res) => {
+router.get('/:id', dualAuth, requireActorAccess(), async (req, res) => {
   try {
     const sprint = await db.one(`
       SELECT
@@ -127,6 +134,9 @@ router.get('/:id', dualAuth, async (req, res) => {
     `, [req.params.id]);
 
     if (!sprint) {
+      return response.notFound(res, 'Sprint');
+    }
+    if (!hasProjectAccess(req, sprint.project_id)) {
       return response.notFound(res, 'Sprint');
     }
 
@@ -147,10 +157,13 @@ router.get('/:id', dualAuth, async (req, res) => {
  * GET /api/sprints/:id/tasks
  * Get all tasks in a sprint
  */
-router.get('/:id/tasks', dualAuth, async (req, res) => {
+router.get('/:id/tasks', dualAuth, requireActorAccess(), async (req, res) => {
   try {
-    const sprint = await db.one('SELECT id, name FROM sprints WHERE id = ?', [req.params.id]);
+    const sprint = await db.one('SELECT id, name, project_id FROM sprints WHERE id = ?', [req.params.id]);
     if (!sprint) {
+      return response.notFound(res, 'Sprint');
+    }
+    if (!hasProjectAccess(req, sprint.project_id)) {
       return response.notFound(res, 'Sprint');
     }
 

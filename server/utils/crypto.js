@@ -404,6 +404,26 @@ export function decrypt(encryptedData, ivBase64, keyVersion = null) {
 }
 
 /**
+ * Compact encrypted format suitable for a single .env value. Plain values are
+ * intentionally accepted by decryptEnvSecret for a non-breaking migration.
+ */
+export function encryptEnvSecret(value) {
+  if (value === null || value === undefined || value === '') return '';
+  const { encrypted, iv, keyVersion } = encrypt(String(value));
+  if (!encrypted || !iv) throw new Error('Unable to encrypt environment secret');
+  return `enc:v1:${keyVersion}:${iv}:${encrypted}`;
+}
+
+export function decryptEnvSecret(value) {
+  const raw = String(value || '');
+  if (!raw.startsWith('enc:v1:')) return raw;
+  const [, , keyVersion, iv, ...ciphertext] = raw.split(':');
+  const plaintext = decrypt(ciphertext.join(':'), iv, Number(keyVersion));
+  if (plaintext === null) throw new Error('Unable to decrypt environment secret');
+  return plaintext;
+}
+
+/**
  * Check if encrypted data can be decrypted with a given key version.
  * Returns boolean, never throws.
  * @param {string} encryptedData

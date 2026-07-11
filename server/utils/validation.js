@@ -410,7 +410,7 @@ export const logTaskProgressSchema = z.object({
 
 // File attachment schema
 const fileAttachmentSchema = z.object({
-  filename: z.string().min(1, 'Filename is required'),
+  filename: z.string().min(1, 'Filename is required').max(255),
   content: z.string().min(1, 'File content is required'),
   mimeType: z.string().optional()
 });
@@ -429,7 +429,7 @@ export const submitDeliverableSchema = z.object({
   summary: z.string().max(50000).optional(), // Text summary shown in Overview tab
   content: z.string().max(1000000).optional(), // Main content (optional if files provided)
   contentType: z.enum(['markdown', 'html', 'json', 'text', 'code']).optional(),
-  files: z.array(fileAttachmentSchema).optional(), // File attachments
+  files: z.array(fileAttachmentSchema).max(5, 'Maximum 5 files per deliverable').optional(), // File attachments
   actions: z.array(actionItemSchema).optional(), // Follow-up action items
   metadata: z.record(z.any()).optional().default({}),
   // Token usage tracking for AI-generated content
@@ -447,7 +447,7 @@ export const submitRevisionSchema = z.object({
   summary: z.string().max(50000).optional(), // Text summary shown in Overview tab
   content: z.string().max(1000000).optional(), // Main content (optional if files provided)
   contentType: z.enum(['markdown', 'html', 'json', 'text', 'code']).optional(),
-  files: z.array(fileAttachmentSchema).optional(), // File attachments for revisions
+  files: z.array(fileAttachmentSchema).max(5, 'Maximum 5 files per revision').optional(), // File attachments for revisions
   actions: z.array(actionItemSchema).optional(), // Follow-up action items
   metadata: z.record(z.any()).optional()
 }).refine(

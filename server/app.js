@@ -25,6 +25,7 @@ import connectionsRouter from './routes/connections.js';
 import settingsRouter from './routes/settings.js';
 import skillsRuntimeRouter from './routes/skillsRuntime.js';
 import internalProvisioningRouter from './routes/internalProvisioning.js';
+import uploadsRouter from './routes/uploads.js';
 
 // Import services
 import { processPendingDeliveries } from './services/webhooks.js';
@@ -49,8 +50,6 @@ import {
 } from './middleware/security.js';
 
 // Import auth middleware for file serving
-import { dualAuth } from './middleware/agentAuth.js';
-
 // Import database adapter
 import db from './db/adapter.js';
 
@@ -84,17 +83,15 @@ export function createApp(options = {}) {
     credentials: true
   }));
 
-  // Body parsing with size limits
-  app.use(express.json({ limit: '10mb' }));
+  // Reject abusive API traffic before parsing or walking a request body.
+  app.use('/api', apiLimiter);
 
   // Cookie parsing
   app.use(cookieParser());
 
-  // Sanitize request body
-  app.use(sanitizeRequest);
-
-  // General API rate limiting
-  app.use('/api', apiLimiter);
+  // Body parsing and sanitization apply only to the JSON API.
+  app.use('/api', express.json({ limit: '10mb' }));
+  app.use('/api', sanitizeRequest);
 
   // CSRF protection for state-changing requests
   app.use(csrfProtection);
@@ -142,9 +139,9 @@ export function createApp(options = {}) {
     app.use('/api/skills-runtime', skillsRuntimeRouter);
     app.use('/api/internal/provisioning', internalProvisioningRouter);
 
-    // Serve uploaded files (deliverable attachments) with authentication
-    const uploadsPath = join(__dirname, '../data/uploads');
-    app.use('/uploads', dualAuth, express.static(uploadsPath));
+    // Authenticated artifact downloads. Do not statically serve agent-produced
+    // HTML or other active content from the application origin.
+    app.use('/uploads', uploadsRouter);
 
     // afterRoutes hook for downstream route extensions
     if (options.afterRoutes) await options.afterRoutes(app);
@@ -223,7 +220,7 @@ export function createApp(options = {}) {
 
   async function _doStart(bindOptions) {
     const port = bindOptions.port ?? (process.env.PORT || 3001);
-    const host = bindOptions.host ?? undefined;
+    const host = bindOptions.host ?? (process.env.NODE_ENV === 'production' ? undefined : '127.0.0.1');
 
     // Wait for route assembly to complete
     try {

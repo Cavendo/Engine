@@ -1,8 +1,6 @@
-import { URL } from 'url';
-import dns from 'dns/promises';
 import db from '../db/adapter.js';
 import { generateWebhookSignature } from '../utils/crypto.js';
-import { isPrivateOrLocalIp, isLocalHostname, PRIVATE_IP_PATTERNS } from '../utils/networkUtils.js';
+import { fetchPinned, validateOutboundHttpUrl } from '../utils/outboundHttp.js';
 
 function safeJsonParse(val, fallback) {
   if (val === null || val === undefined) return fallback;
@@ -25,59 +23,7 @@ const webhookCounts = new Map(); // agentId:event -> count
  * @returns {Promise<{valid: boolean, reason?: string}>}
  */
 export async function validateWebhookUrl(urlString) {
-  try {
-    const url = new URL(urlString);
-
-    // Only allow http and https
-    if (!['http:', 'https:'].includes(url.protocol)) {
-      return { valid: false, reason: 'Only HTTP(S) URLs are allowed' };
-    }
-
-    // Skip SSRF checks when explicitly allowed (development/testing)
-    if (process.env.ALLOW_PRIVATE_WEBHOOKS === 'true') {
-      return { valid: true };
-    }
-
-    // Check hostname against private patterns
-    const hostname = url.hostname.toLowerCase();
-    if (isLocalHostname(hostname) || isPrivateOrLocalIp(hostname)) {
-      return { valid: false, reason: 'Private/internal URLs are not allowed' };
-    }
-    for (const pattern of PRIVATE_IP_PATTERNS) {
-      if (pattern.test(hostname)) {
-        return { valid: false, reason: 'Private/internal URLs are not allowed' };
-      }
-    }
-
-    // Resolve hostname and check both IPv4 and IPv6
-    try {
-      const ipv4 = await dns.resolve4(hostname).catch(() => []);
-      const ipv6 = await dns.resolve6(hostname).catch(() => []);
-      const allAddresses = [...ipv4, ...ipv6];
-
-      if (allAddresses.length === 0) {
-        return { valid: false, reason: 'Could not resolve hostname' };
-      }
-
-      for (const ip of allAddresses) {
-        for (const pattern of PRIVATE_IP_PATTERNS) {
-          if (pattern.test(ip)) {
-            return { valid: false, reason: 'URL resolves to private IP' };
-          }
-        }
-        // Block IPv6 loopback and private ranges
-        if (ip === '::1' || ip.startsWith('fe80:') || ip.startsWith('fd') || ip.startsWith('fc') || ip.startsWith('::ffff:')) {
-          return { valid: false, reason: 'URL resolves to private IP' };
-        }
-      }
-    } catch {
-      return { valid: false, reason: 'Could not resolve hostname' };
-    }
-
-    return { valid: true };
-  } catch {
-    return { valid: false, reason: 'Invalid URL format' };
-  }
+  return validateOutboundHttpUrl(urlString);
 }
 
 /**
@@ -240,16 +186,21 @@ export async function deliverWebhook(deliveryId, url, secret, payload) {
     payload = payload || delivery.payload;
   }
 
-  // Get current attempt count
-  const delivery = await db.one('SELECT attempts FROM webhook_deliveries WHERE id = ?', [deliveryId]);
-  const attempts = (delivery?.attempts || 0) + 1;
-
-  // Update attempt info
-  await db.exec(`
+  // Claim the delivery with a durable lease. This prevents both another
+  // process and an in-memory retry from dispatching the same webhook while
+  // this attempt is still using the socket.
+  const claim = await db.exec(`
     UPDATE webhook_deliveries
-    SET attempts = ?, last_attempt_at = datetime('now')
-    WHERE id = ?
-  `, [attempts, deliveryId]);
+    SET attempts = attempts + 1,
+        last_attempt_at = datetime('now'),
+        delivery_claim_until = datetime('now', '+5 minutes')
+    WHERE id = ? AND status = 'pending'
+      AND (delivery_claim_until IS NULL OR delivery_claim_until <= datetime('now'))
+  `, [deliveryId]);
+  if (claim.changes !== 1) return { success: false, busy: true };
+
+  const delivery = await db.one('SELECT attempts FROM webhook_deliveries WHERE id = ?', [deliveryId]);
+  const attempts = delivery?.attempts || 1;
 
   try {
     // SSRF protection: validate URL at delivery time (not just creation time)
@@ -257,7 +208,7 @@ export async function deliverWebhook(deliveryId, url, secret, payload) {
     if (!urlCheck.valid) {
       await db.exec(`
         UPDATE webhook_deliveries
-        SET status = 'failed', error = ?
+        SET status = 'failed', error = ?, delivery_claim_until = NULL
         WHERE id = ?
       `, [`SSRF blocked: ${urlCheck.reason}`, deliveryId]);
       return { success: false, error: `SSRF blocked: ${urlCheck.reason}` };
@@ -279,18 +230,12 @@ export async function deliverWebhook(deliveryId, url, secret, payload) {
     }
 
     // Make the request with timeout
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), WEBHOOK_TIMEOUT);
-
-    const response = await fetch(url, {
+    const response = await fetchPinned(urlCheck, {
       method: 'POST',
       headers,
       body: payload,
-      signal: controller.signal,
-      redirect: 'manual'
+      timeoutMs: WEBHOOK_TIMEOUT
     });
-
-    clearTimeout(timeoutId);
 
     const responseBody = await response.text().catch(() => '');
 
@@ -298,7 +243,7 @@ export async function deliverWebhook(deliveryId, url, secret, payload) {
       // Success
       await db.exec(`
         UPDATE webhook_deliveries
-        SET status = 'delivered', response_status = ?, response_body = ?
+        SET status = 'delivered', response_status = ?, response_body = ?, delivery_claim_until = NULL
         WHERE id = ?
       `, [response.status, responseBody.substring(0, 1000), deliveryId]);
 
@@ -308,18 +253,19 @@ export async function deliverWebhook(deliveryId, url, secret, payload) {
       throw new Error(`HTTP ${response.status}: ${responseBody.substring(0, 200)}`);
     }
   } catch (err) {
-    const errorMessage = err.name === 'AbortError' ? 'Request timeout' : err.message;
+    const errorMessage = err.message === `Request timeout after ${WEBHOOK_TIMEOUT}ms` ? 'Request timeout' : err.message;
 
     // Check if we should retry
     if (attempts < MAX_RETRIES) {
+      const delay = Math.pow(2, attempts) * 1000; // 2s, 4s, 8s
+      const retryAt = new Date(Date.now() + delay).toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
       await db.exec(`
         UPDATE webhook_deliveries
-        SET status = 'pending', error = ?
+        SET status = 'pending', error = ?, delivery_claim_until = ?
         WHERE id = ?
-      `, [errorMessage, deliveryId]);
+      `, [errorMessage, retryAt, deliveryId]);
 
       // Schedule retry with exponential backoff
-      const delay = Math.pow(2, attempts) * 1000; // 2s, 4s, 8s
       setTimeout(() => {
         deliverWebhook(deliveryId, url, secret, payload)
           .catch(e => console.error('Retry failed:', e));
@@ -330,7 +276,7 @@ export async function deliverWebhook(deliveryId, url, secret, payload) {
       // Max retries reached
       await db.exec(`
         UPDATE webhook_deliveries
-        SET status = 'failed', error = ?
+        SET status = 'failed', error = ?, delivery_claim_until = NULL
         WHERE id = ?
       `, [errorMessage, deliveryId]);
 
@@ -349,6 +295,7 @@ export async function processPendingDeliveries() {
     FROM webhook_deliveries d
     JOIN webhooks w ON w.id = d.webhook_id
     WHERE d.status = 'pending' AND d.attempts < ?
+      AND (d.delivery_claim_until IS NULL OR d.delivery_claim_until <= datetime('now'))
     ORDER BY d.created_at ASC
     LIMIT 100
   `, [MAX_RETRIES]);
@@ -363,6 +310,7 @@ export async function processPendingDeliveries() {
       AND d.agent_id IS NOT NULL
       AND d.status = 'pending'
       AND d.attempts < ?
+      AND (d.delivery_claim_until IS NULL OR d.delivery_claim_until <= datetime('now'))
       AND a.webhook_url IS NOT NULL
     ORDER BY d.created_at ASC
     LIMIT 100

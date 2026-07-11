@@ -3,6 +3,7 @@ import db from '../db/adapter.js';
 import * as response from '../utils/response.js';
 import { userAuth, requireRoles } from '../middleware/userAuth.js';
 import { dualAuth } from '../middleware/agentAuth.js';
+import { hasProjectAccess, projectScopeFilter, requireActorAccess } from '../utils/authorization.js';
 import { triggerWebhookForProject } from '../services/webhooks.js';
 import { dispatchEvent } from '../services/routeDispatcher.js';
 import { toISOTimestamp as formatTimestamp } from '../utils/routeHelpers.js';
@@ -69,7 +70,7 @@ function normalizeKnowledgeTimestamps(knowledge) {
  * Search knowledge base (accessible by agents)
  * NOTE: This route MUST come before /:id to avoid "search" being matched as an ID
  */
-router.get('/search', dualAuth, validateQuery(searchKnowledgeSchema), async (req, res) => {
+router.get('/search', dualAuth, requireActorAccess(), validateQuery(searchKnowledgeSchema), async (req, res) => {
   try {
     const { q, projectId, category } = req.query;
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 20));
@@ -85,12 +86,10 @@ router.get('/search', dualAuth, validateQuery(searchKnowledgeSchema), async (req
     const searchTerm = `%${q}%`;
     const params = [searchTerm, searchTerm];
 
-    // For agents (not user keys), restrict to projects they have tasks in
-    if (req.agent && req.agent.id && !req.agent.isUserKey) {
-      query += ` AND (k.project_id IS NULL OR k.project_id IN (
-        SELECT DISTINCT project_id FROM tasks WHERE assigned_agent_id = ?
-      ))`;
-      params.push(req.agent.id);
+    const projectScope = projectScopeFilter(req, 'k.project_id', { includeUnscoped: true });
+    if (projectScope.sql) {
+      query += ` AND ${projectScope.sql}`;
+      params.push(...projectScope.params);
     }
 
     if (projectId && !isNaN(parseInt(projectId))) {
@@ -126,7 +125,7 @@ router.get('/search', dualAuth, validateQuery(searchKnowledgeSchema), async (req
  * List all knowledge entries with filtering
  * Supports both user auth (session/user keys) and agent auth (agent keys)
  */
-router.get('/', dualAuth, async (req, res) => {
+router.get('/', dualAuth, requireActorAccess(), async (req, res) => {
   try {
     const { projectId, category, search } = req.query;
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
@@ -141,6 +140,12 @@ router.get('/', dualAuth, async (req, res) => {
       WHERE 1=1
     `;
     const params = [];
+
+    const projectScope = projectScopeFilter(req, 'k.project_id', { includeUnscoped: true });
+    if (projectScope.sql) {
+      query += ` AND ${projectScope.sql}`;
+      params.push(...projectScope.params);
+    }
 
     if (projectId && !isNaN(parseInt(projectId))) {
       query += ' AND k.project_id = ?';
@@ -176,7 +181,7 @@ router.get('/', dualAuth, async (req, res) => {
  * POST /api/knowledge
  * Create a new knowledge entry
  */
-router.post('/', userAuth, validateBody(createKnowledgeSchema), async (req, res) => {
+router.post('/', dualAuth, requireActorAccess({ roles: ['admin', 'operator', 'reviewer'], agentScope: 'write' }), validateBody(createKnowledgeSchema), async (req, res) => {
   try {
     const { projectId, title, content, contentType, category, tags } = req.body;
 
@@ -185,6 +190,9 @@ router.post('/', userAuth, validateBody(createKnowledgeSchema), async (req, res)
       const project = await db.one('SELECT id FROM projects WHERE id = ?', [projectId]);
       if (!project) {
         return response.validationError(res, 'Invalid project ID');
+      }
+      if (!hasProjectAccess(req, projectId)) {
+        return response.forbidden(res, 'Project access denied');
       }
     }
 
@@ -244,7 +252,7 @@ router.post('/', userAuth, validateBody(createKnowledgeSchema), async (req, res)
  * GET /api/knowledge/:id
  * Get knowledge entry details
  */
-router.get('/:id', dualAuth, async (req, res) => {
+router.get('/:id', dualAuth, requireActorAccess(), async (req, res) => {
   try {
     const knowledge = await db.one(`
       SELECT
@@ -256,6 +264,9 @@ router.get('/:id', dualAuth, async (req, res) => {
     `, [req.params.id]);
 
     if (!knowledge) {
+      return response.notFound(res, 'Knowledge');
+    }
+    if (!hasProjectAccess(req, knowledge.project_id)) {
       return response.notFound(res, 'Knowledge');
     }
 
@@ -273,10 +284,13 @@ router.get('/:id', dualAuth, async (req, res) => {
  * PATCH /api/knowledge/:id
  * Update knowledge entry
  */
-router.patch('/:id', userAuth, validateBody(updateKnowledgeSchema), async (req, res) => {
+router.patch('/:id', dualAuth, requireActorAccess({ roles: ['admin', 'operator', 'reviewer'], agentScope: 'write' }), validateBody(updateKnowledgeSchema), async (req, res) => {
   try {
     const knowledge = await db.one('SELECT * FROM knowledge WHERE id = ?', [req.params.id]);
     if (!knowledge) {
+      return response.notFound(res, 'Knowledge');
+    }
+    if (!hasProjectAccess(req, knowledge.project_id)) {
       return response.notFound(res, 'Knowledge');
     }
 

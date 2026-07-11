@@ -5,6 +5,7 @@
  */
 
 import { validateWebhookUrl } from './webhooks.js';
+import { fetchPinned } from '../utils/outboundHttp.js';
 
 const DEFAULT_TIMEOUT_MS = 10000;
 
@@ -18,23 +19,18 @@ async function safeFetch(url, body, timeoutMs) {
     throw new Error(`SSRF blocked: ${urlCheck.reason}`);
   }
 
-  const controller = new AbortController();
   const timeout = timeoutMs || DEFAULT_TIMEOUT_MS;
-  const timeoutId = setTimeout(() => controller.abort(), timeout);
 
   try {
-    const response = await fetch(url, {
+    const response = await fetchPinned(urlCheck, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-      signal: controller.signal,
-      redirect: 'manual'
+      timeoutMs: timeout
     });
-    clearTimeout(timeoutId);
     return response;
   } catch (err) {
-    clearTimeout(timeoutId);
-    if (err.name === 'AbortError') {
+    if (err.message === `Request timeout after ${timeout}ms`) {
       throw new Error(`Slack timeout after ${timeout}ms`);
     }
     throw err;

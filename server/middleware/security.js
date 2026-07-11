@@ -342,8 +342,17 @@ export function securityHeaders(req, res, next) {
 export function sanitizeRequest(req, res, next) {
   if (req.body && typeof req.body === 'object') {
     const MAX_DEPTH = 20;
+    const MAX_NODES = 10_000;
+    let visited = 0;
     const sanitize = (obj, depth = 0) => {
-      if (!obj || typeof obj !== 'object' || depth > MAX_DEPTH) return;
+      if (!obj || typeof obj !== 'object') return;
+      if (depth > MAX_DEPTH) {
+        throw new Error('Request body exceeds maximum nesting depth');
+      }
+      visited += 1;
+      if (visited > MAX_NODES) {
+        throw new Error('Request body has too many nested values');
+      }
       delete obj.__proto__;
       delete obj.constructor;
       delete obj.prototype;
@@ -353,7 +362,11 @@ export function sanitizeRequest(req, res, next) {
         }
       }
     };
-    sanitize(req.body);
+    try {
+      sanitize(req.body);
+    } catch (err) {
+      return response.validationError(res, err.message);
+    }
   }
   next();
 }

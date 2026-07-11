@@ -11,6 +11,7 @@ import { validateBody, validateParams, validateQuery, idParamSchema, TRIGGER_EVE
 import { z } from 'zod';
 import { dispatchRoute, testRoute } from '../services/routeDispatcher.js';
 import { safeJsonParse, sanitizeDestinationConfig, formatDeliveryLog, toISOTimestamp as formatTimestamp } from '../utils/routeHelpers.js';
+import { decryptDestinationConfig, encryptDestinationConfig } from '../utils/routeSecrets.js';
 
 const router = express.Router();
 
@@ -176,7 +177,7 @@ const logsQuerySchema = z.object({
  */
 function formatRoute(route, isAdmin = false) {
   const destinationType = route.destination_type;
-  const destinationConfig = safeJsonParse(route.destination_config, {});
+  const destinationConfig = decryptDestinationConfig(safeJsonParse(route.destination_config, {}));
 
   return {
     ...route,
@@ -249,7 +250,7 @@ router.post('/routes/global', userAuth, requireRoles('admin'), validateBody(crea
       trigger_event,
       JSON.stringify(trigger_conditions || null),
       destination_type,
-      JSON.stringify(destination_config),
+      JSON.stringify(encryptDestinationConfig(destination_config)),
       JSON.stringify(field_mapping || null),
       JSON.stringify(retry_policy || { max_retries: 3, backoff_type: 'exponential', initial_delay_ms: 1000 }),
       enabled ? 1 : 0
@@ -314,7 +315,7 @@ router.post('/projects/:id/routes', userAuth, requireRoles('admin'), validatePar
       trigger_event,
       JSON.stringify(trigger_conditions || null),
       destination_type,
-      JSON.stringify(destination_config),
+      JSON.stringify(encryptDestinationConfig(destination_config)),
       JSON.stringify(field_mapping || null),
       JSON.stringify(retry_policy || { max_retries: 3, backoff_type: 'exponential', initial_delay_ms: 1000 }),
       enabled ? 1 : 0
@@ -469,7 +470,7 @@ router.put('/routes/:id', userAuth, requireRoles('admin'), validateParams(idPara
     }
     if (destination_config !== undefined) {
       updates.push('destination_config = ?');
-      values.push(JSON.stringify(destination_config));
+      values.push(JSON.stringify(encryptDestinationConfig(destination_config)));
     }
     if (field_mapping !== undefined) {
       updates.push('field_mapping = ?');

@@ -134,6 +134,11 @@ export async function runMigrations(db) {
         console.error(`[Migrator] Run: SELECT task_id, version, COUNT(*) FROM deliverables WHERE task_id IS NOT NULL GROUP BY task_id, version HAVING COUNT(*) > 1;`);
         console.error(`[Migrator] Resolve duplicates, then restart.`);
         throw err;
+      } else if (version === '016_webhook_delivery_leases' && /no such table: webhook_deliveries/i.test(err.message || '')) {
+        // Very early/minimal databases can predate the optional webhook
+        // subsystem entirely. There is no delivery table to lease yet.
+        console.log(`[Migrator] Skipped (webhook deliveries table absent): ${file}`);
+        await recordAppliedMigration(db, version);
       } else {
         console.error(`[Migrator] Failed to apply ${file}:`, err.message);
         throw err;

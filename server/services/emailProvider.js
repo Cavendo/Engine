@@ -4,6 +4,9 @@
  */
 
 import nodemailer from 'nodemailer';
+import { decryptEnvSecret } from '../utils/crypto.js';
+
+const readSecret = (name) => decryptEnvSecret(process.env[name]);
 
 // ============================================
 // Provider Configuration
@@ -20,22 +23,22 @@ let SMTP_CONFIG = {
   secure: process.env.EMAIL_SMTP_SECURE === 'true',
   auth: process.env.EMAIL_SMTP_USER ? {
     user: process.env.EMAIL_SMTP_USER,
-    pass: process.env.EMAIL_SMTP_PASS
+    pass: readSecret('EMAIL_SMTP_PASS')
   } : undefined
 };
 
 // API Keys
-let SENDGRID_API_KEY = process.env.EMAIL_SENDGRID_API_KEY;
-let MAILGUN_API_KEY = process.env.EMAIL_MAILGUN_API_KEY;
+let SENDGRID_API_KEY = readSecret('EMAIL_SENDGRID_API_KEY');
+let MAILGUN_API_KEY = readSecret('EMAIL_MAILGUN_API_KEY');
 let MAILGUN_DOMAIN = process.env.EMAIL_MAILGUN_DOMAIN;
 let MAILGUN_BASE_URL = process.env.EMAIL_MAILGUN_BASE_URL || 'https://api.mailgun.net';
-let MAILJET_API_KEY = process.env.EMAIL_MAILJET_API_KEY;
-let MAILJET_SECRET_KEY = process.env.EMAIL_MAILJET_SECRET_KEY;
-let POSTMARK_SERVER_TOKEN = process.env.EMAIL_POSTMARK_SERVER_TOKEN;
+let MAILJET_API_KEY = readSecret('EMAIL_MAILJET_API_KEY');
+let MAILJET_SECRET_KEY = readSecret('EMAIL_MAILJET_SECRET_KEY');
+let POSTMARK_SERVER_TOKEN = readSecret('EMAIL_POSTMARK_SERVER_TOKEN');
 let SES_CONFIG = {
   region: process.env.EMAIL_SES_REGION,
-  accessKeyId: process.env.EMAIL_SES_ACCESS_KEY_ID,
-  secretAccessKey: process.env.EMAIL_SES_SECRET_ACCESS_KEY
+  accessKeyId: readSecret('EMAIL_SES_ACCESS_KEY_ID'),
+  secretAccessKey: readSecret('EMAIL_SES_SECRET_ACCESS_KEY')
 };
 
 // ============================================
@@ -593,20 +596,20 @@ export function reloadConfig() {
     secure: process.env.EMAIL_SMTP_SECURE === 'true',
     auth: process.env.EMAIL_SMTP_USER ? {
       user: process.env.EMAIL_SMTP_USER,
-      pass: process.env.EMAIL_SMTP_PASS
+      pass: readSecret('EMAIL_SMTP_PASS')
     } : undefined
   };
-  SENDGRID_API_KEY = process.env.EMAIL_SENDGRID_API_KEY;
-  MAILGUN_API_KEY = process.env.EMAIL_MAILGUN_API_KEY;
+  SENDGRID_API_KEY = readSecret('EMAIL_SENDGRID_API_KEY');
+  MAILGUN_API_KEY = readSecret('EMAIL_MAILGUN_API_KEY');
   MAILGUN_DOMAIN = process.env.EMAIL_MAILGUN_DOMAIN;
   MAILGUN_BASE_URL = process.env.EMAIL_MAILGUN_BASE_URL || 'https://api.mailgun.net';
-  MAILJET_API_KEY = process.env.EMAIL_MAILJET_API_KEY;
-  MAILJET_SECRET_KEY = process.env.EMAIL_MAILJET_SECRET_KEY;
-  POSTMARK_SERVER_TOKEN = process.env.EMAIL_POSTMARK_SERVER_TOKEN;
+  MAILJET_API_KEY = readSecret('EMAIL_MAILJET_API_KEY');
+  MAILJET_SECRET_KEY = readSecret('EMAIL_MAILJET_SECRET_KEY');
+  POSTMARK_SERVER_TOKEN = readSecret('EMAIL_POSTMARK_SERVER_TOKEN');
   SES_CONFIG = {
     region: process.env.EMAIL_SES_REGION,
-    accessKeyId: process.env.EMAIL_SES_ACCESS_KEY_ID,
-    secretAccessKey: process.env.EMAIL_SES_SECRET_ACCESS_KEY
+    accessKeyId: readSecret('EMAIL_SES_ACCESS_KEY_ID'),
+    secretAccessKey: readSecret('EMAIL_SES_SECRET_ACCESS_KEY')
   };
   // Reset SMTP transporter so it's recreated with new config
   smtpTransporter = null;

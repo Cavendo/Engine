@@ -18,9 +18,9 @@ export default function FileList({ files }) {
                 </span>
               )}
             </div>
-            {file.path && (
+            {(file.downloadUrl || file.path) && (
               <a
-                href={`/uploads/${file.path}`}
+                href={file.downloadUrl || file.path}
                 download={file.filename}
                 className="flex items-center gap-1 text-sm text-primary-600 hover:text-primary-800 flex-shrink-0"
               >

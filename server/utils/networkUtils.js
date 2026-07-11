@@ -13,7 +13,9 @@ const PRIVATE_IP_PATTERNS = [
   /^192\.168\./,                    // 192.168.0.0/16
   /^127\./,                         // 127.0.0.0/8
   /^0\./,                           // 0.0.0.0/8
+  /^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\./, // shared address space
   /^169\.254\./,                    // 169.254.0.0/16 (link-local)
+  /^192\.0\.0\./,                  // IANA special-purpose range
 ];
 
 /**
@@ -33,9 +35,9 @@ export function isPrivateOrLocalIp(ip) {
   }
 
   // Check IPv6 private/local ranges
-  if (ip === '::1') return true;                   // loopback
-  if (/^fe80:/i.test(ip)) return true;             // link-local
-  if (/^fc00:/i.test(ip) || /^fd/i.test(ip)) return true;  // unique local (fc00::/7)
+  if (ip === '::' || ip === '::1') return true;    // unspecified / loopback
+  if (/^fe[89ab][0-9a-f]:/i.test(ip)) return true; // link-local (fe80::/10)
+  if (/^f[cd][0-9a-f]{2}:/i.test(ip)) return true; // unique local (fc00::/7)
 
   // IPv4-mapped IPv6 (::ffff:x.x.x.x) — extract and re-check
   const v4mapped = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);

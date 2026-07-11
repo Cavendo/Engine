@@ -1,9 +1,35 @@
 import { readFileSync, mkdirSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import { hashPassword } from '../utils/crypto.js';
+import { hashPassword, verifyPassword } from '../utils/crypto.js';
+import { migrateRouteDestinationSecrets } from '../utils/routeSecrets.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+function readBootstrapAdminPassword() {
+  const direct = String(process.env.BOOTSTRAP_ADMIN_PASSWORD || '');
+  if (direct) return direct;
+
+  const passwordFile = String(process.env.BOOTSTRAP_ADMIN_PASSWORD_FILE || '');
+  if (!passwordFile) return '';
+  try {
+    return readFileSync(passwordFile, 'utf8').replace(/[\r\n]+$/, '');
+  } catch (err) {
+    throw new Error(`Unable to read BOOTSTRAP_ADMIN_PASSWORD_FILE: ${err.message}`);
+  }
+}
+
+function getBootstrapAdmin() {
+  const email = String(process.env.BOOTSTRAP_ADMIN_EMAIL || '').trim().toLowerCase();
+  const password = readBootstrapAdminPassword();
+  if (!email || !password) {
+    throw new Error('Production startup requires BOOTSTRAP_ADMIN_EMAIL and BOOTSTRAP_ADMIN_PASSWORD (or BOOTSTRAP_ADMIN_PASSWORD_FILE) when no administrator exists');
+  }
+  if (password.length < 14) {
+    throw new Error('BOOTSTRAP_ADMIN_PASSWORD must be at least 14 characters');
+  }
+  return { email, password };
+}
 
 function stripLeadingSqlComments(sql) {
   return sql.replace(/^(?:\s*--.*\n)+/g, '').trim();
@@ -302,16 +328,28 @@ export async function initializeDatabase(db) {
   }
 
   // Create default admin user if none exists
-  const existingAdmin = await db.one('SELECT id FROM users WHERE role = ?', ['admin']);
+  const existingAdmin = await db.one('SELECT id, email, password_hash, last_login_at, force_password_change FROM users WHERE role = ?', ['admin']);
   if (!existingAdmin) {
-    // Use bcrypt for password hashing
-    const passwordHash = await hashPassword('admin');
+    const isProduction = process.env.NODE_ENV === 'production';
+    const bootstrap = isProduction
+      ? getBootstrapAdmin()
+      : { email: 'admin@cavendo.local', password: 'admin' };
+    const passwordHash = await hashPassword(bootstrap.password);
     await db.exec(`
       INSERT INTO users (email, password_hash, name, role, force_password_change)
       VALUES (?, ?, ?, ?, 1)
-    `, ['admin@cavendo.local', passwordHash, 'Admin', 'admin']);
-    console.log('Default admin user created: admin@cavendo.local / admin');
-    console.log('!! CHANGE THIS PASSWORD IMMEDIATELY IN PRODUCTION !!');
+    `, [bootstrap.email, passwordHash, 'Admin', 'admin']);
+    if (isProduction) {
+      console.log(`Bootstrap administrator created: ${bootstrap.email}`);
+    } else {
+      console.warn('Development administrator created: admin@cavendo.local (password change required)');
+    }
+  } else if (process.env.NODE_ENV === 'production'
+      && existingAdmin.email === 'admin@cavendo.local'
+      && !existingAdmin.last_login_at
+      && existingAdmin.force_password_change
+      && await verifyPassword('admin', existingAdmin.password_hash)) {
+    throw new Error('Refusing production startup with the untouched development admin account. Set a real administrator password before deploying.');
   }
 
   // Existing seeded admin should be forced to change password on first login
@@ -356,6 +394,17 @@ export async function initializeDatabase(db) {
       'active'
     ]);
     console.log('Default project created: "My First Project"');
+  }
+
+  // Older releases stored delivery route webhooks, headers, and inline S3
+  // credentials directly in JSON. Run this after core-user backfills so
+  // upgrade adapters that only expose the core tables remain compatible.
+  try {
+    const migratedRoutes = await migrateRouteDestinationSecrets(db);
+    if (migratedRoutes > 0) console.log(`Encrypted destination configuration for ${migratedRoutes} delivery route(s)`);
+  } catch (err) {
+    if (process.env.NODE_ENV === 'production') throw err;
+    console.warn(`[Crypto] Route destination secret migration skipped: ${err.message}`);
   }
 
   return true;

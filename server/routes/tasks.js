@@ -6,7 +6,7 @@ import { agentAuth, dualAuth, logAgentActivity } from '../middleware/agentAuth.j
 import { triggerWebhook } from '../services/webhooks.js';
 import { dispatchEvent } from '../services/routeDispatcher.js';
 import { logActivity } from '../services/activityLogger.js';
-import { canAccessTask } from '../utils/authorization.js';
+import { canAccessTask, requireActorAccess } from '../utils/authorization.js';
 import { insertDeliverableWithRetry } from '../utils/deliverableVersioning.js';
 import { detectDeliverableContentType } from '../utils/detectDeliverableContentType.js';
 import { toISOTimestamp as formatTimestamp } from '../utils/routeHelpers.js';
@@ -317,7 +317,7 @@ function buildTaskContextPayload(taskLike, rawContext = {}) {
  * List all tasks with filtering
  * Supports browser sessions and API keys.
  */
-router.get('/', dualAuth, async (req, res) => {
+router.get('/', dualAuth, requireActorAccess(), async (req, res) => {
   try {
     const { status, priority, projectId, agentId, sprintId } = req.query;
     const limit = Math.max(1, Math.min(500, parseInt(req.query.limit) || 100));
@@ -387,7 +387,7 @@ router.get('/', dualAuth, async (req, res) => {
  * If no assignedAgentId is provided but projectId is, the task router
  * will evaluate routing rules to automatically assign an agent.
  */
-router.post('/', dualAuth, validateBody(createTaskSchema), async (req, res) => {
+router.post('/', dualAuth, requireActorAccess({ roles: ['admin', 'operator', 'reviewer'], agentScope: 'write' }), validateBody(createTaskSchema), async (req, res) => {
   try {
     const {
       title, description, projectId, sprintId, assignedAgentId,
@@ -1229,7 +1229,7 @@ router.delete('/bulk', dualAuth, requireUserOrUserKeyRoles('admin'), validateBod
  * Get task details
  * Supports both user auth (session/user keys) and agent auth (agent keys)
  */
-router.get('/:id', dualAuth, async (req, res) => {
+router.get('/:id', dualAuth, requireActorAccess(), async (req, res) => {
   try {
     // Authorization check
     const access = await canAccessTask(req, req.params.id);
@@ -1282,7 +1282,7 @@ router.get('/:id', dualAuth, async (req, res) => {
  * Get full context bundle for a task (for agent consumption)
  * Includes agent profile with system prompt and instructions
  */
-router.get('/:id/context', dualAuth, async (req, res) => {
+router.get('/:id/context', dualAuth, requireActorAccess(), async (req, res) => {
   try {
     const task = await db.one(`
       SELECT t.*, p.id as project_id, p.name as project_name, p.description as project_description, s.id as sprint_id, s.name as sprint_name
@@ -1427,7 +1427,7 @@ router.get('/:id/context', dualAuth, async (req, res) => {
  * PATCH /api/tasks/:id
  * Update task
  */
-router.patch('/:id', dualAuth, validateBody(updateTaskSchema), async (req, res) => {
+router.patch('/:id', dualAuth, requireActorAccess({ roles: ['admin', 'operator', 'reviewer'] }), validateBody(updateTaskSchema), async (req, res) => {
   try {
     const task = await db.one('SELECT * FROM tasks WHERE id = ?', [req.params.id]);
     if (!task) {
@@ -1828,7 +1828,7 @@ router.delete('/:id', dualAuth, requireUserOrUserKeyRoles('admin'), async (req, 
  * PATCH /api/tasks/:id/status
  * Update task status (agent endpoint)
  */
-router.patch('/:id/status', agentAuth, validateBody(updateTaskStatusSchema), logAgentActivity('task.status_updated', (req, data) => ({
+router.patch('/:id/status', agentAuth, requireActorAccess({ roles: ['admin', 'operator', 'reviewer'], agentScope: 'write' }), validateBody(updateTaskStatusSchema), logAgentActivity('task.status_updated', (req, data) => ({
   type: 'task',
   id: parseInt(req.params.id),
   details: { status: req.body.status }
@@ -1954,7 +1954,7 @@ router.patch('/:id/status', agentAuth, validateBody(updateTaskStatusSchema), log
  * POST /api/tasks/:id/progress
  * Log a progress update for a task (agent endpoint)
  */
-router.post('/:id/progress', agentAuth, validateBody(logTaskProgressSchema), logAgentActivity('task.progress_logged', (req, data) => ({
+router.post('/:id/progress', agentAuth, requireActorAccess({ roles: ['admin', 'operator', 'reviewer'], agentScope: 'write' }), validateBody(logTaskProgressSchema), logAgentActivity('task.progress_logged', (req, data) => ({
   type: 'task',
   id: parseInt(req.params.id),
   details: { message: req.body.message, percentComplete: req.body.percentComplete }
@@ -2037,7 +2037,7 @@ router.post('/:id/progress', agentAuth, validateBody(logTaskProgressSchema), log
  * POST /api/tasks/:id/external-status
  * Update BYOA execution lifecycle state for a claimed task.
  */
-router.post('/:id/external-status', agentAuth, validateBody(updateExternalTaskExecutionSchema), async (req, res) => {
+router.post('/:id/external-status', agentAuth, requireActorAccess({ roles: ['admin', 'operator', 'reviewer'], agentScope: 'write' }), validateBody(updateExternalTaskExecutionSchema), async (req, res) => {
   try {
     const runtime = await resolveExternalTaskActor(req.agent, req.body?.agentId || req.query?.agentId || null);
     const runtimeAgent = runtime?.runtimeAgent;
@@ -2131,7 +2131,7 @@ router.post('/:id/external-status', agentAuth, validateBody(updateExternalTaskEx
  * POST /api/tasks/:id/result
  * Submit a text deliverable for a claimed task from a BYOA worker.
  */
-router.post('/:id/result', agentAuth, validateBody(submitExternalTaskResultSchema), async (req, res) => {
+router.post('/:id/result', agentAuth, requireActorAccess({ roles: ['admin', 'operator', 'reviewer'], agentScope: 'write' }), validateBody(submitExternalTaskResultSchema), async (req, res) => {
   let runtimeAgentId = null;
   let submitPhase = 'resolve_runtime';
   try {
@@ -2351,7 +2351,7 @@ router.post('/:id/result', agentAuth, validateBody(submitExternalTaskResultSchem
  * Claim a task for the requesting agent (agent endpoint)
  * Uses atomic conditional update to prevent race conditions
  */
-router.post('/:id/claim', agentAuth, logAgentActivity('task.claimed', (req, data) => ({
+router.post('/:id/claim', agentAuth, requireActorAccess({ roles: ['admin', 'operator', 'reviewer'], agentScope: 'write' }), logAgentActivity('task.claimed', (req, data) => ({
   type: 'task',
   id: parseInt(req.params.id),
   details: {}
@@ -2478,7 +2478,7 @@ router.post('/:id/claim', agentAuth, logAgentActivity('task.claimed', (req, data
  * GET /api/tasks/:id/activity
  * Get activity log for a task
  */
-router.get('/:id/activity', dualAuth, async (req, res) => {
+router.get('/:id/activity', dualAuth, requireActorAccess(), async (req, res) => {
   try {
     // Authorization check
     const access = await canAccessTask(req, req.params.id);
