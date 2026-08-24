@@ -9,7 +9,8 @@
  */
 
 export class SkillsAdapter {
-  async listSkills() {
+  // eslint-disable-next-line no-unused-vars
+  async listSkills(options = {}) {
     throw new Error('Not implemented');
   }
 

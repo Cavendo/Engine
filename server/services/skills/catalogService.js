@@ -112,10 +112,21 @@ export async function listCatalogForActor({ auth, user, workspaceId = null }) {
   };
 }
 
-export async function getSkillFromCatalog(skillKey, skillVersion = null, { allowVersionFallback = false } = {}) {
+/**
+ * @param {{ allowVersionFallback?: boolean, workspaceId?: string|number|null }} [options]
+ *   `workspaceId` scopes the worker catalogue request. Without it the SHARED
+ *   catalogue is queried, and a skill registered only for one workspace
+ *   cannot be found there — so an invocation for it fails SKILL_NOT_FOUND
+ *   even though its handler is deployed and working.
+ */
+export async function getSkillFromCatalog(
+  skillKey,
+  skillVersion = null,
+  { allowVersionFallback = false, workspaceId = null } = {}
+) {
   const requestedVersion = String(skillVersion || '').trim();
   const adapter = getSkillsAdapter();
-  const catalog = await adapter.listSkills();
+  const catalog = await adapter.listSkills({ workspaceId });
   const skill = catalog.skills.find((s) => {
     if (s.key !== skillKey) return false;
     if (!requestedVersion) return true;

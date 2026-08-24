@@ -210,8 +210,19 @@ export class HttpWorkerAdapter extends SkillsAdapter {
     }
   }
 
-  async listSkills() {
-    const data = await this.request(CATALOG_PATH, null, { method: 'GET' });
+  /**
+   * @param {{ workspaceId?: string|number|null }} [options]
+   *   A workspace scope, when the caller has one. The worker's catalogue is
+   *   otherwise SHARED, so a skill registered only for one workspace is
+   *   invisible to it and every lookup for that skill answers "not found" —
+   *   with the handler deployed and working.
+   */
+  async listSkills({ workspaceId = null } = {}) {
+    const scope = String(workspaceId ?? '').trim();
+    const path = scope
+      ? `${CATALOG_PATH}${CATALOG_PATH.includes('?') ? '&' : '?'}workspace_id=${encodeURIComponent(scope)}`
+      : CATALOG_PATH;
+    const data = await this.request(path, null, { method: 'GET' });
     if (!Array.isArray(data.skills)) {
       throw createError(SKILLS_ERROR_CODES.UPSTREAM_ERROR, 'Worker catalog missing skills[]');
     }

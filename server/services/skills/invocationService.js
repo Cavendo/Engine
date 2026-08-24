@@ -339,7 +339,15 @@ export async function createInvocation(payload, { auth, user }) {
   await assertInvokeAllowed(payload.skillKey, role, payload.workspaceId || null);
 
   const requestedSkillVersion = String(payload.skillVersion || '').trim() || null;
-  const skill = await getSkillFromCatalog(payload.skillKey, requestedSkillVersion, { allowVersionFallback: true });
+  // The invocation's own workspace scopes the lookup. This is a SECOND,
+  // independent catalogue read — a caller may already have resolved the
+  // skill, and this one asked the SHARED catalogue, so a workspace-scoped
+  // skill resolved for the caller and then failed here with SKILL_NOT_FOUND
+  // and no invocation row.
+  const skill = await getSkillFromCatalog(payload.skillKey, requestedSkillVersion, {
+    allowVersionFallback: true,
+    workspaceId: payload.workspaceId || null,
+  });
   const resolvedSkillVersion = requestedSkillVersion || String(skill.version || skill.skill_version || '').trim() || null;
   validateSimpleSchema(skill.input_schema, payload.inputs || {}, 'inputs');
   const connectorConfig = normalizeManagedOnlyConnectorConfig({
